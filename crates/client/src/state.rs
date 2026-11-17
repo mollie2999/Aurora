@@ -41,6 +41,8 @@ pub struct State {
     pub cloud_syncing: std::collections::HashSet<AppId>,
     /// Games whose shaders are compiling before launch: (done, total).
     pub shader_compiling: HashMap<AppId, (u32, u32)>,
+    /// Games whose install script is running before they start: the step.
+    pub install_script: HashMap<AppId, String>,
     pub comments: HashMap<SteamId, Result<model::Comments, String>>,
     pub badges: HashMap<SteamId, Result<model::Badges, String>>,
     pub notifications: Option<model::Notifications>,
@@ -182,6 +184,14 @@ impl State {
             Event::ShaderCompileDone { app_id } => {
                 self.shader_compiling.remove(app_id);
             }
+            Event::InstallScript { app_id, step } => match step {
+                Some(s) => {
+                    self.install_script.insert(*app_id, s.clone());
+                }
+                None => {
+                    self.install_script.remove(app_id);
+                }
+            },
             Event::CloudSyncing { app_id } => {
                 self.cloud_syncing.insert(*app_id);
             }

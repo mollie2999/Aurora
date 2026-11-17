@@ -118,6 +118,10 @@ pub struct OwnedApp {
     /// Steam Deck: 0 unknown, 1 unsupported, 2 playable, 3 verified.
     #[serde(default)]
     pub deck: u8,
+    /// The install script Steam runs on first launch, relative to the
+    /// install folder (app info `extended/installscript`), when declared.
+    #[serde(default)]
+    pub install_script: Option<String>,
 }
 
 /// A game's Steam Cloud setup, from its app info (`ufs`).

@@ -1747,3 +1747,6 @@
 "Trailers need FFmpeg. Install the ffmpeg package, then restart SteamInRust." = "Для трейлеров нужен FFmpeg. Установите пакет ffmpeg и перезапустите SteamInRust."
 "Run with:" = "Запускать с:"
 "Native (Linux)" = "Нативно (Linux)"
+"Running install script…" = "Выполняется скрипт установки…"
+"Running install script: {step}" = "Скрипт установки: {step}"
+"Path to the game's program (Linux or Windows .exe)" = "Путь к программе игры (Linux или .exe для Windows)"

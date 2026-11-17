@@ -16,6 +16,7 @@ pub mod ipc;
 mod launch;
 #[cfg(not(windows))]
 pub mod shaders;
+mod installscript;
 pub mod market;
 pub mod social;
 pub mod cloud;
@@ -35,7 +36,7 @@ pub mod state;
 pub mod store;
 
 pub use auth::Guard;
-pub use launch::{LaunchMode, STEAM_DRM, anti_cheat_headless, mode as launch_mode, mode_cached as launch_mode_cached, proton_builds, proton_override, app_proton, app_protons, default_proton, native_build, NATIVE, DEFAULT_PROTON, set_app_proton, set_app_protons, set_anti_cheat_headless, set_prefer_official as launch_through_steam, set_proton_override, set_steam_setting, steam_setting, steam_settings_locked, SteamSetting, apply_steam_prefs, gameplay_downloads, set_gameplay_downloads};
+pub use launch::{LaunchMode, STEAM_DRM, anti_cheat_headless, mode as launch_mode, mode_cached as launch_mode_cached, proton_builds, proton_override, app_proton, app_protons, default_proton, native_build, NATIVE, DEFAULT_PROTON, set_app_proton, set_app_protons, set_anti_cheat_headless, set_prefer_official as launch_through_steam, set_proton_override, set_steam_setting, steam_setting, steam_settings_locked, SteamSetting, apply_steam_prefs, gameplay_downloads, set_gameplay_downloads, spawn_non_steam};
 pub use state::State;
 pub use store::SavedAccount;
 
@@ -250,6 +251,9 @@ pub enum Event {
     ShaderCompile { app_id: AppId, done: u32, total: u32 },
     /// Shader compiling ended (finished or skipped); the game starts next.
     ShaderCompileDone { app_id: AppId },
+    /// The game's install script is running (first launch): the step's
+    /// name, or `None` once it's done and the game starts next.
+    InstallScript { app_id: AppId, step: Option<String> },
     /// Steam Cloud is syncing a game's saves (before launch or after exit).
     CloudSyncing { app_id: AppId },
     /// Result of a Steam Cloud sync. `held_launch` is set when the game

@@ -221,6 +221,7 @@ fn parse_app(id: AppId, text: &str) -> Option<OwnedApp> {
         icon: common.str("icon").or(common.str("clienticon")).filter(|s| !s.is_empty()).map(String::from),
         parent: common.u64("parent").map(|p| p as AppId).filter(|p| *p != 0),
         install_dir: info.path(&["config"]).and_then(|c| c.str("installdir")).unwrap_or_default().to_string(),
+        install_script: info.path(&["extended"]).and_then(|e| e.str("installscript")).filter(|s| !s.is_empty()).map(String::from),
         depots: parse_depots(info),
         branches: parse_branches(info),
         cloud: parse_cloud(info),

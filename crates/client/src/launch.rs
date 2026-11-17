@@ -339,6 +339,41 @@ pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, extra_args: &s
     cmd.spawn().map_err(|e| format!("could not start {}: {e}", app.name))
 }
 
+/// Start a non-Steam game the player added (program path, launch options).
+/// A path pasted with quotes ("Copy as path") works too.
+///
+/// Linux: Windows programs run with Proton (the global choice, else Steam's
+/// default), in a prefix of their own like Steam's shortcuts; anything else
+/// runs directly (made executable first if it isn't). Windows: shortcuts,
+/// batch files and programs that need admin rights start through the shell,
+/// which gives no process to wait for (`None`).
+pub fn spawn_non_steam(exe: &str, args: &str) -> Result<Option<Child>, String> {
+    let exe = PathBuf::from(exe.trim().trim_matches('"'));
+    if !exe.exists() {
+        return Err(format!("{} doesn't exist", exe.display()));
+    }
+    let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+    #[cfg(not(windows))]
+    {
+        let mut cmd = linux::non_steam(&exe, args)?;
+        cmd.current_dir(&dir);
+        return cmd.spawn().map(Some).map_err(|e| format!("couldn't start {}: {e}", exe.display()));
+    }
+    #[cfg(windows)]
+    {
+        let ext = exe.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if ext == "exe" {
+            match Command::new(&exe).args(split_args(args)).current_dir(&dir).spawn() {
+                Ok(child) => return Ok(Some(child)),
+                // ERROR_ELEVATION_REQUIRED: the shell asks for admin rights.
+                Err(e) if e.raw_os_error() == Some(740) => {}
+                Err(e) => return Err(format!("couldn't start {}: {e}", exe.display())),
+            }
+        }
+        win::shell_open(&exe, args, &dir).map(|()| None)
+    }
+}
+
 fn command(app: &OwnedApp, install_dir: &Path, extra_args: &str) -> Result<Command, String> {
     #[cfg(not(windows))]
     {
@@ -1475,6 +1510,13 @@ pub fn proton_user_dir(app: &OwnedApp, install_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Linux: a command running `program` in the game's Proton prefix, or
+/// `None` when the game runs natively (or can't start at all).
+#[cfg(not(windows))]
+pub(crate) fn in_prefix(app: &OwnedApp, install_dir: &Path, program: &str, args: &[String]) -> Option<Command> {
+    linux::plan(app, install_dir).ok()?.in_prefix(app, install_dir, program, args)
+}
+
 #[cfg(not(windows))]
 mod linux {
     use super::{normalize, split_args};
@@ -1565,6 +1607,69 @@ mod linux {
         Ok(Plan { option: windows.clone(), tool: Some(tool), steam_root: Some(root) })
     }
 
+    /// A Windows program (by extension, or a PE file's "MZ")?
+    fn is_windows_program(exe: &Path) -> bool {
+        let ext = exe.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if matches!(ext.as_str(), "exe" | "bat" | "cmd" | "msi" | "com") {
+            return true;
+        }
+        let mut head = [0u8; 2];
+        std::fs::File::open(exe).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_ok() && &head == b"MZ"
+    }
+
+    /// The command for a non-Steam game (see `super::spawn_non_steam`).
+    pub fn non_steam(exe: &Path, args: &str) -> Result<Command, String> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        let mut cmd = if is_windows_program(exe) {
+            let root = local::find_steam_root().ok_or("Windows games need a Steam install for Proton")?;
+            // Steam's way of numbering shortcuts: a stable id from the path, top bit set.
+            let id = exe.to_string_lossy().bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193)) | 0x8000_0000;
+            let tool = super::proton_override()
+                .and_then(|name| compat::compat_tools(&root).into_iter().find(|t| t.name.eq_ignore_ascii_case(&name)))
+                .or_else(|| compat::tool_for(&root, id))
+                .ok_or("No Proton is installed. Install one in Steam (Library → Tools → Proton).")?;
+            let data = directories::ProjectDirs::from("dev", "SteamInRust", "SteamInRust").ok_or("no data folder")?.data_dir().join("compatdata").join(id.to_string());
+            std::fs::create_dir_all(&data).map_err(|e| format!("couldn't create the Proton prefix: {e}"))?;
+            tracing::info!("launching non-Steam game {} with {}", exe.display(), tool.display);
+            let mut c = proton_base(&tool, &root);
+            c.arg("waitforexitandrun").arg(exe).args(split_args(args));
+            c.env("STEAM_COMPAT_DATA_PATH", &data)
+                .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &root)
+                .env("STEAM_COMPAT_INSTALL_PATH", exe.parent().unwrap_or(exe))
+                .env("STEAM_COMPAT_APP_ID", id.to_string());
+            c
+        } else {
+            // A game unpacked from an archive or an AppImage often isn't executable yet.
+            if let Ok(meta) = std::fs::metadata(exe) {
+                let mode = meta.permissions().mode();
+                if mode & 0o100 == 0 {
+                    let _ = std::fs::set_permissions(exe, std::fs::Permissions::from_mode(mode | ((mode & 0o444) >> 2)));
+                }
+            }
+            tracing::info!("launching non-Steam game {}", exe.display());
+            let mut c = Command::new(exe);
+            c.args(split_args(args));
+            c
+        };
+        cmd.process_group(0);
+        Ok(cmd)
+    }
+
+    /// `proton`, inside the Steam Linux Runtime container when the tool
+    /// asks for one (how Steam runs it); the verb and program come after.
+    fn proton_base(tool: &CompatTool, root: &Path) -> Command {
+        let runtime = tool.runtime_app.and_then(|rt| compat::app_dir(root, rt)).map(|d| d.join("_v2-entry-point")).filter(|p| p.is_file());
+        match runtime {
+            Some(entry) => {
+                let mut c = Command::new(entry);
+                c.arg("--verb=waitforexitandrun").arg("--").arg(tool.script());
+                c
+            }
+            None => Command::new(tool.script()),
+        }
+    }
+
     /// Our steamclient DLL for a Proton game (matching its bitness), unless
     /// it's a native game, the DLL isn't there, or
     /// `STEAMINRUST_PROTON_CLIENT=0` turns this off.
@@ -1636,6 +1741,27 @@ mod linux {
             self.tool.is_some()
         }
 
+        /// `program args…` inside the game's Proton prefix (install scripts:
+        /// redistributables, anti-cheat setup, `reg import`). `None` for a
+        /// native game.
+        pub fn in_prefix(&self, app: &OwnedApp, install_dir: &Path, program: &str, args: &[String]) -> Option<Command> {
+            let tool = self.tool.as_ref()?;
+            let root = self.steam_root.clone().unwrap_or_default();
+            let data = compat::compat_data(install_dir, app.app_id).unwrap_or_else(|| install_dir.join("compatdata"));
+            let _ = std::fs::create_dir_all(&data);
+            let mut cmd = proton_base(tool, &root);
+            cmd.arg("waitforexitandrun").arg(program).args(args);
+            let library = install_dir.parent().and_then(Path::parent).map(Path::to_path_buf).unwrap_or_default();
+            cmd.env("STEAM_COMPAT_DATA_PATH", &data)
+                .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &root)
+                .env("STEAM_COMPAT_INSTALL_PATH", install_dir)
+                .env("STEAM_COMPAT_LIBRARY_PATHS", &library)
+                .env("STEAM_COMPAT_APP_ID", app.app_id.to_string())
+                .env("SteamAppId", app.app_id.to_string())
+                .current_dir(install_dir);
+            Some(cmd)
+        }
+
         pub fn exe(&self, install_dir: &Path) -> PathBuf {
             install_dir.join(normalize(&self.option.executable))
         }
@@ -1676,15 +1802,7 @@ mod linux {
             let root = self.steam_root.clone().unwrap_or_default();
             let data = compat::compat_data(install_dir, app.app_id).unwrap_or_else(|| install_dir.join("compatdata"));
             let _ = std::fs::create_dir_all(&data);
-            let runtime = tool.runtime_app.and_then(|rt| compat::app_dir(&root, rt)).map(|d| d.join("_v2-entry-point")).filter(|p| p.is_file());
-            let mut cmd = match runtime {
-                Some(entry) => {
-                    let mut c = Command::new(entry);
-                    c.arg("--verb=waitforexitandrun").arg("--").arg(tool.script());
-                    c
-                }
-                None => Command::new(tool.script()),
-            };
+            let mut cmd = proton_base(tool, &root);
             cmd.arg("waitforexitandrun").arg(exe).args(split_args(&self.option.arguments));
             let library = install_dir.parent().and_then(Path::parent).map(Path::to_path_buf).unwrap_or_default();
             cmd.env("STEAM_COMPAT_DATA_PATH", &data)
@@ -1743,6 +1861,21 @@ mod win {
         fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut c_void;
         fn Process32FirstW(snap: *mut c_void, entry: *mut ProcessEntry) -> i32;
         fn Process32NextW(snap: *mut c_void, entry: *mut ProcessEntry) -> i32;
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(hwnd: isize, op: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
+    }
+
+    /// Open a program or shortcut the way Explorer does (UAC prompt included).
+    pub fn shell_open(file: &Path, args: &str, dir: &Path) -> Result<(), String> {
+        const SW_SHOWNORMAL: i32 = 1;
+        let (op, f, a, d) = (wide("open"), wide(&file.to_string_lossy()), wide(args), wide(&dir.to_string_lossy()));
+        // SAFETY: all strings are NUL-terminated UTF-16 that outlive the call.
+        let r = unsafe { ShellExecuteW(0, op.as_ptr(), f.as_ptr(), a.as_ptr(), d.as_ptr(), SW_SHOWNORMAL) };
+        // Values above 32 mean success; 1223 is the player cancelling the UAC prompt.
+        if r > 32 { Ok(()) } else { Err(format!("couldn't start {} (error {r})", file.display())) }
     }
 
     fn wide(s: &str) -> Vec<u16> {

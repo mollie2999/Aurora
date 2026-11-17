@@ -1149,9 +1149,12 @@ impl Library {
             ui.add_space(8.0);
             ui.label(w::text_medium(t!("Program"), 12.5, t.text_dim));
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut g.exe).hint_text(t!("Path to the game's .exe")).desired_width(360.0).margin(vec2(10.0, 8.0)));
+                let hint = if cfg!(windows) { t!("Path to the game's .exe") } else { t!("Path to the game's program (Linux or Windows .exe)") };
+                ui.add(egui::TextEdit::singleline(&mut g.exe).hint_text(hint).desired_width(360.0).margin(vec2(10.0, 8.0)));
                 if w::button(ui, t, Some(icons::FOLDER), t!("Choose…"), w::Kind::Secondary, w::Size::Sm).clicked() {
-                    if let Some(path) = rfd::FileDialog::new().add_filter("Programs", &["exe", "bat", "cmd", "lnk"]).pick_file() {
+                    // Linux programs often have no extension (or are AppImages): show everything there.
+                    let dialog = if cfg!(windows) { rfd::FileDialog::new().add_filter("Programs", &["exe", "bat", "cmd", "lnk"]) } else { rfd::FileDialog::new() };
+                    if let Some(path) = dialog.pick_file() {
                         g.exe = path.display().to_string();
                         if g.name.is_empty() {
                             g.name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -1201,17 +1204,17 @@ impl Library {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 if w::button(ui, t, Some(icons::PLAY), t!("Play"), w::Kind::Play, w::Size::Lg).clicked() {
-                    let exe = std::path::PathBuf::from(&g.exe);
-                    let mut cmd = std::process::Command::new(&exe);
-                    cmd.args(g.args.split_whitespace());
-                    if let Some(dir) = exe.parent() {
-                        cmd.current_dir(dir);
-                    }
-                    if let Err(e) = cmd.spawn() {
-                        ctx.toast(e.to_string());
+                    // Windows programs run with Proton on Linux; shortcuts and
+                    // admin-only programs go through the shell on Windows.
+                    match client::spawn_non_steam(&g.exe, &g.args) {
+                        Ok(Some(mut child)) => {
+                            std::thread::spawn(move || child.wait());
+                        }
+                        Ok(None) => {}
+                        Err(e) => ctx.toast(e),
                     }
                 }
-                if let Some(dir) = std::path::Path::new(&g.exe).parent() {
+                if let Some(dir) = std::path::Path::new(g.exe.trim().trim_matches('"')).parent() {
                     if w::button(ui, t, Some(icons::FOLDER), t!("Browse local files"), w::Kind::Secondary, w::Size::Lg).clicked() {
                         local::open_folder(dir);
                     }
@@ -1398,6 +1401,12 @@ impl Library {
                                 if w::button(ui, t, Some(icons::DOWNLOAD), t!("Update"), w::Kind::Primary, w::Size::Lg).clicked() {
                                     self.queue_install(ctx, id, Some(g.library.clone()));
                                 }
+                            }
+                            Some(_) if ctx.state.install_script.contains_key(&id) => {
+                                // Like Steam's "Running install script" on a first launch.
+                                let step = &ctx.state.install_script[&id];
+                                let label = if step.is_empty() { t!("Running install script…").to_string() } else { t!("Running install script: {step}", step = step) };
+                                busy_bar(ui, t, label, 0.0);
                             }
                             Some(_) if ctx.state.shader_compiling.contains_key(&id) => {
                                 // Like Steam's "Processing Vulkan shaders": the game starts after.
@@ -2071,6 +2080,11 @@ fn compile_bar(ui: &mut Ui, t: &Theme, done: u32, total: u32) {
     } else {
         t!("Compiling shaders…").to_string()
     };
+    busy_bar(ui, t, label, fraction);
+}
+
+/// The Play button's place while something runs before the game starts.
+fn busy_bar(ui: &mut Ui, t: &Theme, label: String, fraction: f32) {
     let galley = ui.painter().layout_no_wrap(label, w::font_semibold(16.0), Color32::WHITE);
     let spinner = 18.0;
     let (rect, _) = ui.allocate_exact_size(vec2((galley.size().x + spinner + 58.0).max(240.0), 48.0), Sense::hover());

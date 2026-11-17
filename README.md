@@ -106,6 +106,7 @@ From [the latest release](https://github.com/mollie2999/Aurora/releases/latest):
 | --- | --- |
 | `Aurora-Linux-x86_64.tar.gz` | Linux x86_64. Unpack and run `aurora` |
 | `aurora-bin-<version>-x86_64.pkg.tar.zst` | Arch Linux package (`sudo pacman -U …`) |
+| `aurora_<version>_amd64.deb` | Debian, Ubuntu 22.04+, Mint (`sudo apt install ./aurora_…deb`) |
 | `Aurora-Setup-<version>.exe` | Windows 10/11 installer, updates itself |
 | `Aurora-<version>-portable.zip` | Windows, no installer |
 

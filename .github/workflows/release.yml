@@ -1,6 +1,6 @@
 # Releases happen when the version goes up: bump `version` in Cargo.toml and
 # push to main. If there is no tag vX.Y.Z for that version yet, this builds
-#   - Linux: Aurora-Linux-x86_64.tar.gz (+ .sha256)
+#   - Linux: Aurora-Linux-x86_64.tar.gz (+ .sha256), an Arch package and a .deb
 #   - Windows: the setup, a portable zip and SHA256SUMS.txt (the app's
 #     updater checks it)
 # in parallel, then tags the commit vX.Y.Z and publishes the release (with
@@ -230,6 +230,53 @@ jobs:
           cp arch/PKGBUILD dist/PKGBUILD
           ls -l dist
 
+      # A Debian/Ubuntu package of the same files (Ubuntu 22.04+, Mint,
+      # Pop!_OS…): built from the Ubuntu 22.04 binaries. Test builds too, so
+      # testers can try it. It never holds the release back.
+      - name: Debian package
+        id: deb
+        continue-on-error: true
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          name=Aurora-Linux-x86_64
+          src=work-deb/$name
+          root=deb/aurora
+          rm -rf work-deb deb && mkdir -p work-deb && tar -C work-deb -xzf dist/$name.tar.gz
+          install -d $root/DEBIAN $root/opt/aurora $root/usr/bin $root/usr/share/applications \
+            $root/usr/share/icons/hicolor/256x256/apps $root/usr/share/doc/aurora
+          install -m755 $src/aurora $src/steamhost $root/opt/aurora/
+          for dll in steamclient64.dll steamclient32.dll; do
+            if [ -f $src/$dll ]; then install -m644 $src/$dll $root/opt/aurora/; fi
+          done
+          ln -s /opt/aurora/aurora $root/usr/bin/aurora
+          if [ -f $src/icon-256.png ]; then install -m644 $src/icon-256.png $root/usr/share/icons/hicolor/256x256/apps/aurora.png; fi
+          install -m644 $src/LICENSE $root/usr/share/doc/aurora/copyright
+          # StartupWMClass: the window's app id, which still names the settings folder.
+          printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Aurora' 'GenericName=Steam client' \
+            'Comment=Unofficial Steam client written in Rust' 'Exec=aurora' 'Icon=aurora' 'Terminal=false' \
+            'Categories=Game;' 'StartupWMClass=SteamInRust' > $root/usr/share/applications/aurora.desktop
+          {
+            echo "Package: aurora"
+            echo "Version: $VERSION"
+            echo "Architecture: amd64"
+            echo "Maintainer: Aurora <mollie2999@users.noreply.github.com>"
+            echo "Installed-Size: $(du -sk $root | cut -f1)"
+            echo "Depends: libc6 (>= 2.35), libgcc-s1, libssl3, libdbus-1-3, libgl1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libxcursor1, libxi6, libxrandr2, libwayland-client0"
+            echo "Recommends: ffmpeg, libpulse0"
+            echo "Suggests: steam-installer | steam"
+            echo "Section: games"
+            echo "Priority: optional"
+            echo "Homepage: https://github.com/mollie2999/Aurora"
+            echo "Description: Unofficial Steam client written in Rust"
+            echo " Aurora is a native Steam client: store, library, downloads, friends"
+            echo " and chat, and games launched with Steam features (Proton on Linux)."
+          } > $root/DEBIAN/control
+          deb=aurora_${VERSION}_amd64.deb
+          dpkg-deb --root-owner-group --build $root dist/$deb
+          dpkg-deb --info dist/$deb && dpkg-deb --contents dist/$deb
+          echo "pkg=$deb" >> "$GITHUB_OUTPUT"
+
       - name: Release notes
         env:
           VERSION: ${{ needs.version.outputs.version }}
@@ -238,6 +285,8 @@ jobs:
           BRANCH: ${{ github.ref_name }}
           ARCH: ${{ steps.arch.outcome }}
           ARCH_PKG: ${{ steps.arch.outputs.pkg }}
+          DEB: ${{ steps.deb.outcome }}
+          DEB_PKG: ${{ steps.deb.outputs.pkg }}
         run: |
           {
             echo "## Aurora $VERSION"
@@ -267,6 +316,14 @@ jobs:
               echo '```'
               echo
               echo "It installs to \`/opt/aurora\` with an **Aurora** menu entry and the \`aurora\` command. The \`PKGBUILD\` is attached too."
+              echo
+            fi
+            if [ "$DEB" = "success" ]; then
+              echo "**Debian, Ubuntu 22.04+, Mint:** download \`$DEB_PKG\`, then:"
+              echo
+              echo '```sh'
+              echo "sudo apt install ./$DEB_PKG"
+              echo '```'
               echo
             fi
             if [ "$WINDOWS" = "success" ]; then

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.7.3](https://github.com/mollie2999/Aurora/compare/v0.7.2...v0.7.3) (2026-11-17)
+
+**SteamInRust is now Aurora everywhere:** the program is `aurora`, the Windows setup `Aurora-Setup`, the Linux archive `Aurora-Linux-x86_64`, the Arch package `aurora-bin` (it replaces `steamonrust-bin`). Your settings, sign-ins and caches stay where they are, and installed copies update and move over by themselves ([f87388a](https://github.com/mollie2999/Aurora/commit/f87388a5f5f79ad8a00c12bdd11a433650439e1e))
+
+### New
+
+* Linux: a tray icon (KDE, GNOME with the AppIndicator extension, Cinnamon, XFCE…) with the desktop's own menu. Closing the window keeps Aurora running in the tray; the icon brings it back, also on Wayland ([920412e](https://github.com/mollie2999/Aurora/commit/920412ef2f0eceb86d7ae8d67479754e0e5d8226))
+* Steam install scripts run on a game's first launch, like Steam's "Running install script": the registry keys and setup steps some games need to start (e.g. EasyAntiCheat). On Linux inside the game's Proton prefix ([46ba8d7](https://github.com/mollie2999/Aurora/commit/46ba8d72987e23197ce00ee04c4289cd6e200a9d))
+* Store pages and game news are saved on disk: a game opened before shows at once, also after a restart or offline ([ddc0486](https://github.com/mollie2999/Aurora/commit/ddc048647c4c98fd3874a34242d741a765011efd))
+* A new Aurora logo ([b5c3e31](https://github.com/mollie2999/Aurora/commit/b5c3e3161dc25cfcdd0639f53e341f9f71dad559))
+* Debian/Ubuntu package (`aurora_<version>_amd64.deb`) next to the Arch one
+
+### Fixes
+
+* Non-Steam games launch: on Linux, Windows programs run with Proton and others are made executable; on Windows, shortcuts, quoted paths and games that need admin rights work ([46ba8d7](https://github.com/mollie2999/Aurora/commit/46ba8d72987e23197ce00ee04c4289cd6e200a9d))
+* Memory no longer grows as you open game pages: about a third less after browsing the library ([ddc0486](https://github.com/mollie2999/Aurora/commit/ddc048647c4c98fd3874a34242d741a765011efd))
+* Linux: the app no longer needs GTK ([920412e](https://github.com/mollie2999/Aurora/commit/920412ef2f0eceb86d7ae8d67479754e0e5d8226))
+
 ## [0.7.2](https://github.com/mollie2999/Aurora/compare/v0.7.1-1...v0.7.2) (2026-11-16)
 
 ### New

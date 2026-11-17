@@ -2,7 +2,7 @@
 # pkgver and the checksum and attaches the built package and this file to the
 # GitHub release; by hand: set pkgver, then `updpkgsums && makepkg -si`.
 pkgname=aurora-bin
-pkgver=0.7.2
+pkgver=0.7.3
 pkgrel=1
 # The release tag; a "0.7.1-1" release is pkgver 0.7.1, pkgrel 2.
 _tag=v$pkgver

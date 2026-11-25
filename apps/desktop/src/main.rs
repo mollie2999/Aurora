@@ -18,6 +18,8 @@ mod overlay;
 mod shell;
 mod taskbar;
 mod theme_renderer;
+#[cfg(target_os = "linux")]
+mod hyprland;
 mod tray;
 #[cfg(target_os = "linux")]
 mod tray_linux;

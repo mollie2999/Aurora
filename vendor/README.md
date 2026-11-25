@@ -12,6 +12,13 @@ the in-game overlay responsive on Wayland.
   a window behind a fullscreen game gets no frame callbacks, so eframe only
   runs `App::logic` once a requested redraw is this late. Aurora runs the
   in-game Shift+Tab overlay there, so this is its response time.
+- `native/glow_integration.rs` `run_viewport`: when `ViewportId::ROOT` is in
+  `PassMode::LogicOnly` (e.g. occluded on another Wayland/Hyprland workspace)
+  with `ActionRequested::PaintWhileHidden` queued, keep `is_visible = false`
+  so ROOT's occluded Wayland surface is not cleared/swapped, set
+  `show_ui = true` so `App::ui` still runs to create/update/remove deferred
+  child viewports (such as the fallback Shift+Tab overlay), and drain
+  `ActionRequested::PaintWhileHidden` in the `!is_visible` branch.
 
 ## epaint
 

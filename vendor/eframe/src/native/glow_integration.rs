@@ -806,14 +806,24 @@ impl GlowWinitRunning<'_> {
             };
             egui_winit::update_viewport_info(&mut viewport.info, &egui_ctx, window, false);
 
+            let has_paint_while_hidden = viewport
+                .actions_requested
+                .iter()
+                .any(|action| matches!(action, egui_winit::ActionRequested::PaintWhileHidden));
+            let logic_only_root_ui = mode == PassMode::LogicOnly
+                && viewport_id == egui::ViewportId::ROOT
+                && has_paint_while_hidden;
             let wants_paint = viewport
                 .actions_requested
                 .iter()
                 .any(egui_winit::ActionRequested::wants_paint);
             // A hidden window is not painted, since nothing would be shown — unless someone
-            // wants the pixels anyway, e.g. to screenshot an app that is in the background:
+            // wants the pixels anyway, e.g. to screenshot an app that is in the background.
+            // A LogicOnly pass on ROOT with PaintWhileHidden runs UI/viewport declarations
+            // for child viewports (such as the fallback overlay) without clearing or
+            // swapping ROOT's occluded surface.
             let is_visible = (mode == PassMode::Full && viewport.info.visible().unwrap_or(true))
-                || wants_paint;
+                || (wants_paint && !logic_only_root_ui);
 
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
@@ -831,7 +841,7 @@ impl GlowWinitRunning<'_> {
                     && child.viewport_ui_cb.is_none()
                     && is_viewport_or_descendant_visible(&glutin.viewports, child.ids.this)
             });
-            let show_ui = is_visible || has_visible_descendant;
+            let show_ui = is_visible || has_visible_descendant || logic_only_root_ui;
 
             (raw_input, viewport_ui_cb, is_visible, show_ui)
         };
@@ -991,6 +1001,12 @@ impl GlowWinitRunning<'_> {
         let window = viewport.window.clone();
         if let (Some(window), Some(egui_winit)) = (&window, &mut viewport.egui_winit) {
             egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
+        }
+
+        if !is_visible {
+            viewport
+                .actions_requested
+                .retain(|action| !matches!(action, egui_winit::ActionRequested::PaintWhileHidden));
         }
 
         if is_visible {

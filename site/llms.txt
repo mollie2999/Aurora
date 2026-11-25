@@ -20,11 +20,11 @@ Aurora signs in directly to the user's own Steam account (password, Steam Guard,
 
 ## Documentation & pages
 
-- [Home](https://mollie2999.github.io/Aurora/)
-- [Linux, Wayland & Proton Guide](https://mollie2999.github.io/Aurora/linux/)
-- [Aurora vs Steam Benchmarks](https://mollie2999.github.io/Aurora/benchmarks/)
-- [Download & Install Guide](https://mollie2999.github.io/Aurora/install/)
-- [FAQ: Safety, Anti-Cheat & Aurora vs SteamInRust](https://mollie2999.github.io/Aurora/faq/)
+- [Home](https://auroraclient.eu/)
+- [Linux, Wayland & Proton Guide](https://auroraclient.eu/linux/)
+- [Aurora vs Steam Benchmarks](https://auroraclient.eu/benchmarks/)
+- [Download & Install Guide](https://auroraclient.eu/install/)
+- [FAQ: Safety, Anti-Cheat & Aurora vs SteamInRust](https://auroraclient.eu/faq/)
 - [GitHub Repository](https://github.com/mollie2999/Aurora)
 - [Latest Release](https://github.com/mollie2999/Aurora/releases/latest)
 - [Changelog](https://github.com/mollie2999/Aurora/blob/main/CHANGELOG.md)

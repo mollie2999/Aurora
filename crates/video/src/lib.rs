@@ -599,9 +599,121 @@ const MAX_MEDIA_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum concurrent byte-range requests across a single `get()`.
 const MAX_RANGE_CONCURRENCY: usize = 6;
 
+fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+        || a == 0
+        || (a == 100 && (b & 0b1100_0000) == 64)
+        || (a == 198 && (b & 0b1111_1110) == 18)
+        || a >= 240)
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_public_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                return is_public_ipv4(v4);
+            }
+            let segs = v6.segments();
+            !((segs[0] & 0xfe00) == 0xfc00
+                || (segs[0] & 0xffc0) == 0xfe80
+                || (segs[0] == 0x2001 && segs[1] == 0x0db8))
+        }
+    }
+}
+
+fn validate_media_url(url: &reqwest::Url) -> Result<(), String> {
+    if !matches!(url.scheme(), "https" | "http") {
+        return Err("unsupported media scheme".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("media URL cannot carry credentials".into());
+    }
+    let Some(host) = url.host_str() else {
+        return Err("media URL missing host".into());
+    };
+    let clean = host.trim_end_matches('.');
+    let unbracketed = clean.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(clean);
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        if !is_public_ip(ip) {
+            return Err("blocked non-public media IP".into());
+        }
+        return Ok(());
+    }
+    let lower = unbracketed.to_ascii_lowercase();
+    if lower.is_empty()
+        || lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+    {
+        return Err("blocked local media hostname".into());
+    }
+    Ok(())
+}
+
+struct PublicDnsResolver;
+
+impl reqwest::dns::Resolve for PublicDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = tokio::task::spawn_blocking(move || -> Result<Vec<std::net::SocketAddr>, String> {
+                use std::net::ToSocketAddrs;
+                let mut out = Vec::new();
+                for addr in (host.as_str(), 0).to_socket_addrs().map_err(|e| e.to_string())? {
+                    if !is_public_ip(addr.ip()) {
+                        return Err("blocked non-public media DNS resolution".into());
+                    }
+                    out.push(addr);
+                }
+                if out.is_empty() {
+                    return Err("DNS returned no addresses".into());
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(iter)
+        })
+    }
+}
+
+/// Parse `Content-Range: bytes <start>-<end>/<total>` into `(start, end, total)`.
+fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
+    let rest = header.trim().strip_prefix("bytes ")?;
+    let (span, total) = rest.split_once('/')?;
+    let (start, end) = span.split_once('-')?;
+    let (s, e, t) = (start.trim().parse::<u64>().ok()?, end.trim().parse::<u64>().ok()?, total.trim().parse::<u64>().ok()?);
+    (s <= e && e < t).then_some((s, e, t))
+}
+
 /// One request (optionally a byte range), retried. Returns the body and the
 /// full size when the server answered with a range.
-async fn fetch(http: &reqwest::Client, sh: &Shared, url: &str, range: Option<(u64, u64)>) -> Result<(Vec<u8>, Option<u64>), String> {
+async fn fetch(
+    http: &reqwest::Client,
+    sh: &Shared,
+    url: &str,
+    range: Option<(u64, u64)>,
+    require_partial: bool,
+    enforce_public_ip: bool,
+) -> Result<(Vec<u8>, Option<u64>), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
+    if enforce_public_ip {
+        validate_media_url(&parsed)?;
+    }
     let mut last = String::new();
     for attempt in 0..4u32 {
         if sh.stopped() {
@@ -610,37 +722,58 @@ async fn fetch(http: &reqwest::Client, sh: &Shared, url: &str, range: Option<(u6
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(400 << attempt)).await;
         }
-        let mut req = http.get(url);
+        let mut req = http.get(parsed.clone());
         if let Some((a, b)) = range {
             req = req.header(reqwest::header::RANGE, format!("bytes={a}-{b}"));
         }
         match req.send().await.and_then(|r| r.error_for_status()) {
             Ok(mut r) => {
-                if r.content_length().is_some_and(|n| n > MAX_MEDIA_BYTES as u64) {
-                    return Err("video response exceeds 256 MiB limit".into());
+                if enforce_public_ip && r.remote_addr().is_some_and(|a| !is_public_ip(a.ip())) {
+                    return Err("blocked non-public media host".into());
                 }
-                let total = if r.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                    r.headers()
+                let is_partial = r.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+                if require_partial && !is_partial {
+                    return Err("expected 206 Partial Content for range request".into());
+                }
+                let (total, max_body) = if is_partial {
+                    let cr = r
+                        .headers()
                         .get(reqwest::header::CONTENT_RANGE)
                         .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.rsplit('/').next())
-                        .and_then(|t| t.parse::<u64>().ok())
+                        .and_then(parse_content_range)
+                        .ok_or_else(|| "invalid Content-Range header".to_string())?;
+                    if cr.2 > MAX_MEDIA_BYTES as u64 {
+                        return Err("Content-Range total exceeds 256 MiB limit".into());
+                    }
+                    if let Some((a, b)) = range {
+                        let expected_end = b.min(cr.2.saturating_sub(1));
+                        if cr.0 != a || cr.1 != expected_end {
+                            return Err("Content-Range does not match requested byte range".into());
+                        }
+                    }
+                    let expected_len = (cr.1 - cr.0 + 1) as usize;
+                    (Some(cr.2), expected_len.min(MAX_MEDIA_BYTES))
                 } else {
-                    None
+                    (None, MAX_MEDIA_BYTES)
                 };
-                if total.is_some_and(|t| t > MAX_MEDIA_BYTES as u64) {
-                    return Err("Content-Range total exceeds 256 MiB limit".into());
+                if r.content_length().is_some_and(|n| n > max_body as u64) {
+                    return Err("video response exceeds allowed byte limit".into());
                 }
                 let mut body = Vec::new();
                 loop {
                     match r.chunk().await {
                         Ok(Some(chunk)) => {
-                            if body.len().saturating_add(chunk.len()) > MAX_MEDIA_BYTES {
-                                return Err("video response exceeds 256 MiB limit".into());
+                            if body.len().saturating_add(chunk.len()) > max_body {
+                                return Err("video response exceeds allowed byte limit".into());
                             }
                             body.extend_from_slice(&chunk);
                         }
-                        Ok(None) => return Ok((body, total)),
+                        Ok(None) => {
+                            if is_partial && body.len() != max_body {
+                                return Err("truncated range response".into());
+                            }
+                            return Ok((body, total));
+                        }
                         Err(e) => {
                             last = e.to_string();
                             break;
@@ -656,8 +789,12 @@ async fn fetch(http: &reqwest::Client, sh: &Shared, url: &str, range: Option<(u6
 
 /// A whole file: the first part tells the size, the rest come in parallel.
 async fn get(http: reqwest::Client, sh: Arc<Shared>, url: String) -> Result<Vec<u8>, String> {
+    get_with_policy(http, sh, url, true).await
+}
+
+async fn get_with_policy(http: reqwest::Client, sh: Arc<Shared>, url: String, enforce_public_ip: bool) -> Result<Vec<u8>, String> {
     let started = Instant::now();
-    let (mut body, total) = fetch(&http, &sh, &url, Some((0, PART - 1))).await?;
+    let (mut body, total) = fetch(&http, &sh, &url, Some((0, PART - 1)), false, enforce_public_ip).await?;
     if let Some(total) = total.filter(|t| *t > PART) {
         if total > MAX_MEDIA_BYTES as u64 {
             return Err("Content-Range total exceeds 256 MiB limit".into());
@@ -670,14 +807,26 @@ async fn get(http: reqwest::Client, sh: Arc<Shared>, url: String) -> Result<Vec<
             let (h, s, u, sem) = (http.clone(), sh.clone(), url.clone(), sem.clone());
             parts.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
-                fetch(&h, &s, &u, Some((a, b))).await.map(|r| r.0)
+                fetch(&h, &s, &u, Some((a, b)), true, enforce_public_ip).await.map(|r| r.0)
             }));
             a = b + 1;
         }
         body.reserve((total as usize).saturating_sub(body.len()).min(MAX_MEDIA_BYTES));
-        for p in parts {
-            let chunk = p.await.map_err(|e| e.to_string())??;
+        let mut iter = parts.into_iter();
+        while let Some(p) = iter.next() {
+            let chunk = match p.await.map_err(|e| e.to_string()).and_then(|r| r) {
+                Ok(c) => c,
+                Err(e) => {
+                    for rest in iter {
+                        rest.abort();
+                    }
+                    return Err(e);
+                }
+            };
             if body.len().saturating_add(chunk.len()) > MAX_MEDIA_BYTES {
+                for rest in iter {
+                    rest.abort();
+                }
                 return Err("video response exceeds 256 MiB limit".into());
             }
             body.extend(chunk);
@@ -699,7 +848,31 @@ async fn media_plan(http: &reqwest::Client, sh: &Arc<Shared>, url: &str) -> Resu
 async fn download(sh: Arc<Shared>, source: Source) {
     // One client for all players: later trailers reuse warm connections.
     static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let http = HTTP.get_or_init(|| reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).read_timeout(Duration::from_secs(15)).build().unwrap_or_default()).clone();
+    let http = HTTP
+        .get_or_init(|| {
+            let redirect = reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 {
+                    return attempt.error("too many redirects");
+                }
+                if let Err(err) = validate_media_url(attempt.url()) {
+                    return attempt.error(err);
+                }
+                if let Some(origin) = attempt.previous().first() {
+                    if origin.scheme() == "https" && attempt.url().scheme() != "https" {
+                        return attempt.error("refusing HTTPS-to-HTTP media redirect");
+                    }
+                }
+                attempt.follow()
+            });
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(15))
+                .redirect(redirect)
+                .dns_resolver(Arc::new(PublicDnsResolver))
+                .build()
+                .unwrap_or_default()
+        })
+        .clone();
     if let Err(e) = load(&http, &sh, &source).await {
         if !sh.stopped() {
             sh.fail(e);
@@ -914,7 +1087,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let srv = std::thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (mut sock, _) = listener.accept().unwrap();
                 let mut req = [0u8; 2048];
                 let n = sock.read(&mut req).unwrap_or(0);
@@ -924,11 +1097,14 @@ mod tests {
                     let hdr = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/300000000\r\nContent-Length: 4\r\nConnection: close\r\n\r\n";
                     let _ = sock.write_all(hdr.as_bytes());
                     let _ = sock.write_all(b"abcd");
-                } else if req_s.to_ascii_lowercase().contains("range: bytes=0-") {
-                    // total (450_000) > PART (393_216), and first response body (500_000) > total!
+                } else if first_line.contains("/malformed") {
                     let hdr = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-499999/450000\r\nContent-Length: 500000\r\nConnection: close\r\n\r\n";
                     let _ = sock.write_all(hdr.as_bytes());
                     let _ = sock.write_all(&vec![b'a'; 500_000]);
+                } else if req_s.to_ascii_lowercase().contains("range: bytes=0-") {
+                    let hdr = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-393215/450000\r\nContent-Length: 393216\r\nConnection: close\r\n\r\n";
+                    let _ = sock.write_all(hdr.as_bytes());
+                    let _ = sock.write_all(&vec![b'a'; 393_216]);
                 } else {
                     let hdr = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 393216-449999/450000\r\nContent-Length: 56784\r\nConnection: close\r\n\r\n";
                     let _ = sock.write_all(hdr.as_bytes());
@@ -939,13 +1115,21 @@ mod tests {
 
         let http = reqwest::Client::new();
         let sh = test_shared();
-        // Case 1: total > PART and body.len() > total must not panic on underflow.
-        let r1 = get(http.clone(), sh.clone(), format!("http://{addr}/underflow")).await;
-        assert!(r1.is_ok(), "unexpected error on short Content-Range total: {r1:?}");
+        // Production get() must reject loopback URLs (SSRF).
+        let ssrf = get(http.clone(), sh.clone(), format!("http://{addr}/ok")).await;
+        assert!(ssrf.is_err(), "loopback media URL must be rejected");
 
-        // Case 2: total > 256 MiB must fail cleanly.
-        let r2 = get(http, sh, format!("http://{addr}/huge")).await;
-        assert!(r2.is_err(), "Content-Range total > 256 MiB must be rejected");
+        // Valid multi-part range download assembles exact bytes.
+        let ok = get_with_policy(http.clone(), sh.clone(), format!("http://{addr}/ok"), false).await.unwrap();
+        assert_eq!(ok.len(), 450_000);
+
+        // Malformed Content-Range (end >= total) must be rejected cleanly.
+        let bad = get_with_policy(http.clone(), sh.clone(), format!("http://{addr}/malformed"), false).await;
+        assert!(bad.is_err(), "malformed Content-Range must be rejected");
+
+        // total > 256 MiB must fail cleanly.
+        let huge = get_with_policy(http, sh, format!("http://{addr}/huge"), false).await;
+        assert!(huge.is_err(), "Content-Range total > 256 MiB must be rejected");
         srv.join().unwrap();
     }
 }

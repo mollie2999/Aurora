@@ -23,6 +23,7 @@ pub mod cb {
     pub const REMOTE_STORAGE_FILE_SHARE_RESULT: i32 = 1307;
     pub const REMOTE_STORAGE_FILE_WRITE_ASYNC_COMPLETE: i32 = 1331;
     pub const REMOTE_STORAGE_FILE_READ_ASYNC_COMPLETE: i32 = 1332;
+    pub const HTML_BROWSER_READY: i32 = 4501;
 }
 
 pub const RESULT_OK: i32 = 1;
@@ -272,7 +273,7 @@ pub fn ensure_session() -> bool {
             true
         }
         other => {
-            crate::log!("no session from Aurora: {other:?}");
+            crate::log!("no session from Aurora (received reply: {})", other.is_some());
             false
         }
     }

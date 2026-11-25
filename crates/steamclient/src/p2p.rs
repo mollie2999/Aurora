@@ -92,6 +92,7 @@ struct Channel {
 }
 
 struct Peer {
+    receive_token: u64,
     token: u64,
     candidates: Vec<SocketAddr>,
     addr: Option<SocketAddr>,
@@ -114,7 +115,7 @@ struct Peer {
 impl Peer {
     fn new() -> Self {
         let now = Instant::now();
-        Peer { token: 0, candidates: Vec::new(), addr: None, since: now, last_ping: now - Duration::from_secs(1), last_heard: None, waiting: VecDeque::new(), channels: HashMap::new(), failed: false, announced: false, answered: false, rtt: None, official: false }
+        Peer { receive_token: rand::random::<u64>() | 1, token: 0, candidates: Vec::new(), addr: None, since: now, last_ping: now - Duration::from_secs(1), last_heard: None, waiting: VecDeque::new(), channels: HashMap::new(), failed: false, announced: false, answered: false, rtt: None, official: false }
     }
 }
 
@@ -137,11 +138,10 @@ pub trait Outside: Send + Sync {
 
 pub struct Endpoint {
     me: u64,
-    token: u64,
     socket: UdpSocket,
     public: Mutex<Option<SocketAddr>>,
     peers: Mutex<HashMap<u64, Peer>>,
-    inbox: Mutex<HashMap<i32, VecDeque<(u64, Vec<u8>)>>>,
+    inbox: Mutex<HashMap<i32, crate::recv_queue::Queue<(u64, Vec<u8>)>>>,
     outside: Box<dyn Outside>,
     /// Sessions with official clients, and each one's own UDP socket.
     jingle: Mutex<crate::jingle::Jingle>,
@@ -164,7 +164,6 @@ impl Endpoint {
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
         let ep = Arc::new(Endpoint {
             me,
-            token: random_u64(),
             socket,
             public: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
@@ -199,10 +198,11 @@ impl Endpoint {
         out
     }
 
-    fn signal_payload(&self, answer: bool) -> Vec<u8> {
+    fn signal_peer(&self, peer: u64, answer: bool) {
+        let Some(token) = self.peers.lock().unwrap().get(&peer).map(|p| p.receive_token) else { return };
         let mut b = SIGNAL_MAGIC.to_vec();
         b.push(answer as u8);
-        b.extend_from_slice(&self.token.to_le_bytes());
+        b.extend_from_slice(&token.to_le_bytes());
         let c = self.candidates();
         b.push(c.len().min(16) as u8);
         for a in c.iter().take(16) {
@@ -211,7 +211,7 @@ impl Endpoint {
                 b.extend_from_slice(&v4.port().to_le_bytes());
             }
         }
-        b
+        self.outside.signal(peer, b);
     }
 
     /// A signalling message from `from` (through Steam): ours, or a
@@ -245,7 +245,7 @@ impl Endpoint {
             p.last_ping = Instant::now() - Duration::from_secs(1);
         }
         if !answer {
-            self.outside.signal(from, self.signal_payload(true));
+            self.signal_peer(from, true);
         }
     }
 
@@ -265,7 +265,7 @@ impl Endpoint {
         };
         if new {
             crate::log!("p2p: connecting to {to}");
-            self.outside.signal(to, self.signal_payload(false));
+            self.signal_peer(to, false);
             let known_sir = self.peers.lock().unwrap().get(&to).is_some_and(|p| p.answered);
             if !known_sir {
                 self.start_official(to);
@@ -494,7 +494,11 @@ impl Endpoint {
     }
 
     pub fn read(&self, channel: i32) -> Option<(u64, Vec<u8>)> {
-        self.inbox.lock().unwrap().get_mut(&channel).and_then(|q| q.pop_front())
+        let mut inbox = self.inbox.lock().unwrap();
+        let q = inbox.get_mut(&channel)?;
+        let message = q.pop_front();
+        if q.is_empty() { inbox.remove(&channel); }
+        message
     }
 
     pub fn close(&self, peer: u64) -> bool {
@@ -553,7 +557,7 @@ impl Endpoint {
                 // Tell peers we're still trying to reach about it.
                 let pending: Vec<u64> = self.peers.lock().unwrap().iter().filter(|(_, p)| p.addr.is_none()).map(|(id, _)| *id).collect();
                 for id in pending {
-                    self.outside.signal(id, self.signal_payload(false));
+                    self.signal_peer(id, false);
                 }
             }
             return;
@@ -565,7 +569,7 @@ impl Endpoint {
         let src = u64::from_le_bytes(d[5..13].try_into().unwrap());
         let dst = u64::from_le_bytes(d[13..21].try_into().unwrap());
         let token = u64::from_le_bytes(d[21..29].try_into().unwrap());
-        if dst != self.me || token != self.token {
+        if dst != self.me {
             return;
         }
         let body = &d[HEADER..];
@@ -575,7 +579,7 @@ impl Endpoint {
         {
             let mut peers = self.peers.lock().unwrap();
             let Some(p) = peers.get_mut(&src) else { return };
-            if p.token == 0 {
+            if p.token == 0 || token != p.receive_token {
                 return;
             }
             p.last_heard = Some(Instant::now());
@@ -680,9 +684,11 @@ impl Endpoint {
         }
         let mut inbox = self.inbox.lock().unwrap();
         for (ch, data) in msgs {
+            if inbox.len() >= MAX_CHANNELS && !inbox.contains_key(&ch) { continue; }
             let q = inbox.entry(ch).or_default();
             if q.len() < 8192 {
-                q.push_back((src, data));
+                q.push(src, data.capacity(), (src, data));
+                if q.is_empty() { inbox.remove(&ch); }
             }
         }
     }
@@ -1174,7 +1180,7 @@ mod tests {
         }
         let from: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let make_reliable = |ch: i32, seq: u32, idx: u16, count: u16, payload: &[u8]| {
-            let mut d = ep.header(RELIABLE, me, ep.token);
+            let mut d = ep.header(RELIABLE, me, ep.peers.lock().unwrap()[&peer_id].receive_token);
             // Fix src to peer_id.
             d[5..13].copy_from_slice(&peer_id.to_le_bytes());
             d[13..21].copy_from_slice(&me.to_le_bytes());

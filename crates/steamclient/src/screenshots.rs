@@ -56,7 +56,7 @@ fn folder() -> Option<PathBuf> {
 }
 
 /// A new file name like Steam's: `YYYYMMDDHHMMSS_N.jpg`.
-fn file_name(dir: &Path) -> PathBuf {
+fn reserve_file(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
     // Civil date from days since 1970 (Howard Hinnant's algorithm), UTC.
@@ -70,7 +70,15 @@ fn file_name(dir: &Path) -> PathBuf {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + (m <= 2) as i64;
     let stamp = format!("{y:04}{m:02}{d:02}{:02}{:02}{:02}", rem / 3600, rem / 60 % 60, rem % 60);
-    (1..).map(|n| dir.join(format!("{stamp}_{n}.jpg"))).find(|p| !p.exists()).unwrap_or_else(|| dir.join(format!("{stamp}.jpg")))
+    for n in 1u64.. {
+        let path = dir.join(format!("{stamp}_{n}.jpg"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
 }
 
 /// Save an RGB image (and its thumbnail) into the library.
@@ -81,8 +89,12 @@ fn save_rgb(rgb: Vec<u8>, width: u32, height: u32) -> Result<PathBuf, String> {
 fn save_in(dir: &Path, rgb: Vec<u8>, width: u32, height: u32) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir.join("thumbnails")).map_err(|e| e.to_string())?;
     let img = image::RgbImage::from_raw(width, height, rgb).ok_or("bad image size")?;
-    let path = file_name(dir);
-    img.save_with_format(&path, image::ImageFormat::Jpeg).map_err(|e| e.to_string())?;
+    let (path, mut file) = reserve_file(dir).map_err(|e| e.to_string())?;
+    if let Err(e) = img.write_to(&mut file, image::ImageFormat::Jpeg) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(e.to_string());
+    }
     let th = THUMB_WIDTH.min(width).max(1);
     let thumb = image::imageops::thumbnail(&img, th, (height as u64 * th as u64 / width.max(1) as u64).max(1) as u32);
     let _ = thumb.save_with_format(dir.join("thumbnails").join(path.file_name().unwrap_or_default()), image::ImageFormat::Jpeg);
@@ -291,7 +303,9 @@ mod tests {
     #[test]
     fn names_like_steam() {
         let dir = std::env::temp_dir().join("sir-shots-test");
-        let n = file_name(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (n, _) = reserve_file(&dir).unwrap();
+        assert_ne!(reserve_file(&dir).unwrap().0, n);
         let name = n.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.ends_with("_1.jpg") && name.len() == "20261108142500_1.jpg".len(), "{name}");
         assert!(name.starts_with("20"));

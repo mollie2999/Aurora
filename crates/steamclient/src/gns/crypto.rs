@@ -119,11 +119,10 @@ pub fn check_remote_cert(signed: &CertSigned, expect: u64, now_unix: u64) -> Res
         }
     }
     let id = cert_steam_id(&cert);
-    if id != 0 && expect != 0 && id != expect {
+    if expect != 0 && id != expect {
         return Err(format!("cert was issued to steamid:{id}, not steamid:{expect}"));
     }
     if let Some(exp) = cert.time_expiry
-        && trusted
         && (exp as u64) + 3600 < now_unix
     {
         return Err("cert expired".into());
@@ -217,6 +216,9 @@ impl Session {
     pub fn derive(local: LocalCrypt, remote_public: &[u8], cipher: i32, c: &Context) -> Result<Session, String> {
         let pk: [u8; 32] = remote_public.try_into().map_err(|_| "invalid DH key")?;
         let shared = local.secret.diffie_hellman(&x25519_dalek::PublicKey::from(pk));
+        if !shared.was_contributory() {
+            return Err("non-contributory X25519 public key".into());
+        }
         let premaster: [u8; 32] = Sha256::digest(shared.as_bytes()).into();
         let mut salt = [c.nonce_remote, c.nonce_local];
         if c.server {

@@ -15,12 +15,65 @@ pub fn target() -> Option<(String, String)> {
     (!pipe.is_empty() && !token.is_empty()).then(|| (pipe.to_string(), token.to_string()))
 }
 
+fn request_name(request: &Request) -> &'static str {
+    match request {
+        Request::Hello => "Hello",
+        Request::UserStats { .. } => "UserStats",
+        Request::StoreStats { .. } => "StoreStats",
+        Request::RichPresence { .. } => "RichPresence",
+        Request::CurrentPlayers => "CurrentPlayers",
+        Request::AuthTicket { .. } => "AuthTicket",
+        Request::AuthTicketWait { .. } => "AuthTicketWait",
+        Request::CancelTicket { .. } => "CancelTicket",
+        Request::BeginAuth { .. } => "BeginAuth",
+        Request::EndAuth { .. } => "EndAuth",
+        Request::EncryptedTicket { .. } => "EncryptedTicket",
+        Request::Poll => "Poll",
+        Request::LobbyCreate { .. } => "LobbyCreate",
+        Request::LobbyJoin { .. } => "LobbyJoin",
+        Request::LobbyLeave { .. } => "LobbyLeave",
+        Request::LobbyList { .. } => "LobbyList",
+        Request::LobbySetData { .. } => "LobbySetData",
+        Request::LobbyRefresh { .. } => "LobbyRefresh",
+        Request::LobbyChat { .. } => "LobbyChat",
+        Request::LobbySetOwner { .. } => "LobbySetOwner",
+        Request::LobbyInvite { .. } => "LobbyInvite",
+        Request::Signal { .. } => "Signal",
+        Request::LbFind { .. } => "LbFind",
+        Request::LbEntries { .. } => "LbEntries",
+        Request::LbUpload { .. } => "LbUpload",
+        Request::GlobalPercentages => "GlobalPercentages",
+        Request::Avatar { .. } => "Avatar",
+        Request::Http { .. } => "Http",
+        Request::UgcQuery(..) => "UgcQuery",
+        Request::UgcSubscribed => "UgcSubscribed",
+        Request::UgcSubscribe { .. } => "UgcSubscribe",
+        Request::UgcVote { .. } => "UgcVote",
+        Request::UgcGetVote { .. } => "UgcGetVote",
+        Request::UgcDownload { .. } => "UgcDownload",
+        Request::UgcCreateItem { .. } => "UgcCreateItem",
+        Request::UgcUpdateItem(..) => "UgcUpdateItem",
+        Request::UgcDeleteItem { .. } => "UgcDeleteItem",
+        Request::Inventory(..) => "Inventory",
+        Request::ItemDefs => "ItemDefs",
+        Request::PromoItems => "PromoItems",
+        Request::ServerList { .. } => "ServerList",
+        Request::InputConfig => "InputConfig",
+        Request::InputLayout { .. } => "InputLayout",
+        Request::InputLayoutApplied { .. } => "InputLayoutApplied",
+        Request::Overlay { .. } => "Overlay",
+        Request::SteamDrm => "SteamDrm",
+        Request::GameInvite { .. } => "GameInvite",
+        Request::NetworkingCert { .. } => "NetworkingCert",
+        Request::Rendezvous { .. } => "Rendezvous",
+    }
+}
+
 /// Send one request and wait for the answer. `None` if Aurora can't be
 /// reached (closed, signed out) or answered nonsense.
 pub fn request(req: Request) -> Option<Reply> {
     let (pipe, token) = target()?;
-    let what = format!("{req:?}");
-    let what = &what[..what.len().min(60)];
+    let what = request_name(&req);
     let started = Instant::now();
     if let Some(addr) = pipe.strip_prefix("tcp:") {
         let addr = crate::overlay::wire::ipc_addr(addr);
@@ -31,6 +84,13 @@ pub fn request(req: Request) -> Option<Reply> {
                 return None;
             }
         };
+        let timeout = Some(Duration::from_secs(match req {
+            Request::UgcDownload { .. } => 3600,
+            Request::Http { timeout_ms, .. } => 30 + u64::from(timeout_ms).div_ceil(1000),
+            _ => 60,
+        }));
+        stream.set_read_timeout(timeout).ok()?;
+        stream.set_write_timeout(timeout).ok()?;
         let _ = stream.set_nodelay(true);
         return exchange(&stream, token, req, what, started);
     }
@@ -76,7 +136,7 @@ where
         return None;
     }
     let parsed = serde_json::from_str::<Reply>(reply.trim());
-    crate::log!("ipc: {what} -> {} bytes in {} ms", reply.len(), started.elapsed().as_millis());
+    crate::log!("ipc: {what} ({} request bytes) -> {} bytes in {} ms", line.len(), reply.len(), started.elapsed().as_millis());
     parsed.ok()
 }
 

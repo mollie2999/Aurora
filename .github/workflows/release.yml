@@ -1,6 +1,6 @@
 # Releases happen when the version goes up: bump `version` in Cargo.toml and
 # push to main. If there is no tag vX.Y.Z for that version yet, this builds
-#   - Linux: Aurora-Linux-x86_64.tar.gz (+ .sha256), an Arch package, a .deb, an RPM and an experimental Flatpak
+#   - Linux: Aurora-Linux-x86_64.tar.gz (+ .sha256), an AppImage (+ .zsync + .sha256), an Arch package, a .deb, an RPM and an experimental Flatpak
 #   - Windows: the setup, a portable zip and SHA256SUMS.txt (the app's
 #     updater checks it)
 # in parallel, then tags the commit vX.Y.Z and publishes the complete set.
@@ -24,7 +24,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 # Two quick pushes never race to publish the same version.
 concurrency:
@@ -80,8 +80,28 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev libgtk-3-dev libxdo-dev \
+            cmake ninja-build pkg-config libssl-dev libgtk-3-dev libxdo-dev \
             libayatana-appindicator3-dev libxkbcommon-dev libwayland-dev libudev-dev
+
+      - name: Build bundled libSDL3.so.0 (gamepad/HIDAPI/haptic/sensor)
+        run: |
+          v=3.4.18
+          tarball="$RUNNER_TEMP/SDL3-$v.tar.gz"
+          curl -fsSL -o "$tarball" "https://github.com/libsdl-org/SDL/releases/download/release-$v/SDL3-$v.tar.gz"
+          echo "9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3  $tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/sdl3-src" "$RUNNER_TEMP/sdl3-build"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/sdl3-src" --strip-components=1
+          cmake -S "$RUNNER_TEMP/sdl3-src" -B "$RUNNER_TEMP/sdl3-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSDL_UNIX_CONSOLE_BUILD=ON \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+            -DSDL_AUDIO=OFF -DSDL_VIDEO=OFF -DSDL_RENDER=OFF -DSDL_GPU=OFF \
+            -DSDL_CAMERA=OFF -DSDL_DIALOG=OFF -DSDL_TRAY=OFF \
+            -DSDL_JOYSTICK=ON -DSDL_HAPTIC=ON -DSDL_HIDAPI=ON -DSDL_HIDAPI_LIBUSB=OFF -DSDL_SENSOR=ON
+          cmake --build "$RUNNER_TEMP/sdl3-build" --target SDL3-shared
+          cp -L "$RUNNER_TEMP/sdl3-build/libSDL3.so.0" "$RUNNER_TEMP/libSDL3.so.0"
+          cp "$RUNNER_TEMP/sdl3-src/LICENSE.txt" "$RUNNER_TEMP/SDL3-LICENSE.txt"
+          ls -lh "$RUNNER_TEMP/libSDL3.so.0"
 
       - name: Rust (stable)
         run: rustup toolchain install stable --profile minimal
@@ -92,17 +112,17 @@ jobs:
       # app and the steamhost helper (the headless Steam host for DRM games);
       # tests for the crates that are platform-neutral.
       - name: Test
-        run: cargo test --release --locked -p i18n -p ui -p vdf -p model -p store -p vk_overlay
+        run: cargo test --release --locked -p i18n -p ui -p vdf -p model -p store -p vk_overlay -p html_shim
 
       - name: Build
-        run: cargo build --release --locked -p aurora -p steamhost -p vk_overlay
+        run: cargo build --release --locked -p aurora -p steamhost -p vk_overlay -p html_shim
 
       # Ubuntu 22.04 has glibc 2.35, so the binaries also start on older
       # distros (Ubuntu 22.04, Mint 21, Debian 12). Fail if one needs newer.
       - name: Check the glibc the binaries need
         run: |
           max=2.35
-          for f in target/release/aurora target/release/steamhost target/release/libVkLayer_aurora_overlay.so; do
+          for f in target/release/aurora target/release/steamhost target/release/libVkLayer_aurora_overlay.so target/release/libaurora_htmlsurface.so "$RUNNER_TEMP/libSDL3.so.0"; do
             need=$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n1)
             echo "$f needs glibc $need"
             if [ "$(printf '%s\n%s\n' "$need" "$max" | sort -V | tail -n1)" != "$max" ]; then
@@ -114,7 +134,10 @@ jobs:
         run: |
           name=Aurora-Linux-x86_64
           mkdir -p dist/$name
-          cp target/release/aurora target/release/steamhost target/release/libVkLayer_aurora_overlay.so README.md LICENSE assets/icon-256.png dist/$name/
+          cp target/release/aurora target/release/steamhost target/release/libVkLayer_aurora_overlay.so \
+             target/release/libaurora_htmlsurface.so \
+             "$RUNNER_TEMP/libSDL3.so.0" "$RUNNER_TEMP/SDL3-LICENSE.txt" \
+             README.md LICENSE assets/icon-256.png dist/$name/
           tar -C dist -czf dist/$name.tar.gz $name
           (cd dist && sha256sum $name.tar.gz > $name.tar.gz.sha256)
 
@@ -184,6 +207,8 @@ jobs:
     needs: [version, linux, windows]
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       # For the changelog and Linux package recipes.
       - uses: actions/checkout@v4
@@ -250,7 +275,9 @@ jobs:
           rm -rf work-deb deb && mkdir -p work-deb && tar -C work-deb -xzf dist/$name.tar.gz
           install -d $root/DEBIAN $root/opt/aurora $root/usr/bin $root/usr/share/applications \
             $root/usr/share/icons/hicolor/256x256/apps $root/usr/share/doc/aurora
-          install -m755 $src/aurora $src/steamhost $src/libVkLayer_aurora_overlay.so $root/opt/aurora/
+          install -m755 $src/aurora $src/steamhost $src/libVkLayer_aurora_overlay.so $src/libaurora_htmlsurface.so $root/opt/aurora/
+          if [ -f $src/libSDL3.so.0 ]; then install -m755 $src/libSDL3.so.0 $root/opt/aurora/; fi
+          if [ -f $src/SDL3-LICENSE.txt ]; then install -m644 $src/SDL3-LICENSE.txt $root/usr/share/doc/aurora/SDL3-LICENSE.txt; fi
           for dll in steamclient64.dll steamclient32.dll; do
             if [ -f $src/$dll ]; then install -m644 $src/$dll $root/opt/aurora/; fi
           done
@@ -301,6 +328,26 @@ jobs:
           cp "rpm/RPMS/x86_64/aurora-$rpm_version-1.x86_64.rpm" "dist/$pkg"
           echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
 
+      - name: AppImage
+        id: appimage
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zsync desktop-file-utils
+          tool="$RUNNER_TEMP/appimagetool-x86_64.AppImage"
+          curl -fsSL -o "$tool" \
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  $tool" | sha256sum -c -
+          chmod +x "$tool"
+          pkg="Aurora-$VERSION-x86_64.AppImage"
+          mkdir -p appimage-dist
+          APPIMAGETOOL="$tool" bash repo/packaging/appimage/build-appimage.sh \
+            dist/Aurora-Linux-x86_64.tar.gz "appimage-dist/$pkg" "$VERSION"
+          (cd appimage-dist && sha256sum "$pkg" > "$pkg.sha256")
+          mv "appimage-dist/$pkg" "appimage-dist/$pkg.zsync" "appimage-dist/$pkg.sha256" dist/
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+
       - name: Flatpak bundle
         id: flatpak
         env:
@@ -323,11 +370,14 @@ jobs:
           ARCH_PKG: ${{ steps.arch.outputs.pkg }}
           DEB_PKG: ${{ steps.deb.outputs.pkg }}
           RPM_PKG: ${{ steps.rpm.outputs.pkg }}
+          APPIMAGE_PKG: ${{ steps.appimage.outputs.pkg }}
           FLATPAK_PKG: ${{ steps.flatpak.outputs.pkg }}
         run: |
           for file in "Aurora-Setup-$VERSION.exe" "Aurora-$VERSION-portable.zip" SHA256SUMS.txt \
                       Aurora-Linux-x86_64.tar.gz Aurora-Linux-x86_64.tar.gz.sha256 \
-                      "$ARCH_PKG" PKGBUILD "$DEB_PKG" "$RPM_PKG" "$FLATPAK_PKG" "$FLATPAK_PKG.sha256"; do
+                      "$ARCH_PKG" PKGBUILD "$DEB_PKG" "$RPM_PKG" \
+                      "$APPIMAGE_PKG" "$APPIMAGE_PKG.zsync" "$APPIMAGE_PKG.sha256" \
+                      "$FLATPAK_PKG" "$FLATPAK_PKG.sha256"; do
             if [ ! -s "dist/$file" ]; then
               echo "::error::Missing or empty release asset: $file"
               exit 1
@@ -343,6 +393,7 @@ jobs:
           ARCH_PKG: ${{ steps.arch.outputs.pkg }}
           DEB_PKG: ${{ steps.deb.outputs.pkg }}
           RPM_PKG: ${{ steps.rpm.outputs.pkg }}
+          APPIMAGE_PKG: ${{ steps.appimage.outputs.pkg }}
           FLATPAK_PKG: ${{ steps.flatpak.outputs.pkg }}
         run: |
           asset="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG"
@@ -364,10 +415,11 @@ jobs:
             echo '| Platform / Build | Download | Notes |'
             echo '| --- | --- | --- |'
             echo "| Windows x86-64 | [Installer]($asset/Aurora-Setup-$VERSION.exe) · [Portable ZIP]($asset/Aurora-$VERSION-portable.zip) · [SHA-256]($asset/SHA256SUMS.txt) | Run the installer or extract the ZIP |"
+            echo "| Linux x86-64 (AppImage) | [.AppImage]($asset/$APPIMAGE_PKG) · [.zsync]($asset/$APPIMAGE_PKG.zsync) · [SHA-256]($asset/$APPIMAGE_PKG.sha256) | Portable for SteamOS / Bazzite / immutable distros; Gear Lever & AppImageUpdate compatible |"
             echo "| Debian / Ubuntu / Mint | [.deb]($asset/$DEB_PKG) | Install with apt |"
             echo "| Arch Linux | [.pkg.tar.zst]($asset/$ARCH_PKG) · [PKGBUILD]($asset/PKGBUILD) | Install with pacman -U |"
             echo "| Fedora | [.rpm]($asset/$RPM_PKG) | Install with dnf |"
-            echo "| Linux x86-64 (experimental) | [.flatpak]($asset/$FLATPAK_PKG) · [SHA-256]($asset/$FLATPAK_PKG.sha256) | Install with flatpak install --user; use a native package for Steam and Proton integration |"
+            echo "| Linux x86-64 (experimental) | [.flatpak]($asset/$FLATPAK_PKG) · [SHA-256]($asset/$FLATPAK_PKG.sha256) | Install with flatpak install --user; use a native package or AppImage for Steam and Proton integration |"
             echo "| Generic Linux x86-64 | [.tar.gz]($asset/Aurora-Linux-x86_64.tar.gz) · [SHA-256]($asset/Aurora-Linux-x86_64.tar.gz.sha256) | Extract and launch aurora |"
             echo
           } > notes.md

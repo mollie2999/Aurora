@@ -40,28 +40,37 @@ pub(crate) fn mode_for_launch(app: &OwnedApp, install_dir: &Path, controller: u8
 
 pub(crate) fn mode_with_host(app: &OwnedApp, install_dir: &Path, controller: u8, host_ready: bool) -> LaunchMode {
     #[cfg(not(windows))]
-    let _ = controller;
-    #[cfg(not(windows))]
     let force_official = prefer_official();
     #[cfg(windows)]
     let force_official = false;
 
     let executable = launch_exe(app, install_dir).filter(|path| path.is_file());
     let use_host = host_ready && !force_official && executable.is_some();
+    let ac = anti_cheat(app, install_dir);
     if !use_host {
-        if let Some(ac) = anti_cheat(app, install_dir) {
+        if let Some(ac) = ac {
             return LaunchMode::OfficialSteam { anti_cheat: ac };
         }
     }
     let steam_drm = steam_drm_marked(app.app_id) || executable.is_some_and(|exe| has_steam_drm(&exe));
     if use_host {
-        #[cfg(windows)]
-        if steam_drm {
-            // The headless host has no Steam Input frontend. Let Steam
-            // start DRM games that need its controller configuration.
-            let input = crate::pads::effective_controller_override(app.app_id, controller);
-            if crate::pads::needs_steam_input_client(input) && steam_exe().is_some() {
-                return LaunchMode::OfficialSteam { anti_cheat: STEAM_DRM.into() };
+        // Demand-driven hybrid routing (without OfficialSteam):
+        // Keep HeadlessHost as default when no controller translation/custom
+        // layout is needed, or whenever Steam DRM or anti-cheat requires Valve's
+        // engine (those launches use our external OS virtual gamepad instead).
+        // For non-DRM, non-anti-cheat Windows/Proton games that actively need
+        // Steam Input translation or custom bindings, route to Aurora's
+        // steamclient so ISteamInput + layouts + XInput SHM run natively.
+        if !steam_drm && ac.is_none() && needs_aurora_input_route(app.app_id, controller) {
+            #[cfg(windows)]
+            if windows_mode(app, install_dir) == LaunchMode::Aurora {
+                return LaunchMode::Aurora;
+            }
+            #[cfg(not(windows))]
+            if let Ok(p) = linux::plan(app, install_dir)
+                && linux::client_dll(&p, install_dir).is_some()
+            {
+                return LaunchMode::Aurora;
             }
         }
         return LaunchMode::HeadlessHost { steam_drm };
@@ -82,6 +91,16 @@ pub(crate) fn mode_with_host(app: &OwnedApp, install_dir: &Path, controller: u8,
     }
     #[cfg(windows)]
     return windows_mode(app, install_dir);
+}
+
+/// Whether this launch actively needs controller translation / Steam Input
+/// (non-Xbox enabled pad connected, custom layout chosen, or per-game Enable).
+pub(crate) fn needs_aurora_input_route(app_id: AppId, controller: u8) -> bool {
+    let eff = crate::pads::effective_controller_override(app_id, controller);
+    let families = crate::pads::settings().families;
+    let has_custom = crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+    let summary = crate::pads::connected_summary();
+    summary.needs_translation(eff, &families, has_custom)
 }
 
 /// Windows: our steamclient DLL when it can serve the game.
@@ -117,10 +136,21 @@ fn mode_store(key: (AppId, PathBuf), m: LaunchMode) {
     MODE_CACHE.lock().unwrap().get_or_insert_with(Default::default).insert(key, (Instant::now(), m));
 }
 
-/// Work the mode out on a background thread (once at a time per game).
+/// Work the mode out on a background thread (once at a time per game,
+/// capped at a small number of concurrent refresh threads).
 fn mode_refresh(app: &OwnedApp, install_dir: &Path) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const MAX_MODE_WORKERS: usize = 4;
+    static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
     let key = (app.app_id, install_dir.to_path_buf());
+    let prev = ACTIVE_WORKERS.fetch_add(1, Ordering::AcqRel);
+    if prev >= MAX_MODE_WORKERS {
+        ACTIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
     if !MODE_PENDING.lock().unwrap().get_or_insert_with(Default::default).insert(key.clone()) {
+        ACTIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
         return;
     }
     let (owned, k) = (app.clone(), key.clone());
@@ -128,9 +158,11 @@ fn mode_refresh(app: &OwnedApp, install_dir: &Path) {
         let m = mode(&owned, &k.1);
         mode_store(k.clone(), m);
         MODE_PENDING.lock().unwrap().get_or_insert_with(Default::default).remove(&k);
+        ACTIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
     });
     if spawned.is_err() {
         MODE_PENDING.lock().unwrap().get_or_insert_with(Default::default).remove(&key);
+        ACTIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -235,9 +267,28 @@ fn scan_markers(dir: &Path, depth: u32) -> Option<&'static str> {
 
 // ---------------------------------------------------------- spawning
 
+fn safe_install_rel(install_dir: &Path, rel: &str) -> Option<PathBuf> {
+    if rel.is_empty() || rel.contains('\0') || rel.contains(':') || rel.starts_with('/') || rel.starts_with('\\') {
+        return None;
+    }
+    let mut out = install_dir.to_path_buf();
+    let mut pushed = false;
+    for seg in rel.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return None;
+        }
+        out.push(seg);
+        pushed = true;
+    }
+    pushed.then_some(out)
+}
+
 fn executable(app: &OwnedApp, install_dir: &Path) -> Option<PathBuf> {
     let opt = app.launch.iter().find(|o| o.runs_on_this_os() && !o.executable.is_empty())?;
-    Some(install_dir.join(normalize(&opt.executable)))
+    safe_install_rel(install_dir, &opt.executable)
 }
 
 /// What [`LaunchMode::OfficialSteam`] names for DRM-wrapped games.
@@ -417,10 +468,45 @@ pub(crate) fn steam_input_env_vars(
     env
 }
 
+/// Pass Aurora's SDL3 controller mappings (`SDL_GAMECONTROLLERCONFIG`) and,
+/// when an external OS virtual Xbox 360 pad is translating non-Xbox controllers,
+/// suppress raw physical non-Xbox VID:PIDs in SDL games (`SDL_GAMECONTROLLER_IGNORE_DEVICES`)
+/// to prevent double input without any DLL injection.
+fn apply_sdl_controller_env(cmd: &mut Command, ignore_translated_physical: bool) {
+    let summary = crate::pads::connected_summary();
+    if !summary.sdl_mappings.is_empty() {
+        let mut lines: Vec<String> = std::env::var("SDL_GAMECONTROLLERCONFIG")
+            .ok()
+            .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+            .unwrap_or_default();
+        for m in &summary.sdl_mappings {
+            if !lines.iter().any(|existing| existing == m) {
+                lines.push(m.clone());
+            }
+        }
+        cmd.env("SDL_GAMECONTROLLERCONFIG", lines.join("\n"));
+    }
+    if ignore_translated_physical && !summary.non_xbox_vid_pids.is_empty() {
+        let mut entries: Vec<String> = std::env::var("SDL_GAMECONTROLLER_IGNORE_DEVICES")
+            .ok()
+            .map(|s| s.split(',').map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+            .unwrap_or_default();
+        for (vid, pid) in &summary.non_xbox_vid_pids {
+            let item = format!("0x{vid:04X}/0x{pid:04X}");
+            if !entries.iter().any(|e| e.eq_ignore_ascii_case(&item)) {
+                entries.push(item);
+            }
+        }
+        if !entries.is_empty() {
+            cmd.env("SDL_GAMECONTROLLER_IGNORE_DEVICES", entries.join(","));
+        }
+    }
+}
+
 /// Start a game with our steamclient: environment like a Steam launch, plus
 /// the pipe and token for the DLL. The registry swap must be in place.
 /// `pads` names the shared memory with the controllers XInput can't see.
-pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchArgs, ipc_env: &str, account: &str, pads: Option<&str>, overlay: Option<(u16, &str)>) -> Result<Child, String> {
+pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchArgs, ipc_env: &str, account: &str, pads: Option<&str>, overlay: Option<(u16, &str)>, ignore_physical_pads: bool) -> Result<Child, String> {
     let connect = safe_connect_args(&args.connect)?;
     let opts = UserOptions::parse(&args.user);
     let mut cmd = command(app, install_dir, &opts, &connect)?;
@@ -463,6 +549,7 @@ pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchA
         }
     }
     let mut cmd = finish(app, install_dir, &opts, cmd);
+    apply_sdl_controller_env(&mut cmd, ignore_physical_pads);
     #[cfg(target_os = "linux")]
     apply_vk_overlay_env(&mut cmd, overlay, overlay_on);
     #[cfg(not(target_os = "linux"))]
@@ -541,11 +628,13 @@ fn command(app: &OwnedApp, install_dir: &Path, opts: &UserOptions, connect: &[St
         .find(|o| o.runs_on_this_os() && !o.executable.is_empty())
         .ok_or_else(|| format!("{} has no launch option for this OS", app.name))?;
 
-    let exe = install_dir.join(normalize(&opt.executable));
+    let exe = safe_install_rel(install_dir, &opt.executable)
+        .ok_or_else(|| format!("{} has an unsafe launch executable path", app.name))?;
     let cwd = if opt.working_dir.is_empty() {
         exe.parent().unwrap_or(install_dir).to_path_buf()
     } else {
-        install_dir.join(normalize(&opt.working_dir))
+        safe_install_rel(install_dir, &opt.working_dir)
+            .ok_or_else(|| format!("{} has an unsafe working directory path", app.name))?
     };
     tracing::info!("launching {} ({})", app.name, exe.display());
 
@@ -718,19 +807,53 @@ pub fn kill_in_folder(dir: &Path) {
     }
 }
 
+/// Adaptive post-exit grace period for launcher-to-game handoffs.
+///
+/// - If the user explicitly clicked Stop, return as soon as no process is alive.
+/// - If a process lived long enough to be the real game (>= 15s initial process
+///   or >= 10s descendant), only wait briefly (250ms) once nothing is alive.
+/// - If the initial process exited quickly (< 15s, typical of a bootstrapper
+///   like Paradox's `dowser` or a game launcher), wait up to 2s for the child
+///   game process to appear.
+fn post_exit_grace(initial_lifetime: Duration, descendant_lifetime: Option<Duration>, stop_requested: bool) -> Duration {
+    if stop_requested {
+        return Duration::ZERO;
+    }
+    const LONG_RUN: Duration = Duration::from_secs(15);
+    const LONG_DESCENDANT: Duration = Duration::from_secs(10);
+    if initial_lifetime >= LONG_RUN || descendant_lifetime.is_some_and(|d| d >= LONG_DESCENDANT) {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_secs(2)
+    }
+}
+
 /// Wait for a game process and any launcher-spawned child processes. On
 /// Windows, attaches the child to a Job Object so descendant processes
 /// (even outside `install_dir`) keep IPC and shared controller publishing
 /// alive through launcher handoff. Also check the install directory when the job
 /// is empty, since a launcher can spawn the game before job assignment.
-pub fn wait_in_dir(app_id: AppId, install_dir: &Path, mut child: Child) -> AppId {
+#[cfg(test)]
+pub fn wait_in_dir(app_id: AppId, install_dir: &Path, child: Child) -> AppId {
+    wait_in_dir_cancellable(app_id, install_dir, child, None)
+}
+
+pub(crate) fn wait_in_dir_cancellable(
+    app_id: AppId,
+    install_dir: &Path,
+    mut child: Child,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> AppId {
     #[cfg(windows)]
     let job = win::JobGuard::attach(&child);
-    wait_all(&mut child);
+    let started = Instant::now();
+    wait_all_inner(&mut child, started, stop);
     #[cfg(windows)]
     {
-        const GRACE: Duration = Duration::from_secs(5);
+        let initial_lifetime = started.elapsed();
         let mut logged = false;
+        let mut descendant_since: Option<Instant> = None;
+        let mut descendant_lifetime: Option<Duration> = None;
         let mut empty_since: Option<Instant> = None;
         loop {
             let alive = job.as_ref().is_some_and(win::JobGuard::has_processes)
@@ -740,11 +863,26 @@ pub fn wait_in_dir(app_id: AppId, install_dir: &Path, mut child: Child) -> AppId
                     tracing::info!("initial game process exited; waiting for launcher-spawned processes");
                     logged = true;
                 }
+                descendant_since.get_or_insert_with(Instant::now);
                 empty_since = None;
-            } else if empty_since.get_or_insert_with(Instant::now).elapsed() >= GRACE {
-                break;
+            } else {
+                if let Some(since) = descendant_since.take() {
+                    let dur = since.elapsed();
+                    descendant_lifetime = Some(descendant_lifetime.map_or(dur, |prev| prev.max(dur)));
+                }
+                let stopped = stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire));
+                let grace = post_exit_grace(initial_lifetime, descendant_lifetime, stopped);
+                if grace.is_zero() || empty_since.get_or_insert_with(Instant::now).elapsed() >= grace {
+                    break;
+                }
             }
-            std::thread::sleep(Duration::from_millis(250));
+            let stopped = stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire));
+            let poll_delay = if !stopped && empty_since.is_none() && descendant_since.is_some_and(|s| s.elapsed() >= Duration::from_secs(2)) {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(100)
+            };
+            std::thread::sleep(poll_delay);
         }
     }
     #[cfg(not(windows))]
@@ -756,16 +894,23 @@ pub fn wait_in_dir(app_id: AppId, install_dir: &Path, mut child: Child) -> AppId
 /// that's still in its process group, like Steam's reaper. Launchers
 /// (Cities: Skylines' Paradox Launcher, War Thunder's) start the game and
 /// exit at once; the game, and the Steam host it needs, must outlive them.
+#[cfg(test)]
 pub fn wait_all(child: &mut Child) {
+    wait_all_inner(child, Instant::now(), None);
+}
+
+fn wait_all_inner(child: &mut Child, started: Instant, stop: Option<&std::sync::atomic::AtomicBool>) {
     let _ = child.wait();
     #[cfg(not(windows))]
     {
         // A launcher handing over can leave its group empty for a moment
         // (dowser: none for ~0.1 s, then the Paradox Launcher), so the game
-        // only counts as closed once the group stays empty for a while.
-        const GRACE: Duration = Duration::from_secs(5);
+        // only counts as closed once the group stays empty for the adaptive grace.
+        let initial_lifetime = started.elapsed();
         let group = child.id();
         let mut logged = false;
+        let mut descendant_since: Option<Instant> = None;
+        let mut descendant_lifetime: Option<Duration> = None;
         let mut empty_since: Option<Instant> = None;
         loop {
             if group_alive(group) {
@@ -773,13 +918,30 @@ pub fn wait_all(child: &mut Child) {
                     tracing::info!("process {group} exited; waiting for the processes it started");
                     logged = true;
                 }
+                descendant_since.get_or_insert_with(Instant::now);
                 empty_since = None;
-            } else if empty_since.get_or_insert_with(Instant::now).elapsed() >= GRACE {
-                break;
+            } else {
+                if let Some(since) = descendant_since.take() {
+                    let dur = since.elapsed();
+                    descendant_lifetime = Some(descendant_lifetime.map_or(dur, |prev| prev.max(dur)));
+                }
+                let stopped = stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire));
+                let grace = post_exit_grace(initial_lifetime, descendant_lifetime, stopped);
+                if grace.is_zero() || empty_since.get_or_insert_with(Instant::now).elapsed() >= grace {
+                    break;
+                }
             }
-            std::thread::sleep(Duration::from_millis(250));
+            let stopped = stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire));
+            let poll_delay = if !stopped && empty_since.is_none() && descendant_since.is_some_and(|s| s.elapsed() >= Duration::from_secs(2)) {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(100)
+            };
+            std::thread::sleep(poll_delay);
         }
     }
+    #[cfg(windows)]
+    let _ = (started, stop);
 }
 
 /// Any live (not zombie) process in process group `pgid`?
@@ -1026,15 +1188,19 @@ fn app_running(app_id: AppId) -> bool {
     win::reg_dword(&format!("Software\\Valve\\Steam\\Apps\\{app_id}"), "Running").unwrap_or(0) == 1 || win::steam_launch_running(app_id)
 }
 
-fn wait_until(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+fn wait_until_every(limit: Duration, poll: Duration, mut f: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while start.elapsed() < limit {
         if f() {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(poll);
     }
     f()
+}
+
+fn wait_until(limit: Duration, f: impl FnMut() -> bool) -> bool {
+    wait_until_every(limit, Duration::from_millis(150), f)
 }
 
 /// Run a game through the official client (started with `-silent` if it
@@ -1092,7 +1258,7 @@ pub fn run_through_steam(app_id: AppId, args: &LaunchArgs, steam_id: u64, offlin
     }
     started();
     while app_running(app_id) {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(250));
     }
     if ours {
         tracing::info!("the game closed; shutting down the Steam client started for it");
@@ -1148,13 +1314,21 @@ fn official_steam_open() -> bool {
 
 pub use local::steam_settings::Setting as SteamSetting;
 
-/// Headless hosts running now (Valve's engine holds Steam's config then).
-static HOSTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Lifecycle of the single global headless Steam host.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostLifecycle {
+    Idle,
+    Running,
+    Stopping,
+}
+
+static HOST_STATE: std::sync::LazyLock<(Mutex<HostLifecycle>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(|| (Mutex::new(HostLifecycle::Idle), std::sync::Condvar::new()));
 
 /// Why Steam's own settings can't be changed right now: Steam (the official
 /// client or the headless host) is running and would overwrite them.
 pub fn steam_settings_locked() -> Option<&'static str> {
-    if HOSTS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+    if *HOST_STATE.0.lock().unwrap_or_else(|e| e.into_inner()) != HostLifecycle::Idle {
         Some("Steam is running for a game. Change these after it closes.")
     } else if official_steam_open() {
         Some("Close the official Steam client to change these.")
@@ -1229,21 +1403,48 @@ pub fn apply_steam_prefs() {
     *SETTINGS_CACHE.lock().unwrap() = None;
 }
 
-/// Counts a running host in [`HOSTS`] while alive.
+/// Tracks the active headless host lifecycle in [`HOST_STATE`] while alive.
 struct HostCount;
 
 impl HostCount {
     fn acquire() -> Result<Self, &'static str> {
-        HOSTS
-            .compare_exchange(0, 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed)
-            .map(|_| Self)
-            .map_err(|_| "Close the game using the windowless Steam host before starting another.")
+        let (lock, cv) = &*HOST_STATE;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            match *state {
+                HostLifecycle::Idle => {
+                    *state = HostLifecycle::Running;
+                    return Ok(Self);
+                }
+                HostLifecycle::Running => {
+                    return Err("Close the game using the windowless Steam host before starting another.");
+                }
+                HostLifecycle::Stopping => {
+                    let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                        return Err("Previous headless Steam host is still shutting down; try again in a moment.");
+                    };
+                    let (next, _) = cv.wait_timeout(state, rem).unwrap_or_else(|e| e.into_inner());
+                    state = next;
+                }
+            }
+        }
+    }
+
+    fn begin_stopping(&self) {
+        let (lock, _) = &*HOST_STATE;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if *state == HostLifecycle::Running {
+            *state = HostLifecycle::Stopping;
+        }
     }
 }
 
 impl Drop for HostCount {
     fn drop(&mut self) {
-        HOSTS.store(0, std::sync::atomic::Ordering::Release);
+        let (lock, cv) = &*HOST_STATE;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = HostLifecycle::Idle;
+        cv.notify_all();
     }
 }
 
@@ -1259,6 +1460,8 @@ const STEAMHOST_READY: &str = "STEAMHOST-READY";
 /// the host, waits for the game to close, then drops the pipe so the host
 /// shuts down. Nothing of Valve's is bundled or modified; the engine does its
 /// own ownership check, so a game the user doesn't own won't start.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_through_host(
     app: &OwnedApp,
     install_dir: &Path,
@@ -1267,6 +1470,23 @@ pub fn run_through_host(
     token: &str,
     steam_id: u64,
     overlay: Option<(u16, &str)>,
+    ignore_physical_pads: bool,
+    started: impl FnOnce(),
+) -> Result<(), String> {
+    run_through_host_cancellable(app, install_dir, args, account, token, steam_id, overlay, ignore_physical_pads, None, started)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_through_host_cancellable(
+    app: &OwnedApp,
+    install_dir: &Path,
+    args: &LaunchArgs,
+    account: &str,
+    token: &str,
+    steam_id: u64,
+    overlay: Option<(u16, &str)>,
+    ignore_physical_pads: bool,
+    stop: Option<&std::sync::atomic::AtomicBool>,
     started: impl FnOnce(),
 ) -> Result<(), String> {
     use std::io::{BufRead, BufReader, Write};
@@ -1285,7 +1505,7 @@ pub fn run_through_host(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let _counted = HostCount::acquire()?;
+    let counted = HostCount::acquire()?;
     let mut host = cmd.spawn().map_err(|e| format!("couldn't start the headless Steam host: {e}"))?;
 
     // Its diagnostics go to our log; the last line explains a failure.
@@ -1318,7 +1538,29 @@ pub fn run_through_host(
         let _ = tx.send(false); // stdout closed without ready = host gave up
     });
 
-    let ready = rx.recv_timeout(Duration::from_secs(90)).unwrap_or(false);
+    let wait_start = Instant::now();
+    let mut ready = false;
+    let mut cancelled = false;
+    while wait_start.elapsed() < Duration::from_secs(90) {
+        if stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire)) {
+            cancelled = true;
+            break;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(v) => {
+                ready = v;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if cancelled {
+        drop(stdin);
+        let _ = host.kill();
+        let _ = host.wait();
+        return Ok(());
+    }
     if !ready {
         let _ = host.kill();
         let _ = host.wait();
@@ -1333,12 +1575,12 @@ pub fn run_through_host(
     // Windows: steam_api finds Steam through this registry entry; point it at
     // the host (and Valve's own DLLs) while the game runs.
     #[cfg(windows)]
-    let _active = HostRegistry::point_at(host.id(), &root, model::account_id(steam_id));
+    let active = HostRegistry::point_at(host.id(), &root, model::account_id(steam_id));
     // Linux: newer steam_api checks that ~/.steam/steam.pid names a live
     // process before it connects ("did not locate a running instance of
     // Steam": the Paradox Launcher of Cities: Skylines); name the host.
     #[cfg(not(windows))]
-    let _pid_file = HostPidFile::point_at(host.id());
+    let pid_file = HostPidFile::point_at(host.id());
     tracing::info!("headless Steam host ready; launching {}", app.name);
 
     // Launch the game through Proton with lsteamclient ON (the default), so the
@@ -1349,7 +1591,7 @@ pub fn run_through_host(
         Some(mask) => tracing::info!("controllers: headless launch, native XInput slot mask {mask:#06b} (bit 0 = player 1)"),
         None => tracing::warn!("controllers: headless launch, XInputGetState unavailable"),
     }
-    let game = spawn_for_host(app, install_dir, &args.user, &connect, account, overlay);
+    let game = spawn_for_host(app, install_dir, &args.user, &connect, account, overlay, ignore_physical_pads);
     let child = match game {
         Ok(c) => c,
         Err(e) => {
@@ -1359,15 +1601,28 @@ pub fn run_through_host(
         }
     };
     started();
-    wait_in_dir(app.app_id, install_dir, child);
+    wait_in_dir_cancellable(app.app_id, install_dir, child, stop);
 
-    // Game closed: drop the pipe so the host signs out and exits.
+    // Game closed: drop the pipe so the host signs out and exits, and reap it
+    // asynchronously so the launcher's Play/Stop state updates right away.
     tracing::info!("{} closed; shutting down the headless Steam host", app.name);
+    counted.begin_stopping();
     drop(stdin);
-    if !wait_until(Duration::from_secs(10), || host.try_wait().ok().flatten().is_some()) {
-        let _ = host.kill();
+    let reap = move || {
+        let _counted = counted;
+        #[cfg(windows)]
+        let _active = active;
+        #[cfg(not(windows))]
+        let _pid_file = pid_file;
+        if !wait_until_every(Duration::from_secs(5), Duration::from_millis(50), || host.try_wait().ok().flatten().is_some()) {
+            let _ = host.kill();
+        }
+        let _ = host.wait();
+    };
+    if std::thread::Builder::new().name("steamhost-reap".into()).spawn(reap).is_err() {
+        // Fallback if thread creation fails: clean up synchronously (rare).
+        tracing::warn!("couldn't spawn steamhost-reap thread");
     }
-    let _ = host.wait();
     Ok(())
 }
 
@@ -1381,6 +1636,7 @@ fn spawn_for_host(
     connect: &[String],
     account: &str,
     overlay: Option<(u16, &str)>,
+    ignore_physical_pads: bool,
 ) -> Result<Child, String> {
     let opts = UserOptions::parse(user_args);
     let mut cmd = command(app, install_dir, &opts, connect)?;
@@ -1391,8 +1647,12 @@ fn spawn_for_host(
         .env("SteamAppUser", account)
         .env("SteamUser", account);
     let mut cmd = finish(app, install_dir, &opts, cmd);
+    apply_sdl_controller_env(&mut cmd, ignore_physical_pads);
     #[cfg(target_os = "linux")]
-    apply_vk_overlay_env(&mut cmd, overlay, app_overlay_enabled(app.app_id));
+    {
+        apply_vk_overlay_env(&mut cmd, overlay, app_overlay_enabled(app.app_id));
+        apply_html_shim_env(&mut cmd, app, install_dir);
+    }
     #[cfg(not(target_os = "linux"))]
     let _ = overlay;
     cmd.spawn().map_err(|e| format!("could not start {}: {e}", app.name))
@@ -1457,6 +1717,110 @@ fn vk_overlay_lib() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Does the game executable request Steam's `ISteamHTMLSurface` interface?
+/// Under `steamhost` (no `steamwebhelper`), `ISteamHTMLSurface::CreateBrowser`
+/// never delivers `HTML_BrowserReady_t`, causing games like Microsoft Flight
+/// Simulator (2020) to hang on their splash screen.
+#[cfg(target_os = "linux")]
+fn uses_steam_html_surface(path: &Path) -> bool {
+    use std::io::Read;
+    const NEEDLE: &[u8] = b"STEAMHTMLSURFACE_INTERFACE_VERSION";
+    const CHUNK: usize = 64 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let overlap = NEEDLE.len() - 1;
+    let mut buf = vec![0u8; overlap + CHUNK];
+    let mut carry = 0usize;
+    loop {
+        let Ok(n) = f.read(&mut buf[carry..]) else { return false };
+        if n == 0 {
+            return false;
+        }
+        let end = carry + n;
+        if contains_subslice(&buf[..end], NEEDLE) {
+            return true;
+        }
+        if end >= overlap {
+            buf.copy_within(end - overlap..end, 0);
+            carry = overlap;
+        } else {
+            carry = end;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn contains_subslice(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if hay.len() < needle.len() {
+        return false;
+    }
+    let first = needle[0];
+    let limit = hay.len() - needle.len() + 1;
+    let mut i = 0;
+    while i < limit {
+        let Some(pos) = hay[i..limit].iter().position(|&b| b == first) else {
+            return false;
+        };
+        let at = i + pos;
+        if &hay[at..at + needle.len()] == needle {
+            return true;
+        }
+        i = at + 1;
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn html_shim_lib() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("AURORA_HTML_SHIM_LIB").filter(|s| !s.is_empty()).map(PathBuf::from).filter(|p| p.is_file()) {
+        return Some(std::fs::canonicalize(&p).unwrap_or(p));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    for candidate_dir in [Some(dir), dir.parent()] {
+        let Some(d) = candidate_dir else { continue };
+        let lib = d.join("libaurora_htmlsurface.so");
+        if lib.is_file() {
+            return Some(std::fs::canonicalize(&lib).unwrap_or(lib));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn apply_html_shim_env_with(cmd: &mut Command, lib: &Path) {
+    let canon_lib = std::fs::canonicalize(lib).unwrap_or_else(|_| lib.to_path_buf());
+    let preload = append_colon_paths(existing_cmd_env(cmd, "LD_PRELOAD").as_deref(), &[&canon_lib]);
+    cmd.env("LD_PRELOAD", preload);
+    if let Some(lib_dir) = canon_lib.parent().filter(|p| !p.as_os_str().is_empty() && *p != Path::new("/") && *p != Path::new("/usr")) {
+        let pv_ro = append_colon_paths(existing_cmd_env(cmd, "PRESSURE_VESSEL_FILESYSTEMS_RO").as_deref(), &[lib_dir]);
+        if !pv_ro.is_empty() {
+            cmd.env("PRESSURE_VESSEL_FILESYSTEMS_RO", pv_ro);
+        }
+    }
+    tracing::info!("enabling headless ISteamHTMLSurface shim ({})", canon_lib.display());
+}
+
+#[cfg(target_os = "linux")]
+fn apply_html_shim_env(cmd: &mut Command, app: &OwnedApp, install_dir: &Path) {
+    match std::env::var("AURORA_HTML_SHIM").as_deref() {
+        Ok("0") => return,
+        Ok("1") => {}
+        _ => {
+            if !launch_exe(app, install_dir).is_some_and(|exe| uses_steam_html_surface(&exe)) {
+                return;
+            }
+        }
+    }
+    let Some(lib) = html_shim_lib() else {
+        tracing::warn!("headless ISteamHTMLSurface shim unavailable: libaurora_htmlsurface.so not found beside aurora executable");
+        return;
+    };
+    apply_html_shim_env_with(cmd, &lib);
 }
 
 #[cfg(target_os = "linux")]
@@ -1737,8 +2101,11 @@ fn auto_login(steam_id: u64, offline: bool) -> Option<String> {
         changes.auto_login_user = Some((before_user, account.clone()));
     }
     // Remember first, change second: a crash in between can only leave
-    // nothing to undo.
-    save_pending(&merge_changes(load_pending(), changes));
+    // nothing to undo. Refuse to mutate Steam's files if journaling fails.
+    if let Err(e) = save_pending(&merge_changes(load_pending(), changes)) {
+        tracing::warn!("could not save Steam sign-in restore journal; skipping auto-login override: {e}");
+        return None;
+    }
     win::set_string("Software\\Valve\\Steam", "AutoLoginUser", &account).ok()?;
     if new_users != users {
         let _ = std::fs::write(&users_path, new_users);
@@ -1903,18 +2270,18 @@ fn load_pending() -> Option<LoginChanges> {
     serde_json::from_str(&std::fs::read_to_string(pending_path()).ok()?).ok()
 }
 
-fn save_pending(c: &LoginChanges) {
+fn save_pending(c: &LoginChanges) -> std::io::Result<()> {
     let path = pending_path();
     if c.is_empty() {
-        let _ = std::fs::remove_file(path);
-        return;
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
     }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(c) {
-        let _ = std::fs::write(path, json);
-    }
+    let json = serde_json::to_string_pretty(c)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    crate::store::write_private(&path, json.as_bytes())
 }
 
 static PENDING_LOCK: Mutex<()> = Mutex::new(());
@@ -1923,30 +2290,40 @@ static PENDING_LOCK: Mutex<()> = Mutex::new(());
 fn restore_login_user() {
     let _l = PENDING_LOCK.lock().unwrap();
     let Some(mut c) = load_pending() else { return };
-    if let Some((before, ours)) = c.auto_login_user.take() {
-        if win::reg_string("Software\\Valve\\Steam", "AutoLoginUser").as_deref() == Some(ours.as_str()) {
-            let _ = match before {
-                Some(v) => win::set_string("Software\\Valve\\Steam", "AutoLoginUser", &v),
-                None => win::delete_value("Software\\Valve\\Steam", "AutoLoginUser"),
-            };
+    if let Some((before, ours)) = c.auto_login_user.clone() {
+        let ok = if win::reg_string("Software\\Valve\\Steam", "AutoLoginUser").as_deref() == Some(ours.as_str()) {
+            match before {
+                Some(v) => win::set_string("Software\\Valve\\Steam", "AutoLoginUser", &v).is_ok(),
+                None => win::delete_value("Software\\Valve\\Steam", "AutoLoginUser").is_ok(),
+            }
+        } else {
+            true
+        };
+        if ok {
+            c.auto_login_user = None;
+            let _ = save_pending(&c);
         }
-        save_pending(&c);
     }
 }
 
 /// Put everything back if Steam is closed. True when nothing is left to do.
 fn restore_login_files() -> bool {
     let _l = PENDING_LOCK.lock().unwrap();
-    let Some(c) = load_pending() else { return true };
+    let Some(mut c) = load_pending() else { return true };
     if steam_running() {
         return false;
     }
-    if let Some((before, ours)) = &c.auto_login_user {
-        if win::reg_string("Software\\Valve\\Steam", "AutoLoginUser").as_deref() == Some(ours.as_str()) {
-            let _ = match before {
-                Some(v) => win::set_string("Software\\Valve\\Steam", "AutoLoginUser", v),
-                None => win::delete_value("Software\\Valve\\Steam", "AutoLoginUser"),
-            };
+    if let Some((before, ours)) = c.auto_login_user.clone() {
+        let ok = if win::reg_string("Software\\Valve\\Steam", "AutoLoginUser").as_deref() == Some(ours.as_str()) {
+            match before {
+                Some(v) => win::set_string("Software\\Valve\\Steam", "AutoLoginUser", &v).is_ok(),
+                None => win::delete_value("Software\\Valve\\Steam", "AutoLoginUser").is_ok(),
+            }
+        } else {
+            true
+        };
+        if ok {
+            c.auto_login_user = None;
         }
     }
     let read = |f: &str| steam_config(f).and_then(|p| Some((std::fs::read_to_string(&p).ok()?, p)));
@@ -1954,18 +2331,26 @@ fn restore_login_files() -> bool {
     let (u_text, c_text) = (users.as_ref().map(|u| u.0.as_str()).unwrap_or(""), config.as_ref().map(|c| c.0.as_str()).unwrap_or(""));
     let (new_users, new_config) = undo_auto_login(u_text, c_text, &c);
     if let Some((old, p)) = &users {
-        if *old != new_users {
-            let _ = std::fs::write(p, &new_users);
+        if *old == new_users || std::fs::write(p, &new_users).is_ok() {
+            c.auto_login.clear();
+            c.offline.clear();
         }
     }
     if let Some((old, p)) = &config {
-        if *old != new_config {
-            let _ = std::fs::write(p, &new_config);
+        if *old == new_config || std::fs::write(p, &new_config).is_ok() {
+            c.chooser = None;
         }
     }
-    tracing::info!("put Steam's sign-in settings back as they were");
-    save_pending(&LoginChanges::default());
-    true
+    if save_pending(&c).is_err() {
+        return false;
+    }
+    if c.is_empty() {
+        tracing::info!("put Steam's sign-in settings back as they were");
+        true
+    } else {
+        tracing::warn!("some Steam sign-in settings could not be restored yet; keeping restore journal");
+        false
+    }
 }
 
 /// Restore the sign-in settings as soon as Steam is closed: now, or from a
@@ -2986,6 +3371,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finds_steam_html_surface_across_chunk_boundary_and_sets_ld_preload() {
+        let dir = std::env::temp_dir().join(format!("aurora-html-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let needle = b"STEAMHTMLSURFACE_INTERFACE_VERSION_005";
+
+        let boundary = dir.join("boundary.exe");
+        let mut data = vec![b'x'; 64 * 1024 - 10];
+        data.extend_from_slice(needle);
+        data.extend_from_slice(b"\0trailing");
+        std::fs::write(&boundary, &data).unwrap();
+
+        let plain = dir.join("plain.exe");
+        std::fs::write(&plain, b"ordinary game binary").unwrap();
+
+        assert!(uses_steam_html_surface(&boundary));
+        assert!(!uses_steam_html_surface(&plain));
+        assert!(!uses_steam_html_surface(&dir.join("missing.exe")));
+
+        let lib = dir.join("libaurora_htmlsurface.so");
+        std::fs::write(&lib, b"").unwrap();
+        let mut cmd = Command::new("/bin/true");
+        cmd.env("LD_PRELOAD", "/existing/lib.so");
+        apply_html_shim_env_with(&mut cmd, &lib);
+        let envs: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned())))
+            .collect();
+        let canon = std::fs::canonicalize(&lib).unwrap();
+        assert_eq!(envs.get("LD_PRELOAD").map(String::as_str), Some(format!("/existing/lib.so:{}", canon.display()).as_str()));
+        assert!(envs.get("PRESSURE_VESSEL_FILESYSTEMS_RO").is_some_and(|v| v.contains(&canon.parent().unwrap().to_string_lossy().to_string())));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Exercise Play's route with a real or virtual pad, Steam closed, and
     /// steam.exe, the engine and steamhost available in the test environment.
     #[cfg(windows)]
@@ -3001,14 +3422,14 @@ mod tests {
             launch: vec![model::LaunchOption { executable: "game.exe".into(), os_list: "windows".into(), arguments: String::new(), working_dir: String::new(), description: String::new() }],
             ..Default::default()
         };
-        let steam = LaunchMode::OfficialSteam { anti_cheat: STEAM_DRM.into() };
-        assert_eq!(mode(&app, &dir), if connected { steam.clone() } else { LaunchMode::HeadlessHost { steam_drm: true } });
-        assert_eq!(mode_for_launch(&app, &dir, 1), steam);
+        assert_eq!(mode(&app, &dir), LaunchMode::HeadlessHost { steam_drm: true });
+        assert_eq!(mode_for_launch(&app, &dir, 1), LaunchMode::HeadlessHost { steam_drm: true });
         assert_eq!(mode_for_launch(&app, &dir, 2), LaunchMode::HeadlessHost { steam_drm: true });
         crate::pads::set_app_controller(app.app_id, 1);
-        assert_eq!(mode(&app, &dir), steam);
+        assert_eq!(mode(&app, &dir), LaunchMode::HeadlessHost { steam_drm: true });
         assert_eq!(mode_for_launch(&app, &dir, 2), LaunchMode::HeadlessHost { steam_drm: true });
         crate::pads::set_app_controller(app.app_id, 0);
+        let _ = connected;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3363,9 +3784,9 @@ mod tests {
         ] {
             let args = LaunchArgs { user: "-novid".into(), connect: payload.clone(), controller: 0 };
             assert!(spawn(&test_app, &dir, &args, None).is_err(), "spawn must fail closed for {payload}");
-            assert!(spawn_with_steamclient(&test_app, &dir, &args, "127.0.0.1:1:tok", "acct", None, None).is_err());
+            assert!(spawn_with_steamclient(&test_app, &dir, &args, "127.0.0.1:1:tok", "acct", None, None, false).is_err());
             assert!(run_through_steam(480, &args, 1, false, || {}).unwrap_err().contains("refusing launch"));
-            assert!(run_through_host(&test_app, &dir, &args, "acct", "tok", 1, None, || {}).unwrap_err().contains("refusing launch"));
+            assert!(run_through_host(&test_app, &dir, &args, "acct", "tok", 1, None, false, || {}).unwrap_err().contains("refusing launch"));
             assert!(!pwned.exists(), "evil wrapper executed!");
             assert!(!out.exists(), "game started despite unsafe connect!");
         }
@@ -3473,6 +3894,32 @@ mod tests {
         set_overlay_enabled(false);
         assert!(!app_overlay_enabled(553850));
         set_overlay_enabled(true);
+    }
+
+    #[test]
+    fn post_exit_grace_is_short_for_normal_games_and_stop_requests() {
+        // Explicit Stop returns immediately once no processes remain.
+        assert_eq!(post_exit_grace(Duration::from_secs(1), None, true), Duration::ZERO);
+        // Short-lived launcher/bootstrapper keeps a 2s handoff window.
+        assert_eq!(post_exit_grace(Duration::from_secs(2), None, false), Duration::from_secs(2));
+        // Long-running initial game process drops to a 250ms confirmation window.
+        assert_eq!(post_exit_grace(Duration::from_secs(30), None, false), Duration::from_millis(250));
+        // Short launcher followed by a long-running child game also drops to 250ms.
+        assert_eq!(post_exit_grace(Duration::from_secs(1), Some(Duration::from_secs(20)), false), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn host_count_waits_for_stopping_host_and_rejects_running_host() {
+        let first = HostCount::acquire().expect("idle host acquires");
+        assert!(HostCount::acquire().is_err(), "running host must reject concurrent acquire");
+        first.begin_stopping();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            drop(first);
+        });
+        let second = HostCount::acquire().expect("stopping host should hand off once dropped");
+        releaser.join().unwrap();
+        drop(second);
     }
 }
 

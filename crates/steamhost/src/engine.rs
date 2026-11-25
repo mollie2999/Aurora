@@ -4,7 +4,7 @@
 //! these interfaces between builds, so nothing here may run on another one.
 
 use crate::sys::{self, Lib, class_name};
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::path::Path;
 
 /// `IClientEngine` (CLIENTENGINE_INTERFACE_VERSION005) slots, recovered from
@@ -108,23 +108,24 @@ fn zeroize_slice(buf: &mut [u8]) {
 struct SecretCString(Vec<u8>);
 
 impl SecretCString {
-    fn new(mut s: String) -> Result<Self, String> {
-        let has_nul = s.as_bytes().contains(&0);
-        let mut buf = Vec::with_capacity(s.len() + 1);
-        if !has_nul {
-            buf.extend_from_slice(s.as_bytes());
-            buf.push(0);
-        }
-        // SAFETY: all-zero bytes are valid UTF-8.
-        unsafe {
-            zeroize_slice(s.as_bytes_mut());
-        }
-        drop(s);
-        if has_nul {
-            zeroize_slice(&mut buf);
-            return Err("nul byte in refresh token".into());
-        }
-        Ok(Self(buf))
+    fn read(input: &mut impl std::io::BufRead, what: &str) -> Result<Self, String> {
+        use std::io::Read;
+        // Reserve once so growing the buffer never leaves a freed token copy.
+        const MAX: usize = 64 * 1024;
+        let mut secret = Self(Vec::with_capacity(MAX + 1));
+        let n = std::io::BufRead::read_until(&mut input.take(MAX as u64 + 1), b'\n', &mut secret.0)
+            .map_err(|e| e.to_string())?;
+        if n == 0 { return Err(format!("stdin: missing {what}")); }
+        if n > MAX { return Err(format!("{what} exceeds length limit")); }
+        let text = std::str::from_utf8(&secret.0).map_err(|_| format!("invalid UTF-8 in {what}"))?;
+        let start = text.len() - text.trim_start().len();
+        let len = text.trim().len();
+        if text.as_bytes().contains(&0) { return Err(format!("nul byte in {what}")); }
+        secret.0.copy_within(start..start + len, 0);
+        zeroize_slice(&mut secret.0[len..]);
+        secret.0.truncate(len);
+        secret.0.push(0);
+        Ok(secret)
     }
 
     fn as_ptr(&self) -> *const c_char {
@@ -145,20 +146,13 @@ impl Drop for SecretCString {
 /// Account name, refresh token and SteamID, read one per line from stdin —
 /// never argv/env, which other processes can read.
 fn read_credentials(
-    lines: &mut impl Iterator<Item = std::io::Result<String>>,
-) -> Result<(CString, SecretCString, u64), String> {
-    let mut next = |what: &str| -> Result<String, String> {
-        let l = lines.next().ok_or(format!("stdin: missing {what}"))?.map_err(|e| e.to_string())?;
-        Ok(l.trim().to_owned())
-    };
-    let (account, token, steam_id) = (next("account name")?, next("refresh token")?, next("SteamID")?);
-    let token = SecretCString::new(token)?;
-    let steam_id: u64 = steam_id.parse().map_err(|_| "SteamID must be a 64-bit number".to_string())?;
-    Ok((
-        CString::new(account).map_err(|e| e.to_string())?,
-        token,
-        steam_id,
-    ))
+    input: &mut impl std::io::BufRead,
+) -> Result<(SecretCString, SecretCString, u64), String> {
+    let account = SecretCString::read(input, "account name")?;
+    let token = SecretCString::read(input, "refresh token")?;
+    let id = SecretCString::read(input, "SteamID")?;
+    let steam_id = std::str::from_utf8(&id.0[..id.0.len()-1]).unwrap().parse().map_err(|_| "invalid SteamID")?;
+    Ok((account, token, steam_id))
 }
 
 /// A signed-in headless instance. Holding it keeps Valve's library loaded and
@@ -169,7 +163,7 @@ struct Session {
 
 /// Become the global instance and sign in with the given credentials, waiting
 /// until the engine reports logged-on (or timing out).
-fn sign_in(root: &Path, account: CString, mut token: SecretCString, steam_id: u64) -> Result<Session, String> {
+fn sign_in(root: &Path, account: SecretCString, mut token: SecretCString, steam_id: u64) -> Result<Session, String> {
     let lib = Lib::open(root)?;
     let (e, pipe, h_user) = global_instance(&lib)?;
     sys::verify_slot(e, user::GETTER)?;
@@ -215,7 +209,7 @@ fn sign_in(root: &Path, account: CString, mut token: SecretCString, steam_id: u6
 
 /// Sign in, then hold the instance for a while (manual testing).
 pub fn login(root: &Path) -> Result<(), String> {
-    let mut lines = std::io::stdin().lines();
+    let mut lines = std::io::stdin().lock();
     let (account, token, steam_id) = read_credentials(&mut lines)?;
     let _session = sign_in(root, account, token, steam_id)?;
     eprintln!("logged on");
@@ -227,7 +221,7 @@ pub fn login(root: &Path) -> Result<(), String> {
 /// stdin (or sends EOF); then shut down by exiting. This is what the app runs
 /// for a DRM game: it stays up only as long as the parent holds the pipe.
 pub fn serve(root: &Path) -> Result<(), String> {
-    let mut lines = std::io::stdin().lines();
+    let mut lines = std::io::stdin().lock();
     let (account, token, steam_id) = read_credentials(&mut lines)?;
     let _session = sign_in(root, account, token, steam_id)?;
     println!("{READY}");
@@ -235,7 +229,7 @@ pub fn serve(root: &Path) -> Result<(), String> {
     std::io::stdout().flush().map_err(|e| e.to_string())?;
     eprintln!("ready; serving until stdin closes");
     // Block until the parent drops the pipe (EOF) or sends a line.
-    for _ in lines {}
+    std::io::copy(&mut lines, &mut std::io::sink()).map_err(|e| e.to_string())?;
     eprintln!("stdin closed; shutting down");
     Ok(())
 }
@@ -283,7 +277,7 @@ mod tests {
 
     #[test]
     fn secret_cstring_zeroizes_bytes_immediately() {
-        let mut secret = SecretCString::new("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.secret".to_string()).unwrap();
+        let mut secret = SecretCString::read(&mut &b"  eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.secret \r\n"[..], "token").unwrap();
         assert_eq!(unsafe { std::ffi::CStr::from_ptr(secret.as_ptr()).to_str().unwrap() }, "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.secret");
         secret.zeroize();
         assert!(secret.0.iter().all(|&b| b == 0), "token buffer must be completely zeroed");

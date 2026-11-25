@@ -83,7 +83,8 @@ pub struct Snp {
     last_recv_rel_msg: i64,
     highest_msg: i64,
     partials: HashMap<i64, Partial>,
-    pub inbox: VecDeque<Msg>,
+    pub inbox: crate::recv_queue::Queue<Msg>,
+    peer: u64,
     pub last_recv: Option<Instant>,
     /// Bytes waiting to be sent (for status calls).
     pub pending_bytes: usize,
@@ -147,6 +148,10 @@ impl Default for Snp {
 }
 
 impl Snp {
+    pub fn for_peer(peer: u64) -> Self { Self { peer, ..Self::new() } }
+    pub fn enqueue(&mut self, message: Msg) -> bool {
+        self.inbox.push(self.peer, message.data.capacity(), message)
+    }
     pub fn new() -> Self {
         Snp {
             next_pkt: 2,
@@ -171,7 +176,8 @@ impl Snp {
             last_recv_rel_msg: 0,
             highest_msg: 0,
             partials: HashMap::new(),
-            inbox: VecDeque::new(),
+            inbox: Default::default(),
+            peer: 0,
             last_recv: None,
             pending_bytes: 0,
         }
@@ -705,7 +711,7 @@ impl Snp {
             return;
         }
         if offset == 0 && last && !self.partials.contains_key(&num) {
-            self.inbox.push_back(Msg { data: data.to_vec(), num, reliable: false, lane });
+            self.enqueue(Msg { data: data.to_vec(), num, reliable: false, lane });
             return;
         }
         if data.is_empty() && !last {
@@ -806,7 +812,7 @@ impl Snp {
             };
             dst.copy_from_slice(&part);
         }
-        self.inbox.push_back(Msg { data: msg, num, reliable: false, lane });
+        self.enqueue(Msg { data: msg, num, reliable: false, lane });
     }
 
     fn reliable_segment(&mut self, begin: u64, data: &[u8], lane: u32) -> Result<(), String> {
@@ -874,7 +880,7 @@ impl Snp {
             let data = buf[at..at + len].to_vec();
             self.highest_msg = self.highest_msg.max(num);
             self.last_recv_rel_msg = num;
-            self.inbox.push_back(Msg { data, num, reliable: true, lane });
+            if !self.enqueue(Msg { data, num, reliable: true, lane }) { return Err("receive queue full".into()); }
             let used = at + len;
             self.recv_buf.drain(..used);
             self.recv_pos += used as u64;

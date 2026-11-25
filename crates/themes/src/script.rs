@@ -190,6 +190,8 @@ impl ThemeScript {
     /// Compile a `theme.rhai` source string in a strictly sandboxed Rhai engine.
     pub fn compile(source: &str) -> Result<Self, String> {
         let mut engine = Engine::new();
+        engine.disable_symbol("eval");
+        engine.set_max_expr_depths(64, 32);
         engine.set_max_operations(MAX_OPERATIONS);
         engine.set_max_call_levels(MAX_CALL_LEVELS);
         engine.set_max_string_size(MAX_STRING_SIZE);
@@ -476,4 +478,17 @@ fn parse_rgba_array(arr: &Array) -> Option<Color32> {
     } else {
         Color32::from_rgba_unmultiplied(r, g, b, a)
     })
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_eval_and_deep_expressions() {
+        assert!(ThemeScript::compile(r#"eval("42")"#).is_err());
+        let nested = |depth| format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
+        assert!(ThemeScript::compile(&nested(65)).is_err());
+        assert!(ThemeScript::compile(&format!("fn f() {{ {} }}", nested(33))).is_err());
+    }
 }

@@ -436,7 +436,13 @@ fn block_on<T>(f: impl std::future::Future<Output = T>) -> T {
 
 fn http() -> reqwest::Client {
     static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-        reqwest::Client::builder().user_agent(concat!("Aurora/", env!("CARGO_PKG_VERSION"), " (updater)")).timeout(Duration::from_secs(60)).build().unwrap_or_default()
+        reqwest::Client::builder()
+            .user_agent(concat!("Aurora/", env!("CARGO_PKG_VERSION"), " (updater)"))
+            .https_only(true)
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(60))
+            .build()
+            .unwrap_or_default()
     });
     HTTP.clone()
 }
@@ -483,15 +489,20 @@ async fn latest() -> Result<Option<Release>, String> {
     }))
 }
 
-/// Download the setup into the private updates folder and check it against SHA256SUMS.txt.
+/// Download the setup into the private updates folder (streaming to disk while
+/// hashing) and check it against SHA256SUMS.txt.
 async fn fetch_setup(r: &Release, progress: impl Fn(f32)) -> Result<(PathBuf, String), String> {
     use sha2::{Digest, Sha256};
+    use std::io::Write;
     const MAX_INSTALLER_BYTES: usize = 512 * 1024 * 1024;
     if !is_safe_setup_name(&r.setup_name) {
         return Err("unsafe installer filename".into());
     }
     let client = http();
     let sums_url = r.sums_url.as_ref().ok_or_else(|| t!("The release has no checksums; not installing it.").to_string())?;
+    if !sums_url.starts_with("https://") || !r.setup_url.starts_with("https://") {
+        return Err("refusing non-HTTPS update URL".into());
+    }
     let sums = client.get(sums_url).send().await.and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string())?;
     let want = sums
         .lines()
@@ -506,20 +517,67 @@ async fn fetch_setup(r: &Release, progress: impl Fn(f32)) -> Result<(PathBuf, St
         return Err(t!("The download was damaged (checksum mismatch). Try again later.").to_string());
     }
     let total = resp.content_length().unwrap_or(0).max(1);
-    let mut data = Vec::with_capacity(total.min(16 * 1024 * 1024) as usize);
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        if data.len().saturating_add(chunk.len()) > MAX_INSTALLER_BYTES {
-            return Err(t!("The download was damaged (checksum mismatch). Try again later.").to_string());
-        }
-        data.extend_from_slice(&chunk);
-        progress(data.len() as f32 / total as f32);
+    let dir = updates_dir();
+    if let Some(parent) = dir.parent() {
+        ensure_private_dir(parent).map_err(|e| e.to_string())?;
     }
-    let got: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+    ensure_private_dir(&dir).map_err(|e| e.to_string())?;
+    let dst = dir.join(&r.setup_name);
+    if let Ok(meta) = std::fs::symlink_metadata(&dst)
+        && meta.file_type().is_symlink()
+    {
+        return Err("refusing symlink update destination".into());
+    }
+    let hex = client::ipc::os_random_hex(8);
+    let tmp = dir.join(format!(".{}.{}-{hex}.tmp", r.setup_name, std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
+    }
+    let mut hasher = Sha256::new();
+    let mut written = 0usize;
+    let stream_res: Result<(), String> = async {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+            if written.saturating_add(chunk.len()) > MAX_INSTALLER_BYTES {
+                return Err(t!("The download was damaged (checksum mismatch). Try again later.").to_string());
+            }
+            file.write_all(&chunk).map_err(|e| e.to_string())?;
+            hasher.update(&chunk);
+            written += chunk.len();
+            progress(written as f32 / total as f32);
+        }
+        file.sync_all().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    .await;
+    drop(file);
+    if let Err(e) = stream_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let got: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
     if !ct_eq_hex(&got, &want) {
+        let _ = std::fs::remove_file(&tmp);
         return Err(t!("The download was damaged (checksum mismatch). Try again later.").to_string());
     }
-    let path = stage_installer_in(&updates_dir(), &r.setup_name, &data)?;
-    Ok((path, want))
+    if let Err(e) = std::fs::rename(&tmp, &dst) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok((dst, want))
 }
 
 /// Close the app and let the setup replace it, then it starts again.

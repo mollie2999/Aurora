@@ -193,9 +193,12 @@ impl Server {
     }
 }
 
+const MAX_CONCURRENT_IPC: usize = 64;
+
 #[cfg(windows)]
 async fn accept(name: String, tokens: Tokens, tx: mpsc::UnboundedSender<Call>) {
     use tokio::net::windows::named_pipe::ServerOptions;
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_IPC));
     let mut first = true;
     loop {
         let server = match ServerOptions::new().first_pipe_instance(first).reject_remote_clients(true).create(&name) {
@@ -210,17 +213,34 @@ async fn accept(name: String, tokens: Tokens, tx: mpsc::UnboundedSender<Call>) {
         if server.connect().await.is_err() {
             continue;
         }
-        tokio::spawn(serve_one(server, tokens.clone(), tx.clone()));
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            tracing::warn!("steamclient pipe: too many concurrent connections");
+            continue;
+        };
+        let (tokens, tx) = (tokens.clone(), tx.clone());
+        tokio::spawn(async move {
+            let _permit = permit;
+            serve_one(server, tokens, tx).await;
+        });
     }
 }
 
 #[cfg(not(windows))]
 async fn accept_tcp(listener: tokio::net::TcpListener, tokens: Tokens, tx: mpsc::UnboundedSender<Call>) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_IPC));
     loop {
         match listener.accept().await {
             Ok((stream, peer)) if peer.ip().is_loopback() => {
                 let _ = stream.set_nodelay(true);
-                tokio::spawn(serve_one(stream, tokens.clone(), tx.clone()));
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    tracing::warn!("steamclient socket: too many concurrent connections");
+                    continue;
+                };
+                let (tokens, tx) = (tokens.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    serve_one(stream, tokens, tx).await;
+                });
             }
             Ok(_) => {}
             Err(e) => {
@@ -392,7 +412,8 @@ pub async fn user_stats(conn: &Connection, app_id: AppId, steam_id: u64, languag
     for a in &mut stats.achievements {
         let bits = values.get(&a.block).copied().unwrap_or(0);
         let time = times.get(&a.block).and_then(|t| t.get(a.bit as usize)).copied().unwrap_or(0);
-        a.unlocked = (bits >> a.bit) & 1 == 1 || time != 0;
+        let bit_set = a.bit < 32 && ((bits >> a.bit) & 1 == 1);
+        a.unlocked = bit_set || time != 0;
         a.unlock_time = if a.unlocked { time } else { 0 };
     }
     Ok(stats)
@@ -710,11 +731,16 @@ pub async fn wait_ack(auth: &SharedAuth, seq: u32) -> bool {
         if a.acked >= seq {
             return true;
         }
+        a.ack_waiters.retain(|(_, tx)| !tx.is_closed());
         let (tx, rx) = oneshot::channel();
         a.ack_waiters.push((seq, tx));
         rx
     };
-    matches!(tokio::time::timeout(std::time::Duration::from_secs(15), rx).await, Ok(Ok(())))
+    let ok = matches!(tokio::time::timeout(std::time::Duration::from_secs(15), rx).await, Ok(Ok(())));
+    if !ok {
+        auth.lock().unwrap().ack_waiters.retain(|(_, tx)| !tx.is_closed());
+    }
+    ok
 }
 
 pub fn cancel_ticket(conn: &Connection, auth: &SharedAuth, crc: u32) {
@@ -748,6 +774,7 @@ pub async fn begin_auth(conn: &Connection, auth: &SharedAuth, app_id: AppId, pid
             ticket_type: None,
         });
         let (tx, rx) = oneshot::channel();
+        a.validations.retain(|(_, tx)| !tx.is_closed());
         a.validations.push((crc, tx));
         rx
     };
@@ -755,7 +782,10 @@ pub async fn begin_auth(conn: &Connection, auth: &SharedAuth, app_id: AppId, pid
     match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
         Ok(Ok(r)) => r,
         // k_EAuthSessionResponseAuthTicketInvalid
-        _ => (8, 0),
+        _ => {
+            auth.lock().unwrap().validations.retain(|(_, tx)| !tx.is_closed());
+            (8, 0)
+        }
     }
 }
 

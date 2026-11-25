@@ -2,9 +2,9 @@
 # 1. Contributors' PRs are merged into main (PR titles like "feat: …", "fix: …").
 # 2. release-please keeps one open "chore(main): release X.Y.Z" PR that bumps
 #    the version in Cargo.toml and writes CHANGELOG.md from those titles.
-# 3. Merging that release PR tags vX.Y.Z and creates the GitHub release; the
-#    job below then builds the setup, portable zip and SHA256SUMS.txt and
-#    attaches them. Installed copies of the app update themselves from it.
+# 3. Merging that release PR pushes the bumped Cargo.toml to main; `release.yml`
+#    owns tagging vX.Y.Z and publishing all Linux + Windows assets (including
+#    SDL3.dll) so the two workflows never race or clobber each other.
 name: Release Please
 
 on:
@@ -12,64 +12,18 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
-  pull-requests: write
-
-# Newer rustup refuses a host tuple in rust-toolchain.toml's channel; this
-# picks the same GNU toolchain explicitly (it takes priority over the file).
-env:
-  RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
+  contents: read
 
 jobs:
   release-please:
     runs-on: ubuntu-latest
-    outputs:
-      created: ${{ steps.rp.outputs.release_created }}
-      tag: ${{ steps.rp.outputs.tag_name }}
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - id: rp
         uses: googleapis/release-please-action@v4
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-
-  build:
-    needs: release-please
-    if: needs.release-please.outputs.created == 'true'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release-please.outputs.tag }}
-
-      - name: MinGW (the project uses the GNU toolchain)
-        id: msys2
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: false
-          # Use the MSYS2 that ships with the runner instead of downloading it
-          # (the download often fails with HTTP 504).
-          release: false
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils mingw-w64-i686-gcc mingw-w64-i686-binutils
-
-      - name: Put MinGW on PATH
-        shell: pwsh
-        run: echo "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-
-      - run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-
-      - name: Package
-        shell: pwsh
-        env:
-          # 32-bit MinGW, so the setup includes steamclient32.dll for 32-bit games.
-          SIR_MINGW32: ${{ steps.msys2.outputs.msys2-location }}\mingw32\bin
-        run: cargo xtask package
-
-      - name: Attach the files to the release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ needs.release-please.outputs.tag }}" (Get-ChildItem target/package/dist/* | ForEach-Object FullName) --clobber
+          skip-github-release: true

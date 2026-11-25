@@ -101,19 +101,37 @@ pub async fn content_servers(conn: &Connection, cell_id: u32) -> Result<Vec<depo
         .collect())
 }
 
-pub(crate) async fn depot_key(conn: &Connection, app: AppId, depot: u32) -> Result<Vec<u8>, String> {
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DepotKeyError {
+    #[error("your license doesn't include depot {0}")]
+    Excluded(u32),
+    #[error("{0}")]
+    Failed(String),
+}
+
+pub(crate) async fn depot_key(conn: &Connection, app: AppId, depot: u32) -> Result<Vec<u8>, DepotKeyError> {
     let reply = conn
         .request(emsg::CLIENT_GET_DEPOT_DECRYPTION_KEY, &CMsgClientGetDepotDecryptionKey { depot_id: Some(depot), app_id: Some(app) })
         .await
-        .map_err(|e| e.to_string())?;
-    let r: CMsgClientGetDepotDecryptionKeyResponse = reply.body().map_err(|e| e.to_string())?;
+        .map_err(|e| DepotKeyError::Failed(e.to_string()))?;
+    let r: CMsgClientGetDepotDecryptionKeyResponse = reply.body().map_err(|e| DepotKeyError::Failed(e.to_string()))?;
+    classify_depot_key(r, depot)
+}
+
+fn classify_depot_key(r: CMsgClientGetDepotDecryptionKeyResponse, depot: u32) -> Result<Vec<u8>, DepotKeyError> {
+    if r.depot_id.is_some_and(|id| id != depot) {
+        return Err(DepotKeyError::Failed(format!("depot {depot}: mismatched response")));
+    }
     if r.eresult() == eresult::ACCESS_DENIED {
         // For content this means the license doesn't include this depot
         // (optional content, another region's files, a DLC you don't own).
-        return Err(format!("your license doesn't include depot {depot}"));
+        return Err(DepotKeyError::Excluded(depot));
     }
     if r.eresult() != eresult::OK {
-        return Err(eresult::describe(r.eresult(), &format!("depot {depot}")));
+        return Err(DepotKeyError::Failed(eresult::describe(r.eresult(), &format!("depot {depot}"))));
+    }
+    if r.depot_encryption_key().len() != 32 {
+        return Err(DepotKeyError::Failed(format!("depot {depot}: invalid key length")));
     }
     Ok(r.depot_encryption_key().to_vec())
 }
@@ -227,12 +245,13 @@ pub async fn run(
         let Some((gid, size)) = d.manifest(&req.branch) else { continue };
         let key = match depot_key(&conn, app.app_id, d.id).await {
             Ok(k) => k,
-            Err(e) => {
+            Err(DepotKeyError::Failed(e)) => return Err(e),
+            Err(e @ DepotKeyError::Excluded(_)) => {
                 // Usually a depot this account doesn't own (optional content);
                 // Steam's client skips these too. Shown on the Downloads page.
                 tracing::info!("skipping depot {}: {e}", d.id);
                 if let Ok(mut n) = progress.notes.lock() {
-                    n.push(e);
+                    n.push(e.to_string());
                 }
                 // Already installed: keep it (and its record) as it is.
                 if let Some((_, m)) = old.iter().find(|(dep, _)| *dep == d.id) {
@@ -495,6 +514,19 @@ fn write_app_manifest(req: &InstallRequest, app: &OwnedApp, install_dir: &str, d
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_confirmed_key_denials_exclude_depots() {
+        let reply = |result, len| CMsgClientGetDepotDecryptionKeyResponse {
+            eresult: result, depot_id: Some(42), depot_encryption_key: Some(vec![0; len]),
+        };
+        assert!(matches!(classify_depot_key(reply(Some(eresult::ACCESS_DENIED), 0), 42), Err(DepotKeyError::Excluded(42))));
+        for response in [reply(None, 0), reply(Some(2), 0), reply(Some(eresult::OK), 12)] {
+            assert!(matches!(classify_depot_key(response, 42), Err(DepotKeyError::Failed(_))));
+        }
+        assert!(matches!(classify_depot_key(reply(Some(eresult::ACCESS_DENIED), 0), 1), Err(DepotKeyError::Failed(_))));
+        assert!(classify_depot_key(reply(Some(eresult::OK), 32), 42).is_ok());
+    }
 
     #[test]
     fn picks_windows_64bit_language_depots() {

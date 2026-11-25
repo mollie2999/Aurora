@@ -381,10 +381,8 @@ fn prepare_parent_under_root(base: &Path, segs: &[String]) -> Result<PathBuf, St
     Ok(cur)
 }
 
-fn cloud_tmp_path(p: &Path) -> PathBuf {
-    let mut s = p.as_os_str().to_owned();
-    s.push(".sircloud");
-    PathBuf::from(s)
+fn cloud_temp(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new().prefix(".aurora-").suffix(".sircloud").tempfile_in(parent)
 }
 
 /// Steam's spelling of root names in cloud file names.
@@ -562,9 +560,15 @@ fn backup(t: &Target, name: &str, path: &Path, stamp: u64) -> Result<(), String>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.to_string()),
     }
-    let safe: String = name.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
-    let dir = crate::store::config_dir().join("cloud-backups").join(t.app_id.to_string()).join(stamp.to_string());
-    crate::store::copy_private(path, &dir.join(safe)).map_err(|e| e.to_string())
+    let dir = backups_dir(t.app_id).join(stamp.to_string());
+    backup_into(&dir, name, path)
+}
+
+fn backup_into(dir: &Path, name: &str, path: &Path) -> Result<(), String> {
+    let segs = safe_rel_segments(&clean_name(name)).ok_or("invalid cloud backup path")?;
+    crate::store::ensure_private_dir(dir).map_err(|e| e.to_string())?;
+    let dest = prepare_parent_under_root(dir, &segs)?;
+    crate::store::copy_private(path, &dest).map_err(|e| e.to_string())
 }
 
 pub fn backups_dir(app_id: AppId) -> PathBuf {
@@ -603,6 +607,24 @@ fn decide(local: Option<&str>, remote: Option<&str>, last: Option<&str>) -> Plan
         },
         (None, None) => Plan::Skip,
     }
+}
+
+fn hash_local(path: &Path) -> std::io::Result<(String, u64)> {
+    let mut hasher = Sha1::new();
+    let size = std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
+    Ok((hex(&hasher.finalize()), size))
+}
+
+fn read_for_upload(path: &Path, expected: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let sha = sha1(&data);
+    if hex(&sha) != expected {
+        return Err("save changed during sync".into());
+    }
+    if data.len() > u32::MAX as usize {
+        return Err("save exceeds Steam upload size limit".into());
+    }
+    Ok((data, sha))
 }
 
 /// Run a sync. `keep_local` / `keep_cloud` resolve earlier conflicts.
@@ -655,11 +677,19 @@ pub async fn sync(conn: &Connection, t: &Target, mode: Mode, keep_local: &[Strin
     }
     let mut snap = load_snapshot(t);
     let stamp = now();
-    let mut uploads: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
+    let mut uploads: Vec<(String, PathBuf, String)> = Vec::new();
 
     for (name, path) in &local {
-        let data = std::fs::read(path).ok();
-        let local_sha = data.as_deref().map(|d| hex(&sha1(d)));
+        let input = path.clone();
+        let hashed = tokio::task::spawn_blocking(move || hash_local(&input)).await;
+        let (local_sha, local_size) = match hashed.map_err(std::io::Error::other).and_then(|result| result) {
+            Ok((sha, size)) => (Some(sha), size),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, 0),
+            Err(e) => {
+                report.errors.push((name.clone(), e.to_string()));
+                continue;
+            }
+        };
         let r = remote.get(name);
         let mut plan = decide(local_sha.as_deref(), r.map(|r| r.sha.as_str()), snap.files.get(name).map(|s| s.as_str()));
         if plan == Plan::Conflict {
@@ -679,7 +709,7 @@ pub async fn sync(conn: &Connection, t: &Target, mode: Mode, keep_local: &[Strin
             Plan::Skip => {}
             Plan::Conflict => {
                 let r = r.expect("conflict needs a cloud file");
-                report.conflicts.push(CloudConflict { name: name.clone(), local_time: mtime(path), cloud_time: r.time, local_size: data.as_ref().map(|d| d.len() as u64).unwrap_or(0), cloud_size: r.size });
+                report.conflicts.push(CloudConflict { name: name.clone(), local_time: mtime(path), cloud_time: r.time, local_size: local_size, cloud_size: r.size });
             }
             Plan::Download if matches!(mode, Mode::Download | Mode::Sync) => match download(conn, t, r.map(|r| r.raw.as_str()).unwrap_or(name), path, stamp).await {
                 Ok(sha) => {
@@ -689,8 +719,8 @@ pub async fn sync(conn: &Connection, t: &Target, mode: Mode, keep_local: &[Strin
                 Err(e) => report.errors.push((name.clone(), e)),
             },
             Plan::Upload if matches!(mode, Mode::Upload | Mode::Sync) => {
-                if let Some(d) = data {
-                    uploads.push((name.clone(), path.clone(), d));
+                if let Some(sha) = local_sha {
+                    uploads.push((name.clone(), path.clone(), sha));
                 }
             }
             // Check mode, or the other direction: just count.
@@ -713,6 +743,20 @@ pub async fn sync(conn: &Connection, t: &Target, mode: Mode, keep_local: &[Strin
     }
     report.finished = now();
     report
+}
+
+async fn bounded_body(mut response: reqwest::Response, limit: u64) -> Result<Vec<u8>, String> {
+    if response.content_length().is_some_and(|length| length > limit) {
+        return Err("Steam Cloud download exceeds size limit".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if chunk.len() as u64 > limit - bytes.len() as u64 {
+            return Err("Steam Cloud download exceeds size limit".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Fetch one file from the cloud into place (backing up what was there).
@@ -745,24 +789,18 @@ async fn download(conn: &Connection, t: &Target, name: &str, path: &Path, stamp:
     if !resp.status().is_success() {
         return Err(format!("Steam Cloud answered {}", resp.status()));
     }
-    let raw = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
+    let raw = bounded_body(resp, MAX_CLOUD_UNCOMPRESSED_BYTES).await?;
     let (data, sha) = verify_cloud_download_bytes(&r, raw)?;
     backup(t, name, path, stamp)?;
     let verified = prepare_parent_under_root(&base, &segs)?;
-    let tmp = cloud_tmp_path(&verified);
-    if let Ok(m) = std::fs::symlink_metadata(&tmp)
-        && (is_symlink_or_reparse(&m) || m.is_dir())
-    {
-        return Err("refusing symlink temporary cloud file".into());
-    }
-    std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
+    let mut tmp = cloud_temp(verified.parent().ok_or("missing cloud target parent")?).map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut tmp, &data).map_err(|e| e.to_string())?;
     if let Ok(m) = std::fs::symlink_metadata(&verified)
         && (is_symlink_or_reparse(&m) || m.is_dir())
     {
-        let _ = std::fs::remove_file(&tmp);
         return Err("refusing symlink cloud target".into());
     }
-    std::fs::rename(&tmp, &verified).map_err(|e| e.to_string())?;
+    tmp.persist(&verified).map_err(|e| e.to_string())?;
     if r.time_stamp() > 0 {
         if let Ok(f) = std::fs::File::options().write(true).open(&verified) {
             let _ = f.set_modified(UNIX_EPOCH + Duration::from_secs(r.time_stamp()));
@@ -795,7 +833,7 @@ pub async fn delete(conn: &Connection, t: &Target, names: &[String]) -> Result<V
         .await
         .map_err(|e| e.to_string())?;
     let mut done = Vec::new();
-    let mut failed = None;
+    let mut failed = Vec::new();
     for name in names {
         let r = conn
             .call::<_, CCloudClientDeleteFileResponse>(
@@ -805,23 +843,27 @@ pub async fn delete(conn: &Connection, t: &Target, names: &[String]) -> Result<V
             .await;
         match r {
             Ok(_) => done.push(name.clone()),
-            Err(e) => failed = Some(format!("{name}: {e}")),
+            Err(e) => failed.push(format!("{name}: {e}")),
         }
     }
-    let _ = conn
+    let completion = conn
         .call::<_, CCloudCompleteAppUploadBatchResponse>(
             "Cloud.CompleteAppUploadBatchBlocking#1",
-            &CCloudCompleteAppUploadBatchRequest { appid: Some(t.app_id), batch_id: batch.batch_id, batch_eresult: Some(if failed.is_none() { 1 } else { 2 }) },
+            &CCloudCompleteAppUploadBatchRequest { appid: Some(t.app_id), batch_id: batch.batch_id, batch_eresult: Some(if failed.is_empty() { 1 } else { 2 }) },
         )
         .await;
-    match failed {
-        Some(e) if done.is_empty() => Err(e),
-        _ => Ok(done),
+    finish_batch(done, failed, completion.map(|_| ()).map_err(|e| e.to_string()))
+}
+
+fn finish_batch<T>(done: Vec<T>, mut errors: Vec<String>, completion: Result<(), String>) -> Result<Vec<T>, String> {
+    if let Err(e) = completion {
+        errors.push(format!("completing cloud batch: {e}"));
     }
+    if errors.is_empty() { Ok(done) } else { Err(errors.join("; ")) }
 }
 
 /// Send changed files up in one batch. Returns (name, sha) of each sent file.
-async fn upload(conn: &Connection, t: &Target, files: &[(String, PathBuf, Vec<u8>)]) -> Result<Vec<(String, String)>, String> {
+async fn upload(conn: &Connection, t: &Target, files: &[(String, PathBuf, String)]) -> Result<Vec<(String, String)>, String> {
     let machine = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Aurora".into());
     let batch: CCloudBeginAppUploadBatchResponse = conn
         .call(
@@ -838,9 +880,17 @@ async fn upload(conn: &Connection, t: &Target, files: &[(String, PathBuf, Vec<u8
         .await
         .map_err(|e| e.to_string())?;
     let mut done = Vec::new();
-    let mut failed = None;
-    for (name, path, data) in files {
-        let sha = sha1(data);
+    let mut failed = Vec::new();
+    for (name, path, expected) in files {
+        let (input, hash) = (path.clone(), expected.clone());
+        let read = tokio::task::spawn_blocking(move || read_for_upload(&input, &hash)).await;
+        let (data, sha) = match read.map_err(|e| e.to_string()).and_then(|r| r) {
+            Ok(file) => file,
+            Err(e) => {
+                failed.push(format!("{name}: {e}"));
+                continue;
+            }
+        };
         let begin: Result<CCloudClientBeginFileUploadResponse, _> = conn
             .call(
                 "Cloud.ClientBeginFileUpload#1",
@@ -860,7 +910,7 @@ async fn upload(conn: &Connection, t: &Target, files: &[(String, PathBuf, Vec<u8
             )
             .await;
         let ok = match begin {
-            Ok(b) => send_blocks(&b, data).await,
+            Ok(b) => send_blocks(&b, &data).await,
             Err(e) => Err(e.to_string()),
         };
         let commit: Result<CCloudClientCommitFileUploadResponse, _> = conn
@@ -871,21 +921,18 @@ async fn upload(conn: &Connection, t: &Target, files: &[(String, PathBuf, Vec<u8
             .await;
         match (ok, commit) {
             (Ok(()), Ok(c)) if c.file_committed() => done.push((name.clone(), hex(&sha))),
-            (Err(e), _) => failed = Some(format!("{name}: {e}")),
-            (_, Err(e)) => failed = Some(format!("{name}: {e}")),
-            _ => failed = Some(format!("{name}: Steam didn't accept the file")),
+            (Err(e), _) => failed.push(format!("{name}: {e}")),
+            (_, Err(e)) => failed.push(format!("{name}: {e}")),
+            _ => failed.push(format!("{name}: Steam didn't accept the file")),
         }
     }
-    let _ = conn
+    let completion = conn
         .call::<_, CCloudCompleteAppUploadBatchResponse>(
             "Cloud.CompleteAppUploadBatchBlocking#1",
-            &CCloudCompleteAppUploadBatchRequest { appid: Some(t.app_id), batch_id: batch.batch_id, batch_eresult: Some(if failed.is_none() { 1 } else { 2 }) },
+            &CCloudCompleteAppUploadBatchRequest { appid: Some(t.app_id), batch_id: batch.batch_id, batch_eresult: Some(if failed.is_empty() { 1 } else { 2 }) },
         )
         .await;
-    match failed {
-        Some(e) if done.is_empty() => Err(e),
-        _ => Ok(done),
-    }
+    finish_batch(done, failed, completion.map(|_| ()).map_err(|e| e.to_string()))
 }
 
 /// Upload a single shared file (e.g. Workshop content or preview image) via Steam Cloud.
@@ -1055,6 +1102,58 @@ fn http() -> &'static reqwest::Client {
 #[cfg(test)]
 mod https_tests {
     use super::*;
+
+    #[test]
+    fn cloud_files_are_exclusive_and_uploads_detect_changed_content() {
+        let root = tempfile::tempdir().unwrap();
+        let a = cloud_temp(root.path()).unwrap();
+        let b = cloud_temp(root.path()).unwrap();
+        assert_ne!(a.path(), b.path());
+        std::fs::write(a.path(), b"one").unwrap();
+        let (sha, size) = hash_local(a.path()).unwrap();
+        assert_eq!(size, 3);
+        assert!(read_for_upload(a.path(), &sha).is_ok());
+        backup_into(root.path(), "slots/a.sav", a.path()).unwrap();
+        std::fs::write(a.path(), b"two").unwrap();
+        assert!(read_for_upload(a.path(), &sha).is_err());
+        backup_into(root.path(), "slots_a.sav", a.path()).unwrap();
+        assert!(backup_into(root.path(), "slots/a.sav", a.path()).is_err());
+        assert_eq!(std::fs::read(root.path().join("slots/a.sav")).unwrap(), b"one");
+        assert_eq!(std::fs::read(root.path().join("slots_a.sav")).unwrap(), b"two");
+    }
+
+    #[test]
+    fn partial_batch_and_completion_errors_reach_caller() {
+        assert_eq!(finish_batch(vec![1], vec![], Ok(())).unwrap(), [1]);
+        assert!(finish_batch(vec![1], vec!["missing save".into()], Ok(())).is_err());
+        assert!(finish_batch(vec![1], vec![], Err("timeout".into())).is_err());
+    }
+
+    #[tokio::test]
+    async fn download_caps_announced_and_chunked_bodies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (response, allowed) in [
+            ("Content-Length: 4\r\n\r\n", false),
+            ("Transfer-Encoding: chunked\r\n\r\n2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n", false),
+            ("Content-Length: 3\r\n\r\nabc", true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.read(&mut [0; 4096]).await.unwrap();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\n{response}").as_bytes()).await.unwrap();
+            });
+            let response = reqwest::Client::builder().no_proxy().build().unwrap().get(format!("http://{addr}")).send().await.unwrap();
+            let result = bounded_body(response, 3).await;
+            if allowed {
+                assert_eq!(result.unwrap(), b"abc");
+            } else {
+                assert!(result.unwrap_err().contains("size limit"));
+            }
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn send_blocks_refuses_plaintext_http() {

@@ -128,7 +128,7 @@ pub async fn sync(conn: &Connection, me: SteamId, app: AppId, library: &Path, ce
 
 /// An item stored as a manifest in the game's depot (depot id = app id).
 async fn depot_item(conn: &Connection, cdn: Arc<depot::Cdn>, app: AppId, gid: u64, dir: &Path) -> Result<u64, String> {
-    let key = crate::download::depot_key(conn, app, app).await?;
+    let key = crate::download::depot_key(conn, app, app).await.map_err(|e| e.to_string())?;
     let code = crate::download::request_code(conn, app, app, gid, "public").await;
     let raw = cdn.manifest(app, gid, code).await.map_err(|e| e.to_string())?;
     let mut manifest = depot::Manifest::from_cdn(&raw).map_err(|e| e.to_string())?;

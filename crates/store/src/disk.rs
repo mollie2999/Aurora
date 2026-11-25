@@ -5,9 +5,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
+static WRITES_SINCE_TRIM: AtomicUsize = AtomicUsize::new(0);
+static TRIM_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Folder size limit; trimmed back to 80% of it at start, oldest first.
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -58,9 +61,22 @@ pub(crate) fn read_any(key: &str) -> Option<Vec<u8>> {
 
 pub(crate) fn write(key: &str, bytes: &[u8]) {
     let Some(path) = path(key) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let tmp = path.with_extension("part");
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
+        if WRITES_SINCE_TRIM.fetch_add(1, Ordering::Relaxed) >= 64
+            && !TRIM_RUNNING.swap(true, Ordering::AcqRel)
+            && let Some(dir) = DIR.get().cloned()
+        {
+            WRITES_SINCE_TRIM.store(0, Ordering::Relaxed);
+            std::thread::spawn(move || {
+                trim(&dir);
+                TRIM_RUNNING.store(false, Ordering::Release);
+            });
+        }
     }
 }
 

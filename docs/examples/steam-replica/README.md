@@ -9,7 +9,7 @@ A declarative theme modeled on the modern Steam desktop client, using its two-ro
 - 40 px footer with Add a Game, centered 420 px download area, and Friends & Chat.
 - Modern 2023+, Classic 2018 Blue, and VGUI 2010 Olive palette options. Header accents, utility buttons, account surfaces, sidebar controls, shelf gradients, and separators all follow the selected palette. Changing an accent keeps neutral surfaces in their chosen era.
 
-Install `steam-replica-theme.zip` through **Settings → Appearance → Install Theme…**, then activate **Aurora Desktop**. Choose a palette under **Theme options → Steam Era**. Version 2.3.0 uses the updated theme engine's library Collections action; update Aurora alongside the theme for that control to work.
+**Aurora Desktop** is bundled with Aurora and installed automatically on startup — open **Settings → Appearance** and activate **Aurora Desktop** (or install a custom `steam-replica-theme.zip` via **Install Theme…**). Choose a palette under **Theme options → Steam Era**. Version 2.3.0 uses the updated theme engine's library Collections action; update Aurora alongside the theme for that control to work.
 
 The shell and library home are the closest matches. Each era uses the same modern layout with its own complete palette; the older options do not reproduce historical Steam layouts. Game detail pages and other built-in pages retain Aurora's layout. Aurora's existing card hover effects remain in use: this package does not ship a card-overlay script because the declarative library renderer does not invoke that hook. The header's highlighted people button opens Friends & Chat.
 

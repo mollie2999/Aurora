@@ -332,34 +332,21 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub(crate) fn copy_private(src: &Path, dst: &Path) -> std::io::Result<()> {
     let dir = dst.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory"))?;
     ensure_private_dir(dir)?;
-    if let Ok(meta) = std::fs::symlink_metadata(dst) {
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "refusing to overwrite symlink"));
-        }
-    }
     let mut reader = std::fs::File::open(src)?;
-    let base_name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("backup");
-    let (mut f, tmp) = open_unique_temp(dir, base_name)?;
-    let res = (|| -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::io::copy(&mut reader, &mut f)?;
-        f.sync_all()?;
-        Ok(())
-    })();
-    drop(f);
-    if let Err(e) = res {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    if let Err(e) = std::fs::rename(&tmp, dst) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    let mut file = options.open(dst)?;
+    let result = std::io::copy(&mut reader, &mut file).and_then(|_| file.sync_all());
+    if result.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(dst);
     }
-    Ok(())
+    result
 }
 
 pub fn find(account: &str) -> Option<SavedAccount> {

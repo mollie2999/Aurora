@@ -1315,6 +1315,16 @@ pub fn backup_game(game: &InstalledGame, backup_dir: &Path, progress: &Progress)
         return Err("Backup folder cannot overlap with the game install folder.".into());
     }
 
+    struct Reservation(PathBuf);
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+    let lock = backup_dir.join(".aurora-backup.lock");
+    fs::create_dir(&lock).map_err(|e| format!("could not reserve backup destination {}: {e}", lock.display()))?;
+    let _reservation = Reservation(lock);
+
     let final_meta = backup_dir.join("aurora-backup.json");
     let acf_name = format!("appmanifest_{}.acf", game.app_id);
     let final_acf = backup_dir.join(&acf_name);
@@ -1346,12 +1356,12 @@ pub fn backup_game(game: &InstalledGame, backup_dir: &Path, progress: &Progress)
     progress.done_bytes.store(0, Ordering::Relaxed);
 
     let stage_root = backup_dir.join(format!(".aurora-backup-{}-{}", game.app_id, next_temp_tag()));
+    fs::create_dir(&stage_root).map_err(|e| format!("could not create staging dir {}: {e}", stage_root.display()))?;
     let cleanup = || {
         let _ = remove_tree_safe(&stage_root);
     };
 
     let stage_res = (|| -> Result<BackupManifest, String> {
-        fs::create_dir(&stage_root).map_err(|e| format!("could not create staging dir {}: {e}", stage_root.display()))?;
         let canon_stage = ensure_real_dir(&stage_root, "backup staging")?;
         let (stage_common, canon_stage_common) = ensure_real_subdir(&stage_root, &canon_stage, "common", "staging common")?;
         let (stage_game, canon_stage_game) = ensure_real_subdir(&stage_common, &canon_stage_common, &src.folder_name, "staging game")?;
@@ -1488,31 +1498,15 @@ pub fn backup_game(game: &InstalledGame, backup_dir: &Path, progress: &Progress)
         }
     };
     let _ = canon_backup_common;
-    let move_res = (|| -> Result<(), String> {
-        fs::rename(stage_root.join("common").join(&src.folder_name), &final_game_dir)
-            .map_err(|e| format!("could not finalize backup game folder: {e}"))?;
-        if has_ws {
-            fs::rename(stage_root.join("workshop"), backup_dir.join("workshop"))
-                .map_err(|e| format!("could not finalize backup workshop folder: {e}"))?;
-        }
-        fs::rename(stage_root.join(&acf_name), &final_acf)
-            .map_err(|e| format!("could not finalize backup manifest: {e}"))?;
-        fs::rename(stage_root.join("aurora-backup.json"), &final_meta)
-            .map_err(|e| format!("could not finalize aurora-backup.json: {e}"))?;
-        Ok(())
-    })();
-
-    if let Err(e) = move_res {
-        let _ = remove_tree_safe(&final_game_dir);
-        if has_ws {
-            let _ = remove_tree_safe(&backup_dir.join("workshop"));
-        }
-        let _ = fs::remove_file(&final_acf);
-        let _ = fs::remove_file(&final_meta);
-        cleanup();
-        return Err(e);
+    let mut artifacts = vec![(stage_root.join("common").join(&src.folder_name), final_game_dir, true)];
+    if has_ws {
+        artifacts.push((stage_root.join("workshop"), backup_dir.join("workshop"), true));
     }
+    artifacts.push((stage_root.join(&acf_name), final_acf, false));
+    artifacts.push((stage_root.join("aurora-backup.json"), final_meta.clone(), false));
+    let published = publish_backup(&artifacts);
     cleanup();
+    published?;
 
     if total_bytes == 0 {
         progress.done_bytes.store(1, Ordering::Relaxed);
@@ -1525,6 +1519,22 @@ pub fn backup_game(game: &InstalledGame, backup_dir: &Path, progress: &Progress)
         bytes_copied: total_bytes,
         files_copied: manifest.files.len() + manifest.workshop_files.len(),
     })
+}
+
+fn publish_backup(artifacts: &[(PathBuf, PathBuf, bool)]) -> Result<(), String> {
+    for (index, (source, dest, _)) in artifacts.iter().enumerate() {
+        if let Err(e) = fs::rename(source, dest) {
+            for (_, moved, directory) in artifacts[..index].iter().rev() {
+                if *directory {
+                    let _ = remove_tree_safe(moved);
+                } else {
+                    let _ = fs::remove_file(moved);
+                }
+            }
+            return Err(format!("could not finalize {}: {e}", dest.display()));
+        }
+    }
+    Ok(())
 }
 
 enum BackupLayout {
@@ -2253,6 +2263,27 @@ mod tests {
         assert!(left.is_empty(), "staging should be cleaned up: {left:?}");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn backup_reservation_and_rollback_preserve_other_artifacts() {
+        let root = temp_root("backup-reservation");
+        let lib = root.join("lib");
+        let game = make_test_game(&lib, 730, "CS2", "CS2", false);
+        let dest = root.join("dest");
+        fs::create_dir_all(dest.join(".aurora-backup.lock")).unwrap();
+        assert!(backup_game(&game, &dest, &Progress::default()).unwrap_err().contains("reserve"));
+        assert!(dest.join(".aurora-backup.lock").is_dir());
+        fs::write(root.join("source"), b"new").unwrap();
+        fs::write(dest.join("other"), b"previous").unwrap();
+        let artifacts = [
+            (root.join("source"), dest.join("new"), false),
+            (root.join("missing"), dest.join("other"), false),
+        ];
+        assert!(publish_backup(&artifacts).is_err());
+        assert!(!dest.join("new").exists());
+        assert_eq!(fs::read(dest.join("other")).unwrap(), b"previous");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -404,6 +404,9 @@
 "CURRENTLY IN GAME" = "СЕЙЧАС В ИГРЕ"
 "Ask which account to use" = "Спрашивать, какой аккаунт использовать"
 "Show the account picker at startup instead of signing in automatically." = "При запуске показывать выбор аккаунта вместо автоматического входа."
+"Show What's new" = "Показывать «Что нового»"
+"Show recent news from the games you play on the library home." = "Показывать свежие новости ваших игр на главной странице библиотеки."
+"What's new hidden. You can turn it back on in Settings → Library." = "Раздел «Что нового» скрыт. Его можно вернуть в «Настройки → Библиотека»."
 
 # --- Store additions ---
 "REVIEWS" = "ОБЗОРЫ"
@@ -479,6 +482,7 @@
 
 # --- Launch popup ---
 "Launching {name}" = "Запуск {name}"
+"Launching…" = "Запуск…"
 "Preparing to launch…" = "Подготовка к запуску…"
 
 # --- Downloads ---
@@ -1708,7 +1712,18 @@
 "{pct}% downloaded" = "Загружено {pct}%"
 "Runs through Steam" = "Запускается через Steam"
 "Show collections" = "Показывать коллекции"
-"Collection filters and the new collection button in the library sidebar, and the Add to collection menu on games." = "Фильтры коллекций и кнопка новой коллекции на боковой панели библиотеки, а также меню «Добавить в коллекцию» у игр."
+"Collection groups and the new collection button in the library sidebar, and the Add to collection menu on games." = "Группы коллекций и кнопка новой коллекции на боковой панели библиотеки, а также меню «Добавить в коллекцию» у игр."
+"Uncategorized" = "Без категории"
+"Collapse all" = "Свернуть все"
+"Expand all" = "Развернуть все"
+"Empty collection" = "Пустая коллекция"
+"Your collections" = "Ваши коллекции"
+"Create a new collection" = "Создать новую коллекцию"
+"Drag games here to build this collection." = "Перетащите игры сюда, чтобы наполнить эту коллекцию."
+"Drag games from the sidebar to add" = "Перетащите игры с боковой панели, чтобы добавить"
+"Drop here to add to {name}" = "Отпустите здесь, чтобы добавить в «{name}»"
+"Remove from collection" = "Убрать из коллекции"
+"Manage your collections" = "Управление коллекциями"
 "Minimize and keep downloading" = "Свернуть и продолжить загрузку"
 "New releases" = "Новинки"
 "Home" = "Главная"

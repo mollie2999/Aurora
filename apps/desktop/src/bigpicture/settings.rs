@@ -32,6 +32,8 @@ pub struct SettingsState {
     themes: Option<Vec<(Option<String>, String)>>,
     /// Cached storage probe (library free space + picture cache size).
     storage_cache: Option<(Instant, Vec<StorageEntry>, u64)>,
+    /// In-flight background storage probe result receiver.
+    storage_rx: Option<std::sync::mpsc::Receiver<(Vec<StorageEntry>, u64)>>,
     /// Cached controller detection snapshot (avoids per-frame polling).
     controller_cache: Option<(Instant, client::DetectionSnapshot)>,
     /// Cached Proton builds (Linux).
@@ -53,6 +55,7 @@ impl SettingsState {
     pub fn open_at(&mut self, section: usize) {
         self.section = section.min(sections().len().saturating_sub(1));
         self.storage_cache = None;
+        self.storage_rx = None;
         self.controller_cache = None;
         self.themes = None;
         #[cfg(target_os = "linux")]
@@ -313,29 +316,43 @@ fn library_name(v: u8) -> &'static str {
     }
 }
 
-fn probe_storage(f: &Frame) -> (Vec<StorageEntry>, u64) {
-    let mut entries = Vec::with_capacity(f.app.local.libraries.len());
-    for lib in &f.app.local.libraries {
-        let mut games = 0usize;
-        let mut used_bytes = 0u64;
-        for g in &f.app.local.games {
-            if g.library == *lib {
-                games += 1;
-                used_bytes = used_bytes.saturating_add(g.size_on_disk);
+fn start_storage_probe(f: &Frame, ctx: egui::Context) -> std::sync::mpsc::Receiver<(Vec<StorageEntry>, u64)> {
+    let libraries = f.app.local.libraries.clone();
+    let game_stats: Vec<(PathBuf, u64)> = f
+        .app
+        .local
+        .games
+        .iter()
+        .map(|g| (g.library.clone(), g.size_on_disk))
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    f.app._rt.spawn_blocking(move || {
+        let mut entries = Vec::with_capacity(libraries.len());
+        for lib in libraries {
+            let mut games = 0usize;
+            let mut used_bytes = 0u64;
+            for (g_lib, size) in &game_stats {
+                if *g_lib == lib {
+                    games += 1;
+                    used_bytes = used_bytes.saturating_add(*size);
+                }
             }
+            entries.push(StorageEntry {
+                free_bytes: local::manage::available_space(&lib),
+                path: lib,
+                games,
+                used_bytes,
+            });
         }
-        entries.push(StorageEntry {
-            path: lib.clone(),
-            free_bytes: local::manage::available_space(lib),
-            games,
-            used_bytes,
-        });
-    }
-    let cache = crate::image_cache::size();
-    (entries, cache)
+        let cache = crate::image_cache::size();
+        let _ = tx.send((entries, cache));
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    });
+    rx
 }
 
-fn rows(bp: &mut BigPicture, f: &mut Frame, screen: egui::Vec2) -> Vec<Row> {
+fn rows(bp: &mut BigPicture, f: &mut Frame, ctx: &egui::Context) -> Vec<Row> {
+    let screen = ctx.content_rect().size();
     let flags = *f.app.shared_flags().lock().unwrap();
     match bp.settings.section {
         DOWNLOADS => {
@@ -535,18 +552,32 @@ fn rows(bp: &mut BigPicture, f: &mut Frame, screen: egui::Vec2) -> Vec<Row> {
             out
         }
         STORAGE => {
+            if let Some(rx) = &bp.settings.storage_rx {
+                match rx.try_recv() {
+                    Ok((entries, cache_size)) => {
+                        bp.settings.storage_cache = Some((Instant::now(), entries, cache_size));
+                        bp.settings.storage_rx = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        bp.settings.storage_rx = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
             let need_refresh = bp
                 .settings
                 .storage_cache
                 .as_ref()
                 .is_none_or(|(at, _, _)| at.elapsed() > Duration::from_secs(15));
-            if need_refresh {
-                let (entries, cache_size) = probe_storage(f);
-                bp.settings.storage_cache = Some((Instant::now(), entries, cache_size));
+            if need_refresh && bp.settings.storage_rx.is_none() {
+                bp.settings.storage_rx = Some(start_storage_probe(f, ctx.clone()));
             }
-            let (_, entries, cache_size) = bp.settings.storage_cache.as_ref().unwrap();
-            let entries = entries.clone();
-            let cache_size = *cache_size;
+            let (entries, cache_size) = bp
+                .settings
+                .storage_cache
+                .as_ref()
+                .map(|(_, e, c)| (e.clone(), *c))
+                .unwrap_or_default();
 
             let mut out = Vec::new();
             if entries.is_empty() {
@@ -635,6 +666,13 @@ fn rows(bp: &mut BigPicture, f: &mut Frame, screen: egui::Vec2) -> Vec<Row> {
                     t!("Enable Steam Cloud for games that support it. Each game can also be turned off in its Properties."),
                     flags.cloud,
                     flag(|x| &mut x.cloud),
+                ),
+                toggle(
+                    "lib-whats-new",
+                    t!("Show What's new"),
+                    t!("Show recent news from the games you play on the library home."),
+                    flags.show_whats_new,
+                    flag(|x| &mut x.show_whats_new),
                 ),
             ]
         }
@@ -1395,7 +1433,7 @@ pub fn page(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame) -> f32 {
         pos2(x - 12.0 * s, body_top - 8.0 * s),
         pos2(x + width + 12.0 * s, f.view.bottom() - 6.0 * s),
     );
-    let list_rows = rows(bp, f, ui.ctx().content_rect().size());
+    let list_rows = rows(bp, f, ui.ctx());
     let section = bp.settings.section;
     let pos = bp.scroller("rows").pos;
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));

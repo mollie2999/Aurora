@@ -133,6 +133,7 @@ unsafe extern "system" fn resize(this: *mut c_void, count: u32, w: u32, h: u32, 
 unsafe extern "system" fn resize1(this: *mut c_void, count: u32, w: u32, h: u32, format: i32, flags: u32, mask: *const u32, queues: *const *mut c_void) -> HRESULT {
     before_resize(this);
     let real: Resize1Fn = unsafe { std::mem::transmute(REAL_RESIZE1.load(Ordering::Acquire)) };
+    if !queues.is_null() { unsafe { super::d3d12::invalidate_queue(this) }; }
     unsafe { real(this, count, w, h, format, flags, mask, queues) }
 }
 

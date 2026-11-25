@@ -930,6 +930,15 @@ pub type PFN_vkCreateXlibSurfaceKHR = unsafe extern "C" fn(VkInstance, *const Vk
 pub type PFN_vkCreateXcbSurfaceKHR = unsafe extern "C" fn(VkInstance, *const VkXcbSurfaceCreateInfoKHR, *const c_void, *mut VkSurfaceKHR) -> VkResult;
 pub type PFN_vkCreateWaylandSurfaceKHR = unsafe extern "C" fn(VkInstance, *const VkWaylandSurfaceCreateInfoKHR, *const c_void, *mut VkSurfaceKHR) -> VkResult;
 pub type PFN_vkDestroySurfaceKHR = unsafe extern "C" fn(VkInstance, VkSurfaceKHR, *const c_void);
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VkQueueFamilyProperties {
+    pub queueFlags: u32,
+    pub queueCount: u32,
+    pub timestampValidBits: u32,
+    pub minImageTransferGranularity: VkExtent3D,
+}
+pub type PFN_vkGetPhysicalDeviceQueueFamilyProperties = unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut VkQueueFamilyProperties);
 pub type PFN_vkGetPhysicalDeviceMemoryProperties = unsafe extern "C" fn(VkPhysicalDevice, *mut VkPhysicalDeviceMemoryProperties);
 pub type PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR = unsafe extern "C" fn(VkPhysicalDevice, VkSurfaceKHR, *mut VkSurfaceCapabilitiesKHR) -> VkResult;
 pub type PFN_vkCreateDevice = unsafe extern "C" fn(VkPhysicalDevice, *const VkDeviceCreateInfo, *const c_void, *mut VkDevice) -> VkResult;
@@ -1016,6 +1025,7 @@ pub struct InstanceDispatch {
     pub create_xcb_surface: Option<PFN_vkCreateXcbSurfaceKHR>,
     pub create_wayland_surface: Option<PFN_vkCreateWaylandSurfaceKHR>,
     pub destroy_surface: Option<PFN_vkDestroySurfaceKHR>,
+    pub queue_family_properties: Option<PFN_vkGetPhysicalDeviceQueueFamilyProperties>,
     pub get_physical_device_memory_properties: Option<PFN_vkGetPhysicalDeviceMemoryProperties>,
     pub get_physical_device_surface_capabilities: Option<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
 }

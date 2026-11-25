@@ -39,6 +39,9 @@ pub struct Prefs {
     pub fps_counter: crate::builtin::settings::FpsCorner,
     #[serde(default)]
     pub fps_high_contrast: bool,
+    /// Show the "What's new" news shelf on the library home.
+    #[serde(default = "yes")]
+    pub show_whats_new: bool,
     /// Account to sign in automatically at startup (cleared on log out).
     pub auto_login: Option<String>,
     /// Interface language code; `None` follows the system.
@@ -138,6 +141,7 @@ impl Default for Prefs {
             overlay_enabled: true,
             fps_counter: crate::builtin::settings::FpsCorner::Off,
             fps_high_contrast: false,
+            show_whats_new: true,
             auto_login: None,
             language: None,
             language_asked: false,
@@ -202,6 +206,8 @@ pub struct SteamApp {
     events: mpsc::Receiver<Event>,
     pub state: State,
     pub local: LocalState,
+    local_tx: mpsc::Sender<LocalState>,
+    local_rx: mpsc::Receiver<LocalState>,
     pub registry: Registry,
     pub prefs: Prefs,
     pub saved: Vec<SavedAccount>,
@@ -273,6 +279,18 @@ impl SteamApp {
         let mut prefs: Prefs = cc.storage.and_then(|s| eframe::get_value(s, "prefs")).unwrap_or_default();
         let cfg_dir = client::store::config_dir();
         let mut theme_manager = themes::ThemeManager::new(cfg_dir.join("themes"), cfg_dir.join("theme-data"));
+        match theme_manager.sync_bundled_themes() {
+            Ok(report) => {
+                if !report.installed.is_empty() || !report.updated.is_empty() {
+                    tracing::info!(
+                        installed = ?report.installed,
+                        updated = ?report.updated,
+                        "synced bundled themes"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("sync bundled themes: {e}"),
+        }
         theme_manager.scan();
         let mut last_error = None;
         if let Some(id) = prefs.active_theme_id.as_deref() {
@@ -359,6 +377,7 @@ impl SteamApp {
             overlay_enabled: prefs.overlay_enabled,
             fps_counter: prefs.fps_counter,
             fps_high_contrast: prefs.fps_high_contrast,
+            show_whats_new: prefs.show_whats_new,
         }));
         client::set_proton_override(prefs.proton_override.clone());
         client::set_app_protons(prefs.proton_per_app.clone());
@@ -397,12 +416,15 @@ impl SteamApp {
         if (prefs.bigpicture_start || auto_deck_bp) && !bigpicture.active && !desktop_flag {
             bigpicture.enter(&cc.egui_ctx);
         }
+        let (local_tx, local_rx) = mpsc::channel();
         let mut app = Self {
             _rt: rt,
             client,
             events,
             state: State::default(),
             local,
+            local_tx,
+            local_rx,
             registry,
             prefs,
             saved,
@@ -479,7 +501,22 @@ impl SteamApp {
         self.toasts.push(Toast { title: title.into(), body: body.into(), until: now + 5.0 });
     }
 
+    fn reload_local_async(&self, ctx: &egui::Context) {
+        let root = self.local.steam_root.clone();
+        let tx = self.local_tx.clone();
+        let ctx = ctx.clone();
+        self._rt.spawn_blocking(move || {
+            if let Ok(l) = local::load(Some(root)) {
+                let _ = tx.send(l);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+        });
+    }
+
     pub(crate) fn drain_events(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        while let Ok(l) = self.local_rx.try_recv() {
+            self.local = l;
+        }
         let now = ctx.input(|i| i.time);
         while let Ok(e) = self.events.try_recv() {
             // Toast-worthy things are decided before state changes.
@@ -583,9 +620,7 @@ impl SteamApp {
                 }
                 Event::GameStopped { .. } => {
                     self.overlay.game_stopped();
-                    if let Ok(l) = local::load(Some(self.local.steam_root.clone())) {
-                        self.local = l;
-                    }
+                    self.reload_local_async(ctx);
                 }
                 Event::ControllerLayoutRoute { app_id, enabled } => {
                     self.overlay.set_controller_route(*app_id, *enabled);
@@ -1228,6 +1263,7 @@ impl eframe::App for SteamApp {
             self.prefs.overlay_enabled = f.overlay_enabled;
             self.prefs.fps_counter = f.fps_counter;
             self.prefs.fps_high_contrast = f.fps_high_contrast;
+            self.prefs.show_whats_new = f.show_whats_new;
             #[cfg(not(windows))]
             {
                 self.prefs.precompile_shaders = client::shaders::precompile();
@@ -1745,6 +1781,19 @@ mod tests {
         let restored: Prefs = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.controller, prefs.controller);
         assert_eq!(restored.controller_bindings, prefs.controller_bindings);
+    }
+
+    #[test]
+    fn prefs_show_whats_new_defaults_true_and_roundtrips() {
+        let legacy: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(legacy.show_whats_new);
+        assert!(Prefs::default().show_whats_new);
+
+        let mut prefs = Prefs::default();
+        prefs.show_whats_new = false;
+        let json = serde_json::to_string(&prefs).unwrap();
+        let restored: Prefs = serde_json::from_str(&json).unwrap();
+        assert!(!restored.show_whats_new);
     }
 }
 

@@ -223,8 +223,7 @@ fn call_primary_keystroke(x: &XInput, i: u32, reserved: u32, out: *mut Keystroke
 
 // ------------------------------------------------------------ shared pads
 
-static MAPPED_PTR: AtomicUsize = AtomicUsize::new(0);
-static MAPPED_WRITABLE: AtomicBool = AtomicBool::new(false);
+static MAPPED: std::sync::OnceLock<MappedShm> = std::sync::OnceLock::new();
 static LAST_MAP_TRY: Mutex<Option<Instant>> = Mutex::new(None);
 static LOGGED_MAP_ERR: AtomicBool = AtomicBool::new(false);
 
@@ -233,7 +232,13 @@ static LOGGED_MAP_ERR: AtomicBool = AtomicBool::new(false);
 static PACKET_BUMP: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 static LAST_NEUTRAL: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
 /// Last rumble requested per virtual slot, restored when `XInputEnable(TRUE)`.
-static LAST_RUMBLE: Mutex<[(u16, u16); 4]> = Mutex::new([(0, 0); 4]);
+#[derive(Clone, Copy)]
+struct SavedRumble {
+    slot: usize,
+    generation: u32,
+    motors: [u16; 2],
+}
+static LAST_RUMBLE: Mutex<[Option<SavedRumble>; 4]> = Mutex::new([None; 4]);
 
 fn open_shm(name: &str) -> Option<MappedShm> {
     match pads_shm::open_shm_with_error(name) {
@@ -253,24 +258,20 @@ fn open_shm(name: &str) -> Option<MappedShm> {
 /// The app's shared memory, when it gave us one (Windows only).
 /// Retryable if the first open failed transiently.
 fn mapped_info() -> Option<MappedShm> {
-    let cached = MAPPED_PTR.load(Ordering::Acquire);
-    if cached != 0 {
-        let shared = unsafe { (cached as *const Shared).as_ref()? };
-        return Some(MappedShm { shared, writable: MAPPED_WRITABLE.load(Ordering::Acquire) });
+    if let Some(m) = MAPPED.get() {
+        return Some(*m);
     }
-    let Ok(name) = std::env::var(pads_shm::ENV_PADS) else { return None };
-    {
-        let mut last = LAST_MAP_TRY.lock().unwrap_or_else(|e| e.into_inner());
-        if last.is_some_and(|t| t.elapsed() < Duration::from_millis(500)) {
-            return None;
-        }
-        *last = Some(Instant::now());
+    let name = std::env::var(pads_shm::ENV_PADS).ok()?;
+    let mut last = LAST_MAP_TRY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = MAPPED.get() {
+        return Some(*m);
     }
+    if last.is_some_and(|t| t.elapsed() < Duration::from_millis(500)) {
+        return None;
+    }
+    *last = Some(Instant::now());
     let m = open_shm(&name)?;
-    let ptr = m.shared as *const Shared as usize;
-    MAPPED_WRITABLE.store(m.writable, Ordering::Release);
-    let _ = MAPPED_PTR.compare_exchange(0, ptr, Ordering::AcqRel, Ordering::Acquire);
-    Some(m)
+    Some(*MAPPED.get_or_init(|| m))
 }
 
 fn mapped() -> Option<&'static Shared> {
@@ -278,7 +279,7 @@ fn mapped() -> Option<&'static Shared> {
 }
 
 fn mapped_writable() -> bool {
-    MAPPED_WRITABLE.load(Ordering::Acquire)
+    MAPPED.get().is_some_and(|m| m.writable)
 }
 
 /// The shared pads, while the app keeps them up to date and Steam Input is enabled.
@@ -390,10 +391,22 @@ fn shared_at_after_probe(i: usize) -> Option<(&'static Shared, usize)> {
 
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct SteamInputPad {
+    pub device_id: u32,
     pub pad: Pad,
     pub calibrated: bool,
     pub family: u8,
     pub paddles: u8,
+}
+
+impl SteamInputPad {
+    pub fn input_type(self) -> i32 {
+        match self.family {
+            pads_shm::SLOT_FAMILY_XBOX => 3,
+            pads_shm::SLOT_FAMILY_PLAYSTATION => 5,
+            pads_shm::SLOT_FAMILY_SWITCH_PRO => 8,
+            _ => 4, // Generic gamepad
+        }
+    }
 }
 
 /// The four pads as XInput / games see them.
@@ -433,7 +446,7 @@ fn steam_input_pads_with(
     let xbox_on = mask & pads_shm::FAMILY_XBOX != 0;
     let mut out: [Option<SteamInputPad>; 4] = real.map(|p| {
         p.filter(|_| xbox_on)
-            .map(|pad| SteamInputPad { pad, calibrated: false, family: pads_shm::SLOT_FAMILY_XBOX, paddles: 0 })
+            .map(|pad| SteamInputPad { device_id: 0, pad, calibrated: false, family: pads_shm::SLOT_FAMILY_XBOX, paddles: 0 })
     });
     if let Some(s) = shm {
         let active_shared: Vec<usize> = (0..pads_shm::SLOTS)
@@ -444,7 +457,7 @@ fn steam_input_pads_with(
             if let Some(k) = k
                 && let Some(st) = s.slots[*k].read()
             {
-                out[i] = Some(SteamInputPad { pad: Pad::from(st), calibrated: st.calibrated, family: st.family, paddles: st.paddles });
+                out[i] = Some(SteamInputPad { device_id: st.device_id, pad: Pad::from(st), calibrated: st.calibrated, family: st.family, paddles: st.paddles });
             }
         }
     }
@@ -748,14 +761,15 @@ fn serve_set_state(i: u32, v: *mut [u16; 2], real_fn: Option<SetState>, bypass_s
     if !bypass_shared && !v.is_null() && (i as usize) < 4 {
         if let Some((s, k)) = shared_at(i as usize) {
             let req = unsafe { v.read_unaligned() };
-            LAST_RUMBLE.lock().unwrap_or_else(|e| e.into_inner())[i as usize] = (req[0], req[1]);
+            let generation = s.slots[k].rumble_generation();
+            LAST_RUMBLE.lock().unwrap_or_else(|e| e.into_inner())[i as usize] = Some(SavedRumble { slot: k, generation, motors: req });
             if mapped_writable() {
                 let [low, high] = if XINPUT_ENABLED.load(Ordering::Acquire) && calibration().rumble_enabled {
                     req
                 } else {
                     [0, 0]
                 };
-                s.slots[k].set_rumble(low, high);
+                s.slots[k].set_rumble_for(generation, low, high);
             }
             return ERROR_SUCCESS;
         }
@@ -898,10 +912,13 @@ fn serve_enable(enable: i32, real_fn: Option<EnableFn>) {
         if mapped_writable() {
             let saved = *LAST_RUMBLE.lock().unwrap_or_else(|e| e.into_inner());
             let cal_rumble = calibration().rumble_enabled;
-            for (slot, (low, high)) in saved.into_iter().enumerate() {
+            for (slot, command) in saved.into_iter().enumerate() {
                 if let Some((s, k)) = shared_at(slot) {
-                    let (l, h) = if on && cal_rumble { (low, high) } else { (0, 0) };
-                    s.slots[k].set_rumble(l, h);
+                    if !on || !cal_rumble {
+                        s.slots[k].set_rumble(0, 0);
+                    } else if let Some(cmd) = command.filter(|cmd| cmd.slot == k) {
+                        s.slots[k].set_rumble_for(cmd.generation, cmd.motors[0], cmd.motors[1]);
+                    }
                 }
             }
         }

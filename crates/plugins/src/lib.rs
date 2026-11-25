@@ -262,6 +262,21 @@ pub struct Plugin {
 }
 
 const MAX_OPERATIONS: u64 = 2_000_000;
+const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+const MAX_SCRIPT_BYTES: u64 = 512 * 1024;
+
+fn read_bounded_string(path: &Path, max_bytes: u64, what: &str) -> Result<String, Error> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| Error::Io(path.to_path_buf(), e))?;
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| Error::Io(path.to_path_buf(), e))?;
+    if buf.len() as u64 > max_bytes {
+        return Err(Error::Manifest(format!("{what} exceeds {} KiB limit", max_bytes / 1024)));
+    }
+    String::from_utf8(buf).map_err(|e| Error::Manifest(format!("{what} is not valid UTF-8: {e}")))
+}
 
 fn resolve_main_path(dir: &Path, main: &str) -> Result<(PathBuf, PathBuf), Error> {
     if main.is_empty() || main.contains('\0') || main.contains(':') || main.starts_with('/') || main.starts_with('\\') {
@@ -298,7 +313,7 @@ fn resolve_main_path(dir: &Path, main: &str) -> Result<(PathBuf, PathBuf), Error
 impl Plugin {
     pub fn load(dir: &Path) -> Result<Plugin, Error> {
         let manifest_path = dir.join("plugin.toml");
-        let text = std::fs::read_to_string(&manifest_path).map_err(|e| Error::Io(manifest_path.clone(), e))?;
+        let text = read_bounded_string(&manifest_path, MAX_MANIFEST_BYTES, "plugin.toml")?;
         let raw: RawManifest = toml::from_str(&text).map_err(|e| Error::Manifest(e.to_string()))?;
         if raw.id.is_empty() || !raw.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
             return Err(Error::Manifest("id must be letters, digits, '-' or '_'".into()));
@@ -344,10 +359,10 @@ impl Plugin {
                 return;
             }
         };
-        let src = match std::fs::read_to_string(&path) {
+        let src = match read_bounded_string(&path, MAX_SCRIPT_BYTES, "plugin script") {
             Ok(s) => s,
             Err(e) => {
-                self.error = Some(format!("{}: {e}", path.display()));
+                self.error = Some(e.to_string());
                 return;
             }
         };

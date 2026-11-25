@@ -5,11 +5,12 @@
 //! (`<config_dir>/theme-data/<id>.json`), safe `.zip`/folder installation,
 //! and optional sandboxed `theme.rhai` visual hooks.
 
+pub mod adwaita;
+pub mod bundled;
 pub mod color;
 pub mod install;
 pub mod manifest;
 pub mod native;
-pub mod adwaita;
 pub mod script;
 pub mod tree;
 
@@ -20,6 +21,10 @@ use std::time::SystemTime;
 
 use egui::Color32;
 
+pub use bundled::{
+    BUNDLED_THEMES, BundledFile, BundledSyncReport, BundledTheme, is_bundled_theme,
+    missing_bundled_themes, restore_missing_bundled_themes, sync_bundled_themes,
+};
 pub use color::{ColorRef, ColorToken, ThemeColor, color_to_hex, parse_hex_color};
 pub use install::{install_folder, install_zip, uninstall_theme};
 pub use manifest::{
@@ -121,6 +126,42 @@ impl ThemeManager {
             native_appearance: native::NativeAppearance::default(),
             active_option_values: BTreeMap::new(),
         }
+    }
+
+    /// Ensure built-in themes bundled with Aurora are installed in `themes_dir`
+    /// and upgraded when Aurora ships newer versions.
+    pub fn sync_bundled_themes(&self) -> Result<BundledSyncReport, Error> {
+        bundled::sync_bundled_themes(&self.themes_dir, &self.data_dir)
+    }
+
+    /// Uninstall a theme by id. If it is a bundled theme, marks it dismissed so
+    /// subsequent startups do not silently re-install it.
+    pub fn uninstall(&mut self, id: &str) -> Result<(), Error> {
+        uninstall_theme(&self.themes_dir, id)?;
+        bundled::mark_dismissed(&self.data_dir, id)?;
+        if self.active_id.as_deref() == Some(id) {
+            let _ = self.activate(None);
+        }
+        Ok(())
+    }
+
+    /// Clear any bundled-theme dismissal flag after a manual install.
+    pub fn note_theme_installed(&self, id: &str) {
+        if let Err(e) = bundled::clear_dismissed(&self.data_dir, id) {
+            tracing::warn!("clear dismissed state for theme '{id}': {e}");
+        }
+    }
+
+    /// Return the IDs of bundled themes currently missing from `themes_dir`.
+    pub fn missing_bundled_themes(&self) -> Vec<&'static str> {
+        bundled::missing_bundled_themes(&self.themes_dir)
+    }
+
+    /// Restore any missing bundled themes to `themes_dir` and rescan.
+    pub fn restore_bundled_themes(&mut self) -> Result<Vec<&'static str>, Error> {
+        let restored = bundled::restore_missing_bundled_themes(&self.themes_dir, &self.data_dir)?;
+        self.scan();
+        Ok(restored)
     }
 
     /// Scan `themes_dir` for installed themes, recording any broken folders in

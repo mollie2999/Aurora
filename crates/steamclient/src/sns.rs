@@ -20,7 +20,7 @@ use crate::gns::msg::Rendezvous;
 use crate::ifaces::{This, copy_out, put, slice};
 use crate::state::Bytes;
 use crate::vt::Fp;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -99,7 +99,7 @@ struct Conn {
     callback: usize,
     /// The other end of a socket pair or of a connection to ourselves.
     local: u32,
-    inbox: VecDeque<Received>,
+    inbox: crate::recv_queue::Queue<Received>,
     sent: i64,
     received: i64,
     /// Valve's protocol, for a connection to another player.
@@ -118,7 +118,7 @@ struct Session {
     failed: bool,
     received: i64,
     /// Messages per local channel; held back until the session is accepted.
-    inbox: HashMap<i32, VecDeque<Received>>,
+    inbox: HashMap<i32, crate::recv_queue::Queue<Received>>,
     proto: Option<Box<Proto>>,
 }
 
@@ -306,7 +306,7 @@ impl Net {
             self.arrival += 1;
             c.received += 1;
             if c.inbox.len() < 65536 {
-                c.inbox.push_back(Received { conn: h, peer: c.peer, data: m.data, number: m.num, channel: 0, user_data: c.user_data, arrival: self.arrival });
+                c.inbox.push(c.peer, m.data.capacity(), Received { conn: h, peer: c.peer, data: m.data, number: m.num, channel: 0, user_data: c.user_data, arrival: self.arrival });
             }
         }
         if let Some((state, reason, debug)) = news {
@@ -324,9 +324,10 @@ impl Net {
             let ch = i32::from_le_bytes(m.data[1..5].try_into().unwrap());
             self.arrival += 1;
             s.received += 1;
+            if s.inbox.len() >= crate::recv_queue::CHANNEL_LIMIT && !s.inbox.contains_key(&ch) { continue; }
             let q = s.inbox.entry(ch).or_default();
             if q.len() < 65536 {
-                q.push_back(Received { conn: 0, peer, data: m.data[5..].to_vec(), number: m.num, channel: ch, user_data: 0, arrival: self.arrival });
+                q.push(peer, m.data.len() - 5, Received { conn: 0, peer, data: m.data[5..].to_vec(), number: m.num, channel: ch, user_data: 0, arrival: self.arrival });
             }
         }
         let ended = std::mem::take(&mut p.changed) && matches!(p.state, PState::ClosedByPeer | PState::Problem);
@@ -513,7 +514,7 @@ impl Net {
         let Some(c) = self.conns.get_mut(&h) else { return };
         c.received += 1;
         if c.inbox.len() < 65536 {
-            c.inbox.push_back(Received { conn: h, peer: c.peer, data, number: c.received, channel: 0, user_data: c.user_data, arrival });
+            c.inbox.push(c.peer, data.capacity(), Received { conn: h, peer: c.peer, data, number: c.received, channel: 0, user_data: c.user_data, arrival });
         }
     }
 
@@ -570,8 +571,9 @@ impl Net {
             let s = self.sessions.entry(peer).or_default();
             s.accepted = true;
             s.received += 1;
+            if s.inbox.len() >= crate::recv_queue::CHANNEL_LIMIT && !s.inbox.contains_key(&channel) { return LIMIT_EXCEEDED; }
             let m = Received { conn: 0, peer, data: data.to_vec(), number: s.received, channel, user_data: 0, arrival };
-            s.inbox.entry(channel).or_default().push_back(m);
+            if !s.inbox.entry(channel).or_default().push(peer, m.data.capacity(), m) { return LIMIT_EXCEEDED; }
             return OK;
         }
         let now = Instant::now();
@@ -631,22 +633,17 @@ impl Net {
     }
 
     pub fn receive_channel(&mut self, channel: i32, max: usize) -> Vec<Received> {
-        let mut all: Vec<Received> = Vec::new();
-        for s in self.sessions.values_mut().filter(|s| s.accepted) {
-            if let Some(q) = s.inbox.get_mut(&channel) {
-                all.extend(q.drain(..));
-            }
+        let mut out = Vec::new();
+        while out.len() < max {
+            let next = self.sessions.iter().filter(|(_, s)| s.accepted)
+                .filter_map(|(&peer, s)| Some((s.inbox.get(&channel)?.front()?.arrival, peer))).min();
+            let Some((_, peer)) = next else { break };
+            let inbox = &mut self.sessions.get_mut(&peer).unwrap().inbox;
+            let queue = inbox.get_mut(&channel).unwrap();
+            out.push(queue.pop_front().unwrap());
+            if queue.is_empty() { inbox.remove(&channel); }
         }
-        all.sort_by_key(|m| m.arrival);
-        if all.len() > max {
-            // Put the rest back, oldest first.
-            for m in all.split_off(max).into_iter().rev() {
-                if let Some(s) = self.sessions.get_mut(&m.peer) {
-                    s.inbox.entry(channel).or_default().push_front(m);
-                }
-            }
-        }
-        all
+        out
     }
 
     /// ESteamNetworkingConnectionState of a messages session.

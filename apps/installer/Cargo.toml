@@ -10,6 +10,7 @@ name = "Aurora-Setup"
 path = "src/main.rs"
 
 [dependencies]
+tempfile = "3"
 ui.workspace = true
 i18n.workspace = true
 eframe.workspace = true

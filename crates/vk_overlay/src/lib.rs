@@ -54,7 +54,7 @@ mod layer {
         phys: VkPhysicalDevice,
         inst_key: usize,
         mem_props: VkPhysicalDeviceMemoryProperties,
-        default_queue_family: u32,
+        graphics_families: Vec<bool>,
     }
     unsafe impl Send for DeviceState {}
 
@@ -161,6 +161,7 @@ mod layer {
                 create_xcb_surface: unsafe { load_inst_fn(next_gipa, inst, c"vkCreateXcbSurfaceKHR") },
                 create_wayland_surface: unsafe { load_inst_fn(next_gipa, inst, c"vkCreateWaylandSurfaceKHR") },
                 destroy_surface: unsafe { load_inst_fn(next_gipa, inst, c"vkDestroySurfaceKHR") },
+                queue_family_properties: unsafe { load_inst_fn(next_gipa, inst, c"vkGetPhysicalDeviceQueueFamilyProperties") },
                 get_physical_device_memory_properties: unsafe { load_inst_fn(next_gipa, inst, c"vkGetPhysicalDeviceMemoryProperties") },
                 get_physical_device_surface_capabilities: unsafe { load_inst_fn(next_gipa, inst, c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR") },
             };
@@ -289,11 +290,14 @@ mod layer {
             unsafe { get_mem(physical_device, &mut mem_props) };
         }
 
-        let default_queue_family = if !p_create_info.is_null() && unsafe { (*p_create_info).queueCreateInfoCount } > 0 {
-            unsafe { (*(*p_create_info).pQueueCreateInfos).queueFamilyIndex }
-        } else {
-            0
-        };
+        let mut graphics_families = Vec::new();
+        if let Some(query) = INSTANCES.lock().unwrap_or_else(|e| e.into_inner()).get(&inst_key).and_then(|d| d.queue_family_properties) {
+            let mut count = 0;
+            unsafe { query(physical_device, &mut count, ptr::null_mut()) };
+            let mut props = vec![VkQueueFamilyProperties::default(); count as usize];
+            unsafe { query(physical_device, &mut count, props.as_mut_ptr()) };
+            graphics_families.extend(props.iter().take(count as usize).map(|p| p.queueFlags & 1 != 0));
+        }
 
         if let Some(dd) = unsafe { load_device_dispatch(next_gdpa, dev) } {
             DEVICES.lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -303,7 +307,7 @@ mod layer {
                     phys: physical_device,
                     inst_key,
                     mem_props,
-                    default_queue_family,
+                    graphics_families,
                 },
             );
         }
@@ -557,7 +561,8 @@ mod layer {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&(queue as usize))
-                .map(|i| i.family);
+                .filter(|i| i.device_key == dev_key)
+                .map(|i| i.family)?;
 
             let sw_entry = SWAPCHAINS
                 .lock()
@@ -565,6 +570,11 @@ mod layer {
                 .get(&sw_handle)
                 .map(|(_, entry)| entry.clone())?;
             let mut sw = sw_entry.lock().unwrap_or_else(|e| e.into_inner());
+
+            if sw.device_key != dev_key || sw.renderer.as_ref().is_some_and(|r| r.queue_family != queue_family)
+                || !DEVICES.lock().unwrap_or_else(|e| e.into_inner()).get(&dev_key)?
+                    .graphics_families.get(queue_family as usize).copied().unwrap_or(false)
+            { return None; }
 
             // Ignore tiny helper/dummy swapchains (e.g. launcher splash windows).
             if sw.width < 128 || sw.height < 128 {
@@ -604,11 +614,10 @@ mod layer {
             if sw.renderer.is_none() && !sw.init_failed {
                 let dev_info = {
                     let g = DEVICES.lock().unwrap_or_else(|e| e.into_inner());
-                    g.get(&sw.device_key).map(|d| (d.dd.clone(), d.mem_props, d.default_queue_family))
+                    g.get(&sw.device_key).map(|d| (d.dd.clone(), d.mem_props))
                 };
-                if let Some((dd, mem_props, default_qf)) = dev_info {
-                    let qf = queue_family.unwrap_or(default_qf);
-                    sw.renderer = OverlayRenderer::new(sw.device, dd, mem_props, qf, sw_handle, sw.format, sw.can_copy_src, sw.width, sw.height);
+                if let Some((dd, mem_props)) = dev_info {
+                    sw.renderer = OverlayRenderer::new(sw.device, dd, mem_props, queue_family, sw_handle, sw.format, sw.can_copy_src, sw.width, sw.height);
                     if sw.renderer.is_some() {
                         // Seed the freshly created swapchain renderer with every live
                         // texture (especially egui's font atlas id=0) before applying deltas.

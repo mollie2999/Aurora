@@ -420,11 +420,19 @@ pub fn unregister() -> Result<(), String> {
 /// `steam://rungameid/<id>`, with the game's own icon).
 pub fn desktop_shortcut(app_id: u32, name: &str, icon: Option<PathBuf>) -> Result<PathBuf, String> {
     let desktop = directories::UserDirs::new().and_then(|d| d.desktop_dir().map(|p| p.to_path_buf())).ok_or("No desktop folder found")?;
-    let safe: String = name.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { ' ' } else { c }).collect();
-    let path = desktop.join(format!("{}.url", safe.trim()));
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_control() || r#"\/:*?"<>|"#.contains(c) { ' ' } else { c })
+        .collect();
+    let trimmed = safe.trim().trim_matches('.');
+    let file_stem = if trimmed.is_empty() { format!("app-{app_id}") } else { trimmed.to_string() };
+    let path = desktop.join(format!("{file_stem}.url"));
     let mut text = format!("[InternetShortcut]\r\nURL=steam://rungameid/{app_id}\r\n");
     if let Some(icon) = icon {
-        text.push_str(&format!("IconFile={}\r\nIconIndex=0\r\n", icon.display()));
+        let icon_str = icon.display().to_string();
+        if !icon_str.chars().any(char::is_control) {
+            text.push_str(&format!("IconFile={icon_str}\r\nIconIndex=0\r\n"));
+        }
     }
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
     Ok(path)
@@ -581,8 +589,25 @@ mod ipc_auth_tests {
 /// Best icon for a game: its main executable.
 pub fn game_icon(app: Option<&model::OwnedApp>, install_dir: &std::path::Path) -> Option<PathBuf> {
     let exe = app?.launch.iter().find(|l| l.runs_on_this_os() && l.executable.to_lowercase().ends_with(".exe"))?;
-    let p = install_dir.join(exe.executable.replace('/', "\\"));
-    p.exists().then_some(p)
+    if exe.executable.is_empty()
+        || exe.executable.contains('\0')
+        || exe.executable.contains(':')
+        || exe.executable.starts_with('/')
+        || exe.executable.starts_with('\\')
+    {
+        return None;
+    }
+    let mut p = install_dir.to_path_buf();
+    for seg in exe.executable.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return None;
+        }
+        p.push(seg);
+    }
+    p.is_file().then_some(p)
 }
 
 #[cfg(test)]

@@ -108,6 +108,7 @@ struct FrameSlot {
 }
 
 pub struct OverlayRenderer {
+    pub queue_family: u32,
     device: VkDevice,
     dd: DeviceDispatch,
     mem_props: VkPhysicalDeviceMemoryProperties,
@@ -537,7 +538,7 @@ impl OverlayRenderer {
         };
         if unsafe { (dd.allocate_command_buffers)(device, &alloc_ci, cmds.as_mut_ptr()) } != VK_SUCCESS {
             let mut r = Self {
-                device, dd, mem_props, format, can_copy_src, width, height, linear_out: is_linear_output_format(format),
+                device, dd, mem_props, queue_family, format, can_copy_src, width, height, linear_out: is_linear_output_format(format),
                 cmd_pool, render_pass, ds_layout, ds_pool, sampler_linear, sampler_nearest,
                 pipe_layout, pipeline, slots: Vec::new(), textures: HashMap::new(),
                 submit_gen: 0, retired_tex: Vec::new(),
@@ -597,7 +598,7 @@ impl OverlayRenderer {
                     if view != 0 { (dd.destroy_image_view)(device, view, ptr::null()); }
                 }
                 let mut r = Self {
-                    device, dd, mem_props, format, can_copy_src, width, height, linear_out: is_linear_output_format(format),
+                    device, dd, mem_props, queue_family, format, can_copy_src, width, height, linear_out: is_linear_output_format(format),
                     cmd_pool, render_pass, ds_layout, ds_pool, sampler_linear, sampler_nearest,
                     pipe_layout, pipeline, slots, textures: HashMap::new(),
                     submit_gen: 0, retired_tex: Vec::new(),
@@ -622,6 +623,7 @@ impl OverlayRenderer {
         }
 
         Some(Self {
+            queue_family,
             device,
             dd,
             mem_props,

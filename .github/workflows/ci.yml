@@ -6,6 +6,9 @@ on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
 
+permissions:
+  contents: read
+
 # Newer rustup refuses a host tuple in rust-toolchain.toml's channel; this
 # picks the same GNU toolchain explicitly (it takes priority over the file).
 env:

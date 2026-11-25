@@ -122,7 +122,7 @@ pub async fn begin_qr(conn: &Connection, device: &Device) -> Result<PendingAuth>
         client_id: resp.client_id(),
         request_id: resp.request_id().to_vec(),
         steam_id: 0,
-        interval: Duration::from_secs_f32(resp.interval().clamp(1.0, 10.0)),
+        interval: poll_interval(resp.interval()),
         guards: resp.allowed_confirmations.iter().filter_map(Guard::from_proto).collect(),
         challenge_url: Some(resp.challenge_url().to_string()),
     })
@@ -144,6 +144,14 @@ impl Default for Device {
 }
 
 const OS_TYPE_WIN11: i32 = 20;
+
+fn poll_interval(raw: f32) -> Duration {
+    if raw.is_finite() {
+        Duration::from_secs_f32(raw.clamp(1.0, 10.0))
+    } else {
+        Duration::from_secs(5)
+    }
+}
 
 pub async fn begin(
     conn: &Connection,
@@ -191,7 +199,7 @@ pub async fn begin(
         client_id: resp.client_id(),
         request_id: resp.request_id().to_vec(),
         steam_id: resp.steamid(),
-        interval: Duration::from_secs_f32(resp.interval().clamp(1.0, 10.0)),
+        interval: poll_interval(resp.interval()),
         guards: resp.allowed_confirmations.iter().filter_map(Guard::from_proto).collect(),
         challenge_url: None,
     })
@@ -208,11 +216,23 @@ fn encrypt_password(modulus_hex: &str, exponent_hex: &str, password: &str) -> Re
 }
 
 fn hex(s: &str) -> Option<Vec<u8>> {
-    let s = if s.len() % 2 == 1 { format!("0{s}") } else { s.to_string() };
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    if !s.is_ascii() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let padded: Vec<u8>;
+    let src = if bytes.len() % 2 == 1 {
+        padded = std::iter::once(b'0').chain(bytes.iter().copied()).collect();
+        padded.as_slice()
+    } else {
+        bytes
+    };
+    let mut out = Vec::with_capacity(src.len() / 2);
+    for pair in src.chunks_exact(2) {
+        let pair_str = std::str::from_utf8(pair).ok()?;
+        out.push(u8::from_str_radix(pair_str, 16).ok()?);
+    }
+    Some(out)
 }
 
 impl PendingAuth {

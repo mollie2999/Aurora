@@ -591,6 +591,7 @@ pub fn poll(app: &mut SteamApp, ctx: &egui::Context, visible: bool) -> bool {
     for event in rx.try_iter() {
         match event {
             PadEvent::Connected(n) => bp.controllers_connected(n),
+            PadEvent::Touchpads(_) => {}
             PadEvent::Press(press) if signed_in || bp.active => {
                 show_window |= bp.handle_pad_press(ctx, press, focused, playing);
             }
@@ -878,6 +879,7 @@ impl BigPicture {
                     Press::Y => y = true,
                     Press::Lt => lt = true,
                     Press::Rt => rt = true,
+                    Press::L3 | Press::R3 | Press::ToggleOsk => {}
                     Press::Scroll(delta) => stick_scroll += delta as f32 * 110.0 * s,
                     Press::Lb => self.switch_tab(TABS[(self.tab.index() + TABS.len() - 1) % TABS.len()], now, true),
                     Press::Rb => self.switch_tab(TABS[(self.tab.index() + 1) % TABS.len()], now, true),

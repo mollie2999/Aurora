@@ -320,7 +320,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aurora"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "client",
  "directories",
@@ -330,7 +330,6 @@ dependencies = [
  "extensions",
  "fast_image_resize",
  "fs4",
- "gilrs",
  "global-hotkey",
  "i18n",
  "image",
@@ -367,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "auth"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "base64 0.22.1",
  "net",
@@ -696,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "client"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "auth",
  "depot",
@@ -717,6 +716,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.10.7",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "depot"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "extensions"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "client",
  "egui",
@@ -1951,40 +1951,6 @@ checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
 dependencies = [
  "color_quant",
  "weezl",
-]
-
-[[package]]
-name = "gilrs"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "902fb00d3f6398e635be22e5c837b303c501835cca7ac11a47bba138f7aafdd8"
-dependencies = [
- "fnv",
- "gilrs-core",
- "log",
- "uuid",
- "vec_map",
-]
-
-[[package]]
-name = "gilrs-core"
-version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc7f0ce6237abcc0523f2a5502b1e3fe5802daaae47ac14e166fe49551301ea9"
-dependencies = [
- "inotify",
- "js-sys",
- "libc",
- "libudev-sys",
- "log",
- "nix 0.31.4",
- "objc2-core-foundation",
- "objc2-io-kit",
- "uuid",
- "vec_map",
- "wasm-bindgen",
- "web-sys",
- "windows",
 ]
 
 [[package]]
@@ -2388,6 +2354,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "html_shim"
+version = "1.0.0-rc5"
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2513,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "i18n"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "sys-locale",
  "toml 1.2.1+spec-1.1.0",
@@ -2669,26 +2639,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inotify"
-version = "0.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cc00ea907cab49550b7da656f80ebb97be1b997d931fbcd28d39734e17ce592"
-dependencies = [
- "bitflags 2.13.2",
- "inotify-sys",
- "libc",
-]
-
-[[package]]
-name = "inotify-sys"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c033f80b2c113cdf91ab7a33faa9cbc014726dcad99880c8609af2a370edf37d"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2700,7 +2650,7 @@ dependencies = [
 
 [[package]]
 name = "installer"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "directories",
  "eframe",
@@ -2708,6 +2658,7 @@ dependencies = [
  "flate2",
  "i18n",
  "rfd",
+ "tempfile",
  "ui",
  "windows-sys 0.61.2",
  "winresource",
@@ -2999,16 +2950,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libudev-sys"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c8469b4a23b962c1396b9b451dda50ef5b283e8dd309d69033475fa9b334324"
-dependencies = [
- "libc",
- "pkg-config",
-]
-
-[[package]]
 name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3040,7 +2981,7 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "local"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "directories",
  "fs4",
@@ -3214,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "serde",
 ]
@@ -3341,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "net"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "flate2",
  "futures-util",
@@ -3366,18 +3307,6 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
-]
-
-[[package]]
-name = "nix"
-version = "0.31.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bc81ce8148d3b4f3274da811f11cdd824ae661ee4ef732cdb229825cf5be7f7"
-dependencies = [
- "bitflags 2.13.2",
- "cfg-if",
- "cfg_aliases",
- "libc",
 ]
 
 [[package]]
@@ -3698,17 +3627,6 @@ dependencies = [
  "bitflags 2.13.2",
  "block2 0.6.2",
  "objc2 0.6.5",
- "objc2-core-foundation",
-]
-
-[[package]]
-name = "objc2-io-kit"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
-dependencies = [
- "bitflags 2.13.2",
- "libc",
  "objc2-core-foundation",
 ]
 
@@ -4127,7 +4045,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plugins"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "model",
  "rhai",
@@ -4393,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "prost",
  "prost-build",
@@ -5362,7 +5280,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "steamclient"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "aes-gcm",
  "crc32fast",
@@ -5382,14 +5300,14 @@ dependencies = [
 
 [[package]]
 name = "steamhost"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "store"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "model",
  "reqwest",
@@ -5519,7 +5437,7 @@ dependencies = [
 
 [[package]]
 name = "themes"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "egui",
  "flate2",
@@ -5528,6 +5446,7 @@ dependencies = [
  "rhai",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "toml 1.2.1+spec-1.1.0",
  "tracing",
@@ -6047,7 +5966,7 @@ dependencies = [
 
 [[package]]
 name = "ui"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "eframe",
  "egui",
@@ -6187,16 +6106,10 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vdf"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "thiserror 2.0.21",
 ]
-
-[[package]]
-name = "vec_map"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
 
 [[package]]
 name = "vello_common"
@@ -6239,7 +6152,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "egui",
  "i18n",
@@ -6253,7 +6166,7 @@ dependencies = [
 
 [[package]]
 name = "vk_overlay"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 
 [[package]]
 name = "walkdir"
@@ -7152,7 +7065,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "sha2",
  "zip",
@@ -7197,7 +7110,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "hex",
- "nix 0.29.0",
+ "nix",
  "ordered-stream",
  "rand 0.8.8",
  "serde",

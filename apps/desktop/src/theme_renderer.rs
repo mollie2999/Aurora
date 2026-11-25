@@ -1400,6 +1400,8 @@ fn render_scroll_generic(
 /// tree renderer can render library components without owning library state.
 pub trait LibraryHost {
     fn is_detail_open(&self) -> bool;
+    fn whats_new_enabled(&self) -> bool { true }
+    fn is_collections_open(&self) -> bool { false }
     fn render_detail(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx);
     fn handle_library_action(&mut self, action: &str, ctx: &mut Ctx);
     fn render_action_popup(&mut self, ui: &mut Ui, t: &Theme, response: &egui::Response, action: &str);
@@ -1433,7 +1435,20 @@ pub fn render_library(host: &mut dyn LibraryHost, nodes: &[Node], ui: &mut Ui, t
     }
 }
 
+fn lib_node_visible(host: &dyn LibraryHost, node: &Node) -> bool {
+    match node {
+        Node::WhatsNewShelf { .. } => host.whats_new_enabled(),
+        Node::Box { children, .. } | Node::Col { children, .. } | Node::Row { children, .. } if !children.is_empty() => {
+            children.iter().any(|child| lib_node_visible(host, child))
+        }
+        _ => true,
+    }
+}
+
 fn render_lib_node(lctx: &mut LibRenderCtx<'_, '_>, ui: &mut Ui, node: &Node) {
+    if !lib_node_visible(lctx.host, node) {
+        return;
+    }
     let t = lctx.t.clone();
     match node {
         Node::Panel { side, size, resizable, style, children, .. } => {
@@ -1554,7 +1569,9 @@ fn render_lib_node(lctx: &mut LibRenderCtx<'_, '_>, ui: &mut Ui, node: &Node) {
 
         Node::Button { label, icon, action, style } => {
             let mut resolved_style = style.clone();
-            if action == "navigate:library" && !lctx.host.is_detail_open() {
+            if (action == "navigate:library" && !lctx.host.is_detail_open())
+                || (action == "library:collections" && lctx.host.is_collections_open())
+            {
                 resolved_style.bg = style.active_bg.or(style.bg);
             }
             let mut resp = render_styled_button(ui, &t, label, icon.as_deref(), &resolved_style);
@@ -1879,5 +1896,63 @@ mod tests {
         });
         assert_eq!(bounds[0].top(), bounds[1].top());
         assert!(bounds[1].left() >= bounds[0].right());
+    }
+
+    struct StubLibraryHost {
+        whats_new: bool,
+        whats_new_rendered: usize,
+    }
+
+    impl LibraryHost for StubLibraryHost {
+        fn is_detail_open(&self) -> bool { false }
+        fn whats_new_enabled(&self) -> bool { self.whats_new }
+        fn render_detail(&mut self, _: &mut Ui, _: &Theme, _: &mut Ctx) {}
+        fn handle_library_action(&mut self, _: &str, _: &mut Ctx) {}
+        fn render_action_popup(&mut self, _: &mut Ui, _: &Theme, _: &egui::Response, _: &str) {}
+        fn render_search(&mut self, _: &mut Ui, _: &Theme, _: &mut Ctx, _: Option<&str>, _: bool, _: &NodeStyle) {}
+        fn render_filters(&mut self, _: &mut Ui, _: &Theme, _: &mut Ctx, _: &str, _: &NodeStyle) {}
+        fn render_list(&mut self, _: &mut Ui, _: &Theme, _: &mut Ctx, _: f32, _: themes::LibraryGrouping, _: f32, _: bool, _: bool, _: &NodeStyle) {}
+        fn render_whats_new(&mut self, _: &mut Ui, _: &Theme, _: &mut Ctx, _: Option<&str>, _: f32, _: f32, _: u8, _: bool, _: usize, _: f32, _: &NodeStyle) {
+            self.whats_new_rendered += 1;
+        }
+        fn render_recent_games(&mut self, _: &mut Ui, _: &Theme, _: &mut Ctx, _: Option<&str>, _: bool, _: f32, _: f32, _: f32, _: u8, _: f32, _: &NodeStyle) {}
+        fn render_all_games(&mut self, _: &mut Ui, _: &Theme, _: &mut Ctx, _: Option<&str>, _: bool, _: bool, _: &str, _: f32, _: f32, _: u8, _: f32, _: &NodeStyle) {}
+    }
+
+    #[test]
+    fn disabled_whats_new_collapses_wrapping_box_without_hiding_other_containers() {
+        let shelf = Node::WhatsNewShelf {
+            title: Some("What's New".into()),
+            card_width: 318.0,
+            card_height: 179.0,
+            card_radius: 4,
+            date_above: true,
+            max_items: 12,
+            gap: 16.0,
+            style: NodeStyle::default(),
+        };
+        let news_band = Node::Box {
+            style: NodeStyle {
+                padding: Some(themes::Edges { top: 16.0, right: 24.0, bottom: 28.0, left: 24.0 }),
+                bg_gradient: Some(GradientSpec { from: ColorRef::Literal(Color32::RED), to: ColorRef::Literal(Color32::BLUE), direction: Direction::Vertical }),
+                ..Default::default()
+            },
+            children: vec![shelf.clone()],
+        };
+        let decorative_box = Node::Box { style: NodeStyle::default(), children: vec![] };
+        let mixed_box = Node::Box {
+            style: NodeStyle::default(),
+            children: vec![shelf.clone(), Node::Text { value: "Keep".into(), style: NodeStyle::default() }],
+        };
+
+        let hidden = StubLibraryHost { whats_new: false, whats_new_rendered: 0 };
+        assert!(!lib_node_visible(&hidden, &shelf));
+        assert!(!lib_node_visible(&hidden, &news_band));
+        assert!(lib_node_visible(&hidden, &decorative_box));
+        assert!(lib_node_visible(&hidden, &mixed_box));
+
+        let shown = StubLibraryHost { whats_new: true, whats_new_rendered: 0 };
+        assert!(lib_node_visible(&shown, &shelf));
+        assert!(lib_node_visible(&shown, &news_band));
     }
 }

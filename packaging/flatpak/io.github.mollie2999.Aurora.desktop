@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Aurora Steam Client
+Name=Aurora
 Comment=An unofficial native Steam desktop client
 Exec=aurora
 Icon=io.github.mollie2999.Aurora

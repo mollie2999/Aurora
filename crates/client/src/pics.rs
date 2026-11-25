@@ -150,20 +150,17 @@ async fn fetch_apps(conn: &Connection, cache: &mut Cache, ids: Vec<AppId>) -> Re
     Ok(())
 }
 
-fn pending(p: &net::Packet) -> bool {
-    p.body::<CMsgClientPicsProductInfoResponse>()
-        .map(|r| r.response_pending())
-        .unwrap_or(false)
-}
-
 async fn product_info(
     conn: &Connection,
     req: &CMsgClientPicsProductInfoRequest,
 ) -> Result<Vec<CMsgClientPicsProductInfoResponse>> {
-    let replies = conn
-        .request_many(emsg::CLIENT_PICS_PRODUCT_INFO_REQUEST, req, |p| !pending(p))
-        .await?;
-    replies.iter().map(|p| p.body().map_err(Error::from)).collect()
+    conn.request_many_decoded(
+        emsg::CLIENT_PICS_PRODUCT_INFO_REQUEST,
+        req,
+        |r: &CMsgClientPicsProductInfoResponse| !r.response_pending(),
+    )
+    .await
+    .map_err(Error::from)
 }
 
 /// Each package's app ids.

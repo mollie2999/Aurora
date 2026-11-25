@@ -1123,7 +1123,7 @@ fn install_custom_art(src: &std::path::Path, app: AppId, kind: &str) -> Result<(
     }
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);

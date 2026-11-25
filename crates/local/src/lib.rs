@@ -96,10 +96,14 @@ pub fn load(steam_root: Option<PathBuf>) -> Result<LocalState> {
             libraries.push(lib);
         }
     }
-    let accounts = accounts(&root).unwrap_or_else(|e| {
-        tracing::warn!("could not read accounts: {e}");
-        Vec::new()
-    });
+    let accounts = match accounts(&root) {
+        Ok(accounts) => accounts,
+        Err(Error::Io(_, e)) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::warn!("could not read accounts: {e}");
+            Vec::new()
+        }
+    };
 
     let usage = accounts
         .iter()

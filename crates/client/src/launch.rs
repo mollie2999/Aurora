@@ -2650,6 +2650,10 @@ mod linux {
         (native, windows)
     }
 
+    /// On FreeBSD, default to Windows builds (Wine/wine-proton) until
+    /// Linuxulator / LSU runtime launching is supported and tested.
+    const DEFAULT_TO_WINDOWS: bool = cfg!(target_os = "freebsd");
+
     /// For the Compatibility menu: `None` if no Linux build is installed,
     /// else (the Linux build is what runs without a choice here, the Windows
     /// build is installed too).
@@ -2661,7 +2665,7 @@ mod linux {
         if !native {
             return None;
         }
-        let steam_forced = local::find_steam_root().is_some_and(|r| compat::forced_tool(&r, app.app_id));
+        let steam_forced = DEFAULT_TO_WINDOWS || local::find_steam_root().is_some_and(|r| compat::forced_tool(&r, app.app_id));
         Some((use_native(steam_forced, native, windows), windows))
     }
 
@@ -2676,7 +2680,10 @@ mod linux {
             .filter(|c| c != super::NATIVE && c != super::DEFAULT_PROTON)
             .and_then(|name| root.as_deref().and_then(|r| compat::compat_tools(r).into_iter().find(|t| t.name.eq_ignore_ascii_case(&name))));
         let forced = !want_native
-            && (choice.as_deref() == Some(super::DEFAULT_PROTON) || own.is_some() || root.as_deref().is_some_and(|r| compat::forced_tool(r, app.app_id)));
+            && (DEFAULT_TO_WINDOWS
+                || choice.as_deref() == Some(super::DEFAULT_PROTON)
+                || own.is_some()
+                || root.as_deref().is_some_and(|r| compat::forced_tool(r, app.app_id)));
         // A Linux build, unless the player forced a compatibility tool.
         let (native, windows) = builds(app);
         let installed = |o: &LaunchOption| install_dir.join(normalize(&o.executable)).is_file();
@@ -3398,8 +3405,9 @@ mod tests {
         // An app id no real Steam config maps a tool to.
         let app = OwnedApp { app_id: 4_000_000_123, name: "Both".into(), launch: vec![opt("Game.exe", "windows"), opt("BinLinux/Game.x64", "linux")], ..Default::default() };
         let runs_native = || linux::plan(&app, &dir).is_ok_and(|p| !p.uses_proton());
-        assert_eq!(native_build(&app, &dir), Some((true, true)));
-        assert!(runs_native());
+        let native_default = !cfg!(target_os = "freebsd");
+        assert_eq!(native_build(&app, &dir), Some((native_default, true)));
+        assert_eq!(runs_native(), native_default);
         set_app_proton(app.app_id, Some(NATIVE.into()));
         assert!(runs_native());
         // Proton (fails without a Proton installed, but never runs native).

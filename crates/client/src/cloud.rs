@@ -93,10 +93,10 @@ impl Target {
             "winvideos" if cfg!(target_os = "windows") => user.as_ref()?.video_dir()?.to_path_buf(),
             "winmusic" if cfg!(target_os = "windows") => user.as_ref()?.audio_dir()?.to_path_buf(),
             // Steam's Linux roots, for native Linux games.
-            "linuxhome" if cfg!(target_os = "linux") => home?,
-            "linuxxdgdatahome" if cfg!(target_os = "linux") => base.as_ref()?.data_dir().to_path_buf(),
-            "linuxxdgconfighome" if cfg!(target_os = "linux") => base.as_ref()?.config_dir().to_path_buf(),
-            "linuxxdgcachehome" if cfg!(target_os = "linux") => base.as_ref()?.cache_dir().to_path_buf(),
+            "linuxhome" if cfg!(any(target_os = "linux", target_os = "freebsd")) => home?,
+            "linuxxdgdatahome" if cfg!(any(target_os = "linux", target_os = "freebsd")) => base.as_ref()?.data_dir().to_path_buf(),
+            "linuxxdgconfighome" if cfg!(any(target_os = "linux", target_os = "freebsd")) => base.as_ref()?.config_dir().to_path_buf(),
+            "linuxxdgcachehome" if cfg!(any(target_os = "linux", target_os = "freebsd")) => base.as_ref()?.cache_dir().to_path_buf(),
             // Steam's macOS roots.
             "machome" if cfg!(target_os = "macos") => home?,
             "macappsupport" if cfg!(target_os = "macos") => base.as_ref()?.data_dir().to_path_buf(),
@@ -1337,7 +1337,7 @@ mod tests {
         assert!(t_ruled.local_path("%LinuxHome%.bashrc").is_none());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn gates_windows_and_mac_roots_unless_proton_prefix_is_set() {
         let mut t = Target {

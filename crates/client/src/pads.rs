@@ -474,7 +474,10 @@ mod sdl_dyn {
                 return Some(m);
             }
         }
+        #[cfg(target_os = "linux")]
         tracing::info!("controllers: libSDL3 not found; using Linux sysfs/evdev fallback");
+        #[cfg(not(target_os = "linux"))]
+        tracing::info!("controllers: libSDL3 not found; no native fallback on this OS");
         None
     }
 
@@ -1174,14 +1177,22 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::{
-        ConnectionKind, ControllerFamily, DetectedController, DetectionSnapshot, FORCE_RESCAN, LiveInput,
+        ControllerFamily, DetectedController, DetectionSnapshot, FORCE_RESCAN,
         build_live_input, rumble_lock, sdl_dyn::{self, Gp, Sdl}, settings, snapshot_lock, ui_active,
     };
+    #[cfg(target_os = "linux")]
+    use super::{ConnectionKind, LiveInput};
+    #[cfg(target_os = "linux")]
     use std::collections::HashMap;
+    #[cfg(target_os = "linux")]
     use std::fs::File;
+    #[cfg(target_os = "linux")]
     use std::io::Read;
+    #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(target_os = "linux")]
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
@@ -1192,7 +1203,7 @@ mod platform {
     pub fn ensure_ui_reader() {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         if !*running {
-            if std::thread::Builder::new().name("pads-linux".into()).spawn(read_loop).is_ok() {
+            if std::thread::Builder::new().name("pads-unix".into()).spawn(read_loop).is_ok() {
                 *running = true;
             }
         }
@@ -1220,13 +1231,20 @@ mod platform {
                 run_sdl_linux(sdl);
                 return;
             }
+            #[cfg(target_os = "linux")]
             tracing::warn!("controllers: SDL3 gamepad init failed ({}); falling back to Linux evdev/js", sdl_dyn::cstr_lossy(unsafe { (sdl.get_error)() }));
+            #[cfg(not(target_os = "linux"))]
+            tracing::warn!("controllers: SDL3 gamepad init failed ({})", sdl_dyn::cstr_lossy(unsafe { (sdl.get_error)() }));
         }
+        #[cfg(target_os = "linux")]
         run_native_linux();
+        #[cfg(not(target_os = "linux"))]
+        run_native_fallback();
     }
 
     /// Trigger a short rumble pulse directly via Linux evdev `EVIOCSFF` + `EV_FF`
     /// as a fallback when SDL3 rumble returns false (common on Bluetooth Xbox pads).
+    #[cfg(target_os = "linux")]
     fn evdev_rumble_fallback(vendor: u16, product: u16) {
         static RUMBLE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if RUMBLE_BUSY.swap(true, Ordering::AcqRel) {
@@ -1329,9 +1347,12 @@ mod platform {
             }
             unsafe { (sdl.update)() };
             let force = FORCE_RESCAN.swap(false, Ordering::AcqRel);
+            #[cfg(target_os = "linux")]
             let need_bt_reinit = pads.is_empty()
                 && last_reinit.elapsed() > Duration::from_secs(2)
                 && !discover_sysfs_pads(Path::new("/sys/class/input"), Path::new("/dev/input")).is_empty();
+            #[cfg(not(target_os = "linux"))]
+            let need_bt_reinit = false;
             if force || need_bt_reinit {
                 last_reinit = Instant::now();
                 for o in pads.drain(..) {
@@ -1391,6 +1412,7 @@ mod platform {
                 if rumble_target.as_deref() == Some(id_str.as_str()) && cal.rumble_enabled {
                     let ok = unsafe { (sdl.rumble)(o.gp, 0xFFFF, 0xFFFF, 400) };
                     if !ok {
+                        #[cfg(target_os = "linux")]
                         evdev_rumble_fallback(o.vendor, o.product);
                     }
                 }
@@ -1448,8 +1470,15 @@ mod platform {
 
     // -------------------------------------------------------- Linux sysfs / evdev / js fallback
 
+    #[cfg(target_os = "linux")]
+    pub(super) use linux_native::*;
+
+    #[cfg(target_os = "linux")]
+    mod linux_native {
+    use super::*;
+
     #[derive(Debug, Clone)]
-    pub(super) struct SysfsPad {
+    pub struct SysfsPad {
         pub id: String,
         pub name: String,
         pub family: ControllerFamily,
@@ -1462,7 +1491,7 @@ mod platform {
 
     /// Check if a bit in Linux `/sys/class/input/*/device/capabilities/key` is set.
     /// Words are hex `usize` values listed most-significant word first.
-    pub(super) fn has_cap_bit(caps: &str, bit: usize) -> bool {
+    pub fn has_cap_bit(caps: &str, bit: usize) -> bool {
         let bits_per_word = usize::BITS as usize;
         let words: Vec<&str> = caps.split_whitespace().collect();
         let word_from_lsb = bit / bits_per_word;
@@ -1473,7 +1502,7 @@ mod platform {
         usize::from_str_radix(words[idx], 16).is_ok_and(|w| (w >> (bit % bits_per_word)) & 1 != 0)
     }
 
-    pub(super) fn is_gamepad_caps(key_caps: &str, props: &str) -> bool {
+    pub fn is_gamepad_caps(key_caps: &str, props: &str) -> bool {
         // Skip dedicated accelerometer/IMU nodes (`INPUT_PROP_ACCELEROMETER = 6`).
         if has_cap_bit(props, 6) {
             return false;
@@ -1486,7 +1515,7 @@ mod platform {
         std::fs::read_to_string(path).ok().and_then(|s| u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0)
     }
 
-    pub(super) fn discover_sysfs_pads(sys_class_input: &Path, dev_input: &Path) -> Vec<SysfsPad> {
+    pub fn discover_sysfs_pads(sys_class_input: &Path, dev_input: &Path) -> Vec<SysfsPad> {
         let Ok(rd) = std::fs::read_dir(sys_class_input) else {
             return Vec::new();
         };
@@ -1542,11 +1571,11 @@ mod platform {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct InputEvent {
-        time: libc::timeval,
-        kind: u16,
-        code: u16,
-        value: i32,
+    pub struct InputEvent {
+        pub time: libc::timeval,
+        pub kind: u16,
+        pub code: u16,
+        pub value: i32,
     }
 
     #[repr(C)]
@@ -1651,7 +1680,7 @@ mod platform {
                                     0x137 => set_bit(&mut raw.buttons, 0x0200, down), // BTN_TR
                                     0x13a => set_bit(&mut raw.buttons, 0x0020, down), // BTN_SELECT
                                     0x13b => set_bit(&mut raw.buttons, 0x0010, down), // BTN_START
-                                    0x13c => set_bit(&mut raw.buttons, super::shm::GUIDE, down), // BTN_MODE
+                                    0x13c => set_bit(&mut raw.buttons, crate::pads::shm::GUIDE, down), // BTN_MODE
                                     0x13d => set_bit(&mut raw.buttons, 0x0040, down), // BTN_THUMBL
                                     0x13e => set_bit(&mut raw.buttons, 0x0080, down), // BTN_THUMBR
                                     0x220 => set_bit(&mut raw.buttons, 0x0001, down), // DPAD_UP
@@ -1711,7 +1740,7 @@ mod platform {
                                     5 => set_bit(&mut raw.buttons, 0x0200, down),
                                     6 => set_bit(&mut raw.buttons, 0x0020, down),
                                     7 => set_bit(&mut raw.buttons, 0x0010, down),
-                                    8 => set_bit(&mut raw.buttons, super::shm::GUIDE, down),
+                                    8 => set_bit(&mut raw.buttons, crate::pads::shm::GUIDE, down),
                                     9 => set_bit(&mut raw.buttons, 0x0040, down),
                                     10 => set_bit(&mut raw.buttons, 0x0080, down),
                                     _ => {}
@@ -1746,7 +1775,7 @@ mod platform {
         }
     }
 
-    fn run_native_linux() {
+    pub fn run_native_linux() {
         let mut nodes: Vec<(SysfsPad, OpenNode)> = Vec::new();
         let mut scanned: Option<Instant> = None;
         loop {
@@ -1828,6 +1857,28 @@ mod platform {
                 note,
             };
             std::thread::sleep(Duration::from_millis(16));
+        }
+    }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn run_native_fallback() {
+        loop {
+            if !ui_active() {
+                let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+                if !ui_active() {
+                    *running = false;
+                    return;
+                }
+            }
+            if ui_active() {
+                *snapshot_lock().lock().unwrap_or_else(|e| e.into_inner()) = DetectionSnapshot {
+                    backend: "none",
+                    controllers: Vec::new(),
+                    note: Some("Controller detection requires SDL3 (libSDL3.so.0) when Linux evdev/sysfs is unavailable.".into()),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 }
@@ -1956,7 +2007,7 @@ mod tests {
         assert_eq!(live.gyro, [1.0, -0.5, 0.0]);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_sysfs_discovery_filters_gamepads_and_ignores_mice_and_imus() {
         let root = std::env::temp_dir().join(format!("sir-sysfs-pads-{}", std::process::id()));

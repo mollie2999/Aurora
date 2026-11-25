@@ -13,6 +13,8 @@ pub struct CompatTool {
     pub name: String,
     /// Name to show (`Proton 11.0`).
     pub display: String,
+    /// Direct Wine executable on FreeBSD. Proton tools use their script instead.
+    pub wine_bin: Option<PathBuf>,
     /// Folder holding the `proton` script.
     pub dir: PathBuf,
     /// Steam Linux Runtime app the tool asks to run inside (toolmanifest.vdf
@@ -24,6 +26,38 @@ impl CompatTool {
     pub fn script(&self) -> PathBuf {
         self.dir.join("proton")
     }
+}
+
+/// FreeBSD also supports standalone Wine without a Steam installation. Use
+/// the conventional Steam tools directory for optional custom Proton scripts.
+pub fn tool_root() -> Option<PathBuf> {
+    let root = crate::find_steam_root();
+    #[cfg(target_os = "freebsd")]
+    let root = root.or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/Steam")))
+        .or_else(|| Some(PathBuf::from("/usr/local/share/steam")));
+    root
+}
+
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn discover_wine(port_root: &Path, path: &[PathBuf]) -> Vec<CompatTool> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut tools = Vec::new();
+    for (name, display) in [("wine-proton", "Wine Proton"), ("wine", "Wine"), ("wine-devel", "Wine Development")] {
+        let binary = std::iter::once(port_root.join(name).join("bin/wine"))
+            .chain(path.iter().filter(|dir| dir.is_absolute()).map(|dir| dir.join(name)))
+            .chain(std::iter::once(port_root.join("bin").join(name)))
+            .find(|bin| bin.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0));
+        if let Some(bin) = binary {
+            tools.push(CompatTool {
+                dir: bin.parent().unwrap().to_owned(),
+                wine_bin: Some(bin),
+                display: display.into(),
+                name: name.into(),
+                runtime_app: None,
+            });
+        }
+    }
+    tools
 }
 
 fn read_vdf(path: &Path) -> Option<vdf::Obj> {
@@ -38,6 +72,9 @@ fn runtime_of(dir: &Path) -> Option<AppId> {
 /// Every installed tool: Valve's Proton apps in the Steam libraries, then
 /// custom tools in `compatibilitytools.d` (the user's and the system's).
 pub fn compat_tools(root: &Path) -> Vec<CompatTool> {
+    #[cfg(target_os = "freebsd")]
+    let mut out = discover_wine(Path::new("/usr/local"), &std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>());
+    #[cfg(not(target_os = "freebsd"))]
     let mut out = Vec::new();
     for lib in crate::library_folders(root).unwrap_or_default() {
         let apps = lib.join("steamapps");
@@ -54,7 +91,7 @@ pub fn compat_tools(root: &Path) -> Vec<CompatTool> {
             let Some(installdir) = state.str("installdir").filter(|s| crate::is_valid_folder_name(s)) else { continue };
             let dir = apps.join("common").join(installdir);
             if dir.join("proton").is_file() {
-                out.push(CompatTool { name: internal, display: name.to_string(), runtime_app: runtime_of(&dir), dir });
+                out.push(CompatTool { wine_bin: None, name: internal, display: name.to_string(), runtime_app: runtime_of(&dir), dir });
             }
         }
     }
@@ -80,7 +117,7 @@ pub fn compat_tools(root: &Path) -> Vec<CompatTool> {
                 if !dir.join("proton").is_file() || out.iter().any(|x: &CompatTool| x.name == name) {
                     continue;
                 }
-                out.push(CompatTool { name: name.to_string(), display: t.str("display_name").unwrap_or(name).to_string(), runtime_app: runtime_of(&dir), dir });
+                out.push(CompatTool { wine_bin: None, name: name.to_string(), display: t.str("display_name").unwrap_or(name).to_string(), runtime_app: runtime_of(&dir), dir });
             }
         }
     }
@@ -136,6 +173,10 @@ pub fn tool_for(root: &Path, app: AppId) -> Option<CompatTool> {
             return Some(t.clone());
         }
     }
+    #[cfg(target_os = "freebsd")]
+    if let Some(tool) = tools.iter().find(|t| t.wine_bin.is_some()) {
+        return Some(tool.clone());
+    }
     let rank = |t: &CompatTool| -> (u8, u32) {
         if t.name == "proton_experimental" {
             return (2, 0);
@@ -177,12 +218,39 @@ pub fn compat_data(install_dir: &Path, app: AppId) -> Option<PathBuf> {
 /// go (`…/pfx/drive_c/users/steamuser`), if the prefix exists.
 pub fn prefix_user_dir(install_dir: &Path, app: AppId) -> Option<PathBuf> {
     let dir = compat_data(install_dir, app)?.join("pfx").join("drive_c").join("users").join("steamuser");
+    #[cfg(target_os = "freebsd")]
+    if !dir.is_dir() {
+        let user = std::env::var("USER").ok().filter(|name| crate::is_valid_folder_name(name))?;
+        let native = dir.parent()?.join(user);
+        return native.is_dir().then_some(native);
+    }
     dir.is_dir().then_some(dir)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_wine_discovery() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = std::env::temp_dir().join(format!("aurora-wine-tools-{}", std::process::id()));
+        let path = temp.join("custom bin");
+        let proton = temp.join("wine-proton/bin/wine");
+        std::fs::create_dir_all(proton.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        for bin in [&proton, &path.join("wine")] {
+            std::fs::write(bin, b"").unwrap();
+            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(path.join("wine-devel"), b"").unwrap();
+        let tools = discover_wine(&temp, std::slice::from_ref(&path));
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].wine_bin.as_ref(), Some(&proton));
+        assert_eq!(tools[1].wine_bin, Some(path.join("wine")));
+        std::fs::remove_dir_all(temp).unwrap();
+    }
 
     #[test]
     fn valve_names() {

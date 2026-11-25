@@ -71,7 +71,7 @@ pub(crate) enum Page {
     GameManage(AppId),
     Controller(AppId),
     Notifications,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     Compatibility(AppId),
     StoreApp(AppId),
     Review(AppId, String),
@@ -219,7 +219,7 @@ pub struct BigPicture {
     /// The install screen's choices: (game, library folder, desktop shortcut).
     install: Option<(AppId, std::path::PathBuf, bool, &'static str)>,
     pub(crate) install_plan_cache: Option<(AppId, &'static str, crate::builtin::library::InstallPlan)>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub(crate) compat_cache: Option<(AppId, Option<(bool, bool)>, Option<String>, Vec<(String, String)>)>,
     pub(crate) manage: manage::ManageState,
     pub(crate) profile: profile::ProfileState,
@@ -487,7 +487,7 @@ impl BigPicture {
         if matches!(page, Page::Install(_)) {
             self.install_plan_cache = None;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if matches!(page, Page::Compatibility(_)) {
             self.compat_cache = None;
         }

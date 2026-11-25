@@ -180,7 +180,7 @@ pub fn page(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f32, id: AppId
     y += row_step;
 
     if installed.is_some() && !f.app.demo {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
             let current_tool = client::app_proton(id).unwrap_or_else(|| t!("Automatic").into());
             if compact_row(

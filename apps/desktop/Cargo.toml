@@ -41,6 +41,9 @@ reqwest.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
 tray-icon.workspace = true
@@ -52,8 +55,6 @@ winresource = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { workspace = true, features = ["wayland", "x11"] }
-# mallopt / malloc_trim (main.rs: memory given back to the system).
-libc = "0.2"
 # Tray icon over D-Bus (StatusNotifierItem): no GTK loop needed.
 ksni = { version = "0.3.7", features = ["blocking"] }
 # Taskbar/dock download progress over D-Bus (com.canonical.Unity.LauncherEntry).
@@ -65,3 +66,6 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # Shift+Tab overlay: which window is in front (X11/XWayland, where games run).
 x11rb = "0.13"
+
+[target.'cfg(target_os = "freebsd")'.dependencies]
+eframe = { workspace = true, features = ["wayland", "x11"] }

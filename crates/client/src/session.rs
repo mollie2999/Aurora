@@ -3135,7 +3135,7 @@ impl Online {
                 let overlay: Option<(u16, String)> = None;
                 let started = swapped.and_then(|_| {
                     let ov = overlay.as_ref().map(|(p, t)| (*p, t.as_str()));
-                    launch::spawn_with_steamclient(app, dir, args, &self.ipc.env_value(&token), &self.account, pads.as_deref(), ov)
+                    launch::spawn_with_steamclient(app, dir, args, &self.ipc.env_value(&token), &self.account, account_id, pads.as_deref(), ov)
                 });
                 if started.is_err() && pads.is_some() {
                     crate::pads::stop();

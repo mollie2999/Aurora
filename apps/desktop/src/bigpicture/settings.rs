@@ -37,7 +37,7 @@ pub struct SettingsState {
     /// Cached controller detection snapshot (avoids per-frame polling).
     controller_cache: Option<(Instant, client::DetectionSnapshot)>,
     /// Cached Proton builds (Linux).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     proton_cache: Option<(Instant, Vec<(String, String)>)>,
     /// "Sign out" was pressed once: needs a second press before this time.
     confirm_until: f64,
@@ -58,7 +58,7 @@ impl SettingsState {
         self.storage_rx = None;
         self.controller_cache = None;
         self.themes = None;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
             self.proton_cache = None;
         }
@@ -74,11 +74,11 @@ pub(super) const CONTROLLER: usize = 5;
 pub(super) const OVERLAY: usize = 6;
 pub(super) const APPEARANCE: usize = 7;
 pub(super) const ACCOUNT: usize = 8;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(super) const COMPATIBILITY: usize = 9;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(super) const SYSTEM: usize = 10;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub(super) const SYSTEM: usize = 9;
 
 const SIZES: [f32; 5] = [0.85, 1.0, 1.1, 1.2, 1.35];
@@ -281,7 +281,7 @@ fn sections() -> Vec<(&'static str, &'static str)> {
         (icons::PALETTE, t!("Appearance")),
         (icons::USER_CIRCLE, t!("Account")),
     ];
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     list.push((icons::WINDOWS, t!("Compatibility")));
     list.push((icons::INFO, t!("System")));
     list
@@ -1102,7 +1102,7 @@ fn rows(bp: &mut BigPicture, f: &mut Frame, ctx: &egui::Context) -> Vec<Row> {
             ]);
             out
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         COMPATIBILITY => {
             let need_refresh = bp
                 .settings

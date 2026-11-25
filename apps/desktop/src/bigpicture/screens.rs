@@ -43,7 +43,7 @@ pub fn draw(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, pos: f32) -> f32 {
         Page::GameManage(id) => super::manage::page(bp, ui, f, top, id),
         Page::Controller(id) => controller_page(bp, ui, f, top, id),
         Page::Notifications => notifications(bp, ui, f, top),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         Page::Compatibility(id) => compatibility_page(bp, ui, f, top, id),
         Page::StoreApp(id) => store_app(bp, ui, f, top, id),
         Page::Review(id, review) => review_page(ui, f, top, id, &review),
@@ -534,7 +534,7 @@ fn runs_here(app: &model::OwnedApp) -> bool {
     if launch.peek().is_some() {
         return launch.any(|option| {
             option.runs_on_this_os()
-                || cfg!(target_os = "linux") && option.os_list.split(',').any(|os| os.trim() == "windows")
+                || cfg!(any(target_os = "linux", target_os = "freebsd")) && option.os_list.split(',').any(|os| os.trim() == "windows")
         });
     }
     let depots = app.depots.iter().filter(|depot| depot.dlc_app.is_none() && !depot.manifests.is_empty());
@@ -542,7 +542,7 @@ fn runs_here(app: &model::OwnedApp) -> bool {
     depots.peek().is_none() || depots.any(|depot| {
         depot.os.is_empty() || depot.os.split(',').any(|os| {
             let os = os.trim();
-            os == std::env::consts::OS || cfg!(target_os = "linux") && os == "windows"
+            os == std::env::consts::OS || cfg!(any(target_os = "linux", target_os = "freebsd")) && os == "windows" || cfg!(target_os = "freebsd") && os == "linux"
         })
     })
 }
@@ -993,7 +993,7 @@ fn game(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f32, id: AppId) ->
     {
         bp.open(Page::StoreApp(id), f.now);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     if installed.is_some()
         && !f.app.demo
         && !matches!(action, MainAction::Busy { .. })
@@ -1095,7 +1095,7 @@ fn game(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f32, id: AppId) ->
     y - top + 40.0 * s
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn compatibility_choices<'a>(native: Option<(bool, bool)>, default: Option<&str>, builds: &'a [(String, String)]) -> Vec<(Option<&'a str>, String)> {
     let mut choices = vec![(None, t!("Automatic").to_string())];
     if let Some((_, windows)) = native {
@@ -1111,7 +1111,7 @@ fn compatibility_choices<'a>(native: Option<(bool, bool)>, default: Option<&str>
     choices
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn compatibility_page(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f32, id: AppId) -> f32 {
     let s = f.s;
     let left = f.view.left() + f.pad;
@@ -2643,7 +2643,7 @@ fn embedded(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, page: &str, arg: Op
     f.view.height()
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
 mod compatibility_tests {
     use super::compatibility_choices;
 

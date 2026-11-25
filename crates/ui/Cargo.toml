@@ -17,8 +17,11 @@ log = "0.4"
 # Match epaint's parser when checking theme-provided font faces.
 skrifa = { version = "0.44.0", default-features = false, features = ["std"] }
 
-# winit needs a windowing system on Linux (same as the apps).
+# winit needs a windowing system on Linux and FreeBSD (same as the apps).
 [target.'cfg(target_os = "linux")'.dependencies]
+eframe = { workspace = true, features = ["wayland", "x11"] }
+
+[target.'cfg(target_os = "freebsd")'.dependencies]
 eframe = { workspace = true, features = ["wayland", "x11"] }
 
 # Direct3D 12 renderer, used when OpenGL can't start (see src/native.rs).

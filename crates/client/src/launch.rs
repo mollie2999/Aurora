@@ -48,6 +48,8 @@ pub(crate) fn mode_with_host(app: &OwnedApp, install_dir: &Path, controller: u8,
 
     let executable = launch_exe(app, install_dir).filter(|path| path.is_file());
     let use_host = host_ready && !force_official && executable.is_some();
+    #[cfg(target_os = "freebsd")]
+    let use_host = use_host && !linux::plan(app, install_dir).is_ok_and(|p| p.uses_native_wine());
     if !use_host {
         if let Some(ac) = anti_cheat(app, install_dir) {
             return LaunchMode::OfficialSteam { anti_cheat: ac };
@@ -219,7 +221,7 @@ pub fn anti_cheat(app: &OwnedApp, install_dir: &Path) -> Option<String> {
     if app.categories.contains(&CATEGORY_VAC) {
         return Some("Valve Anti-Cheat".into());
     }
-    for opt in app.launch.iter().filter(|o| o.runs_on_this_os() || (cfg!(target_os = "linux") && o.os_list.split(',').any(|os| os.trim() == "windows"))) {
+    for opt in app.launch.iter().filter(|o| o.runs_on_this_os() || (cfg!(any(target_os = "linux", target_os = "freebsd")) && o.os_list.split(',').any(|os| os.trim() == "windows"))) {
         let text = format!("{} {}", opt.executable, opt.arguments).to_lowercase();
         if let Some((_, name)) = ANTI_CHEAT_MARKERS.iter().find(|(m, _)| text.contains(m)) {
             return Some(name.to_string());
@@ -452,7 +454,7 @@ pub(crate) fn steam_input_env_vars(
 /// Start a game with our steamclient: environment like a Steam launch, plus
 /// the pipe and token for the DLL. The registry swap must be in place.
 /// `pads` names the shared memory with the controllers XInput can't see.
-pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchArgs, ipc_env: &str, account: &str, pads: Option<&str>, overlay: Option<(u16, &str)>) -> Result<Child, String> {
+pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchArgs, ipc_env: &str, account: &str, account_id: u32, pads: Option<&str>, overlay: Option<(u16, &str)>) -> Result<Child, String> {
     let connect = safe_connect_args(&args.connect)?;
     let opts = UserOptions::parse(&args.user);
     let mut cmd = command(app, install_dir, &opts, &connect)?;
@@ -476,6 +478,34 @@ pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchA
     if let Some(log) = std::env::var_os("STEAMINRUST_STEAMCLIENT_LOG") {
         cmd.env(crate::ipc::protocol::ENV_LOG, log);
     }
+    #[cfg(not(windows))]
+    configure_steamclient(&mut cmd, app, install_dir, account_id)?;
+    #[cfg(windows)]
+    let _ = account_id;
+    let mut cmd = finish(app, install_dir, &opts, cmd);
+    #[cfg(target_os = "linux")]
+    apply_vk_overlay_env(&mut cmd, overlay, overlay_on);
+    #[cfg(not(target_os = "linux"))]
+    let _ = overlay;
+    cmd.spawn().map_err(|e| format!("could not start {}: {e}", app.name))
+}
+
+#[cfg(not(windows))]
+fn configure_steamclient(cmd: &mut Command, app: &OwnedApp, install_dir: &Path, account_id: u32) -> Result<(), String> {
+    #[cfg(target_os = "freebsd")]
+    if let Some(prefix) = cmd.get_envs().find(|(key, _)| *key == "WINEPREFIX").and_then(|(_, value)| value) {
+        setup_wine_client(Path::new(cmd.get_program()), Path::new(prefix), account_id, [steamclient_dll(true), steamclient_dll(false)])?;
+        // wine-proton can provide built-in Steam bridges. Select our native
+        // Windows DLLs while keeping overrides for unrelated libraries.
+        let mut overrides = std::env::var_os("WINEDLLOVERRIDES").unwrap_or_default();
+        if !overrides.is_empty() {
+            overrides.push(";");
+        }
+        overrides.push("steamclient,steamclient64=n");
+        cmd.env("WINEDLLOVERRIDES", overrides);
+        return Ok(());
+    }
+    let _ = account_id;
     // Proton: a Steam folder whose legacycompat/ DLLs are ours, which Proton
     // copies into the prefix. Proton's Wine also swaps any "steamclient64"
     // the game loads for its own bridge to the Steam client (lsteamclient)
@@ -483,23 +513,15 @@ pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchA
     // writes the registry entry naming the DLL, so a prefix without it yet
     // keeps the bridge for this one launch. The DLL draws the Shift+Tab
     // overlay inside D3D11 games and reaches the app over loopback.
-    #[cfg(not(windows))]
-    {
-        let root = local::find_steam_root().ok_or("Steam Play needs a Steam install for Proton")?;
-        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", linux::client_shim(&root)?);
-        if prefix_knows_client(app, install_dir) {
-            cmd.env("PROTON_DISABLE_LSTEAMCLIENT", "1");
-        } else {
-            // `prefix_setup` normally ran first; if it failed, this launch keeps the bridge.
-            tracing::info!("{}: new Proton prefix, Steam features from our steamclient from the next launch", app.name);
-        }
+    let root = local::find_steam_root().ok_or("Steam Play needs a Steam install for Proton")?;
+    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", linux::client_shim(&root)?);
+    if prefix_knows_client(app, install_dir) {
+        cmd.env("PROTON_DISABLE_LSTEAMCLIENT", "1");
+    } else {
+        // `prefix_setup` normally ran first; if it failed, this launch keeps the bridge.
+        tracing::info!("{}: new Proton prefix, Steam features from our steamclient from the next launch", app.name);
     }
-    let mut cmd = finish(app, install_dir, &opts, cmd);
-    #[cfg(target_os = "linux")]
-    apply_vk_overlay_env(&mut cmd, overlay, overlay_on);
-    #[cfg(not(target_os = "linux"))]
-    let _ = overlay;
-    cmd.spawn().map_err(|e| format!("could not start {}: {e}", app.name))
+    Ok(())
 }
 
 /// Start a non-Steam game the player added (program path, launch options).
@@ -890,7 +912,16 @@ fn wait_all_inner(child: &mut Child, started: Instant, stop: Option<&std::sync::
 }
 
 /// Any live (not zombie) process in process group `pgid`?
-#[cfg(not(windows))]
+#[cfg(target_os = "freebsd")]
+fn group_alive(pgid: u32) -> bool {
+    win::ps(&["-ax", "-o", "pgid=,stat="]).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next().and_then(|group| group.parse().ok()) == Some(pgid)
+            && fields.next().is_some_and(|state| !state.starts_with('Z'))
+    })
+}
+
+#[cfg(not(any(windows, target_os = "freebsd")))]
 fn group_alive(pgid: u32) -> bool {
     let Ok(dir) = std::fs::read_dir("/proc") else { return false };
     dir.flatten().filter(|e| e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))).any(|e| {
@@ -2427,7 +2458,7 @@ pub fn default_proton(app: AppId) -> Option<String> {
 }
 
 fn default_proton_uncached(app: AppId) -> Option<String> {
-    let root = local::find_steam_root()?;
+    let root = local::compat::tool_root()?;
     let tools = local::compat::compat_tools(&root);
     proton_override()
         .and_then(|n| tools.iter().find(|t| t.name.eq_ignore_ascii_case(&n)).cloned())
@@ -2436,13 +2467,13 @@ fn default_proton_uncached(app: AppId) -> Option<String> {
 }
 
 /// The installed Proton/compat tools as (internal name, display name), for a
-/// chooser. Empty off Linux or without a Steam install.
+/// chooser, including standalone Wine on FreeBSD.
 pub fn proton_builds() -> Vec<(String, String)> {
     // Menus and Settings ask every frame; this reads every app manifest.
     static CACHE: Mutex<Option<(Instant, Vec<(String, String)>)>> = Mutex::new(None);
     let mut cache = CACHE.lock().unwrap();
     if cache.as_ref().is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(5)) {
-        let builds = match local::find_steam_root() {
+        let builds = match local::compat::tool_root() {
             Some(root) => local::compat::compat_tools(&root).into_iter().map(|t| (t.name, t.display)).collect(),
             None => Vec::new(),
         };
@@ -2488,10 +2519,53 @@ pub(crate) fn prefix_setup(app: &OwnedApp, install_dir: &Path) -> Option<Command
         return None;
     }
     let mut cmd = in_prefix(app, install_dir, "cmd", &["/c".into(), "exit".into()])?;
+    #[cfg(target_os = "freebsd")]
+    if cmd.get_envs().any(|(key, _)| key == "WINEPREFIX") {
+        return Some(cmd);
+    }
     // Our DLLs, copied into the prefix as on a real launch.
     let root = local::find_steam_root()?;
     cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", linux::client_shim(&root).ok()?);
     Some(cmd)
+}
+
+/// Register the signed-in account and bundled clients with Wine itself so
+/// registry updates also reach an already running wineserver for this prefix.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn setup_wine_client(wine: &Path, prefix: &Path, account_id: u32, dlls: [Option<PathBuf>; 2]) -> Result<(), String> {
+    use std::io::Write;
+    let steam = prefix.join("drive_c/Program Files (x86)/Steam");
+    let mut registry = format!(
+        "REGEDIT4\r\n\r\n[HKEY_CURRENT_USER\\{}]\r\n\"pid\"=dword:{:08x}\r\n\"ActiveUser\"=dword:{account_id:08x}\r\n",
+        ACTIVE, std::process::id()
+    );
+    std::fs::create_dir_all(prefix).map_err(|e| format!("create Wine prefix: {e}"))?;
+    let mut clients = Vec::new();
+    for (src, (key, file)) in dlls.into_iter().zip([("SteamClientDll64", "steamclient64.dll"), ("SteamClientDll", "steamclient.dll")]) {
+        if let Some(src) = src {
+            registry += &format!("\"{key}\"=\"C:\\\\Program Files (x86)\\\\Steam\\\\{file}\"\r\n");
+            clients.push((src, file));
+        } else {
+            registry += &format!("\"{key}\"=-\r\n");
+        }
+    }
+    if clients.is_empty() {
+        return Err("Aurora steamclient DLLs are missing".into());
+    }
+    let mut reg = tempfile::Builder::new().suffix(".reg").tempfile_in(prefix).map_err(|e| e.to_string())?;
+    reg.write_all(registry.as_bytes()).map_err(|e| e.to_string())?;
+    // Wine initializes the prefix on first use. Use its default Z: mapping for reg.exe.
+    let mut cmd = Command::new(wine);
+    let filename = format!(r"Z:{}", reg.path().display().to_string().replace('/', r"\"));
+    cmd.env("WINEPREFIX", prefix).args(["reg", "import", &filename]);
+    run_quietly(&mut cmd, Duration::from_secs(180)).map_err(|e| format!("Wine registry setup: {e}"))?;
+    std::fs::create_dir_all(&steam).map_err(|e| format!("create Wine Steam directory: {e}"))?;
+    for (src, file) in clients {
+        let mut staged = tempfile::NamedTempFile::new_in(&steam).map_err(|e| e.to_string())?;
+        std::io::copy(&mut std::fs::File::open(src).map_err(|e| e.to_string())?, &mut staged).map_err(|e| e.to_string())?;
+        staged.persist(steam.join(file)).map_err(|e| format!("install {file}: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Run a helper to the end with its output dropped; killed after `limit`.
@@ -2531,6 +2605,12 @@ mod linux {
     use model::{LaunchOption, OwnedApp};
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    const NO_COMPAT_TOOL: &str = if cfg!(target_os = "freebsd") {
+        "No Wine or Proton tool found. Install wine-proton, wine, or wine-devel."
+    } else {
+        "No Proton is installed. Install one in Steam (Library → Tools → Proton)."
+    };
 
     /// How a game starts here: its executable, and the Proton to run it
     /// with when it's a Windows program.
@@ -2586,7 +2666,7 @@ mod linux {
     }
 
     pub fn plan(app: &OwnedApp, install_dir: &Path) -> Result<Plan, String> {
-        let root = local::find_steam_root();
+        let root = local::compat::tool_root();
         // The choice for this game here: the Linux build, Proton, or one
         // Proton build (if that tool is still installed).
         let choice = super::app_proton(app.app_id);
@@ -2612,7 +2692,7 @@ mod linux {
         let tool = own
             .or_else(|| super::proton_override().and_then(|name| compat::compat_tools(&root).into_iter().find(|t| t.name.eq_ignore_ascii_case(&name))))
             .or_else(|| compat::tool_for(&root, app.app_id))
-            .ok_or("No Proton is installed. Install one in Steam (Library → Tools → Proton).")?;
+            .ok_or(NO_COMPAT_TOOL)?;
         if !install_dir.join(normalize(&windows.executable)).exists() {
             return Err(format!("{} isn't installed completely", app.name));
         }
@@ -2633,18 +2713,18 @@ mod linux {
     pub fn non_steam(exe: &Path, args: &[String]) -> Result<Command, String> {
         use std::os::unix::process::CommandExt;
         let mut cmd = if is_windows_program(exe) {
-            let root = local::find_steam_root().ok_or("Windows games need a Steam install for Proton")?;
+            let root = local::compat::tool_root().ok_or("Windows games need a Steam install for Proton")?;
             // Steam's way of numbering shortcuts: a stable id from the path, top bit set.
             let id = exe.to_string_lossy().bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193)) | 0x8000_0000;
             let tool = super::proton_override()
                 .and_then(|name| compat::compat_tools(&root).into_iter().find(|t| t.name.eq_ignore_ascii_case(&name)))
                 .or_else(|| compat::tool_for(&root, id))
-                .ok_or("No Proton is installed. Install one in Steam (Library → Tools → Proton).")?;
+                .ok_or(NO_COMPAT_TOOL)?;
             let data = directories::ProjectDirs::from("dev", "SteamInRust", "SteamInRust").ok_or("no data folder")?.data_dir().join("compatdata").join(id.to_string());
             std::fs::create_dir_all(&data).map_err(|e| format!("couldn't create the Proton prefix: {e}"))?;
             tracing::info!("launching non-Steam game {} with {}", exe.display(), tool.display);
-            let mut c = proton_base(&tool, &root);
-            c.arg("waitforexitandrun").arg(exe).args(args);
+            let mut c = compat_command(&tool, &root, &data);
+            c.arg(exe).args(args);
             c.env("STEAM_COMPAT_DATA_PATH", &data)
                 .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &root)
                 .env("STEAM_COMPAT_INSTALL_PATH", exe.parent().unwrap_or(exe))
@@ -2674,9 +2754,40 @@ mod linux {
         }
     }
 
+    fn compat_command(tool: &CompatTool, root: &Path, data: &Path) -> Command {
+        if let Some(bin) = &tool.wine_bin {
+            let mut cmd = Command::new(bin);
+            cmd.env("WINEPREFIX", data.join("pfx"));
+            return cmd;
+        }
+        let mut cmd = proton_base(tool, root);
+        cmd.arg("waitforexitandrun");
+        cmd
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn direct_wine_uses_the_game_prefix_and_no_proton_verb() {
+        let tool = CompatTool {
+            name: "wine-proton".into(),
+            display: "Wine Proton".into(),
+            dir: "/usr/local/wine-proton/bin".into(),
+            wine_bin: Some("/usr/local/wine-proton/bin/wine".into()),
+            runtime_app: Some(123),
+        };
+        let mut cmd = compat_command(&tool, Path::new("/missing"), Path::new("/games/compatdata/42"));
+        cmd.args(["game.exe", "two words"]);
+        assert_eq!(cmd.get_program(), tool.wine_bin.as_ref().unwrap().as_os_str());
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["game.exe", "two words"]);
+        assert_eq!(cmd.get_envs().find(|(k, _)| *k == "WINEPREFIX").unwrap().1, Some(std::ffi::OsStr::new("/games/compatdata/42/pfx")));
+    }
+
     /// `proton`, inside the Steam Linux Runtime container when the tool
     /// asks for one (how Steam runs it); the verb and program come after.
     fn proton_base(tool: &CompatTool, root: &Path) -> Command {
+        #[cfg(target_os = "freebsd")]
+        let runtime: Option<PathBuf> = { let _ = root; None };
+        #[cfg(not(target_os = "freebsd"))]
         let runtime = tool.runtime_app.and_then(|rt| compat::app_dir(root, rt)).map(|d| d.join("_v2-entry-point")).filter(|p| p.is_file());
         match runtime {
             Some(entry) => {
@@ -2755,6 +2866,11 @@ mod linux {
     }
 
     impl Plan {
+        #[cfg(target_os = "freebsd")]
+        pub fn uses_native_wine(&self) -> bool {
+            self.tool.as_ref().is_some_and(|tool| tool.wine_bin.is_some())
+        }
+
         pub fn uses_proton(&self) -> bool {
             self.tool.is_some()
         }
@@ -2767,8 +2883,8 @@ mod linux {
             let root = self.steam_root.clone().unwrap_or_default();
             let data = compat::compat_data(install_dir, app.app_id).unwrap_or_else(|| install_dir.join("compatdata"));
             let _ = std::fs::create_dir_all(&data);
-            let mut cmd = proton_base(tool, &root);
-            cmd.arg("waitforexitandrun").arg(program).args(args);
+            let mut cmd = compat_command(tool, &root, &data);
+            cmd.arg(program).args(args);
             let library = install_dir.parent().and_then(Path::parent).map(Path::to_path_buf).unwrap_or_default();
             cmd.env("STEAM_COMPAT_DATA_PATH", &data)
                 .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &root)
@@ -2823,8 +2939,8 @@ mod linux {
             let root = self.steam_root.clone().unwrap_or_default();
             let data = compat::compat_data(install_dir, app.app_id).unwrap_or_else(|| install_dir.join("compatdata"));
             let _ = std::fs::create_dir_all(&data);
-            let mut cmd = proton_base(tool, &root);
-            cmd.arg("waitforexitandrun").arg(exe).args(split_args(&self.option.arguments));
+            let mut cmd = compat_command(tool, &root, &data);
+            cmd.arg(exe).args(split_args(&self.option.arguments));
             let library = install_dir.parent().and_then(Path::parent).map(Path::to_path_buf).unwrap_or_default();
             cmd.env("STEAM_COMPAT_DATA_PATH", &data)
                 .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &root)
@@ -3119,22 +3235,66 @@ mod win {
     pub fn delete_value(_: &str, _: &str) -> Result<(), String> {
         Ok(())
     }
+    #[cfg(not(target_os = "freebsd"))]
     pub fn is_alive(pid: u32) -> bool {
         pid != 0 && Path::new(&format!("/proc/{pid}")).exists()
     }
+    #[cfg(not(target_os = "freebsd"))]
     pub fn is_steam_process(pid: u32) -> bool {
         is_alive(pid) && std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "steam")
     }
+    #[cfg(target_os = "freebsd")]
+    pub fn is_alive(pid: u32) -> bool {
+        let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+        pid > 0 && (unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+    }
+
+    #[cfg(target_os = "freebsd")]
+    pub(super) fn ps(args: &[&str]) -> String {
+        std::process::Command::new("/bin/ps").args(args).output().ok().filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned()).unwrap_or_default()
+    }
+
+    #[cfg(target_os = "freebsd")]
+    pub fn is_steam_process(pid: u32) -> bool {
+        is_alive(pid) && Path::new(ps(&["-p", &pid.to_string(), "-o", "comm="]).trim()).file_name().is_some_and(|name| name == "steam")
+    }
+
+    #[cfg(target_os = "freebsd")]
+    pub fn steam_launch_running(app_id: AppId) -> bool {
+        let id = format!("AppId={app_id}");
+        ps(&["-axww", "-o", "args="]).lines().any(|line| {
+            let mut words = line.split_whitespace().take_while(|word| *word != "--");
+            words.any(|w| w == "SteamLaunch") && words.any(|w| w == id)
+        })
+    }
+
+    #[cfg(target_os = "freebsd")]
+    pub fn processes_in(dir: &Path) -> Vec<u32> {
+        let Ok(output) = std::process::Command::new("/usr/bin/procstat").args(["--libxo", "json", "-a", "files"]).output() else { return Vec::new() };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else { return Vec::new() };
+        let Some(entries) = value.pointer("/procstat/files").and_then(|v| v.as_object()) else { return Vec::new() };
+        entries.iter().filter_map(|(pid, entry)| {
+            let pid: u32 = pid.parse().ok()?;
+            let inside = entry["files"].as_array()?.iter().any(|file| {
+                matches!(file["fd"].as_str(), Some("cwd" | "text")) && file["path"].as_str().is_some_and(|path| Path::new(path).starts_with(dir))
+            });
+            (inside && pid != std::process::id()).then_some(pid)
+        }).collect()
+    }
+
     /// The pid the running client wrote to `~/.steam/steam.pid`.
     pub fn steam_pid_file() -> Option<u32> {
         std::fs::read_to_string(dot_steam()?.join("steam.pid")).ok()?.trim().parse().ok()
     }
 
+    #[cfg(not(target_os = "freebsd"))]
     fn pids() -> impl Iterator<Item = u32> {
         std::fs::read_dir("/proc").into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok())
     }
 
     /// Steam starts every game as `reaper SteamLaunch AppId=<id> -- ...`.
+    #[cfg(not(target_os = "freebsd"))]
     pub fn steam_launch_running(app_id: AppId) -> bool {
         let want = format!("AppId={app_id}");
         pids().any(|pid| {
@@ -3150,6 +3310,7 @@ mod win {
     }
 
     /// Processes whose program or working folder is inside `dir`.
+    #[cfg(not(target_os = "freebsd"))]
     pub fn processes_in(dir: &Path) -> Vec<u32> {
         let me = std::process::id();
         pids()
@@ -3162,6 +3323,27 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires Wine"]
+    fn wine_imports_aurora_registry_and_installs_both_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("prefix with spaces");
+        let dll = dir.path().join("fixture.dll");
+        std::fs::write(&dll, b"test dll").unwrap();
+        setup_wine_client(Path::new("wine"), &prefix, 4242, [Some(dll.clone()), Some(dll)]).unwrap();
+        for (view, key, file) in [("64", "SteamClientDll64", "steamclient64.dll"), ("32", "SteamClientDll", "steamclient.dll")] {
+            let query = Command::new("wine").env("WINEPREFIX", &prefix)
+                .args(["reg", "query", &format!(r"HKCU\{ACTIVE}"), &format!("/reg:{view}")]).output().unwrap();
+            assert!(query.status.success());
+            let output = String::from_utf8_lossy(&query.stdout);
+            assert!(output.contains(key) && output.contains(&format!(r"C:\Program Files (x86)\Steam\{file}")), "{output}");
+            assert!(output.contains("0x1092"), "{output}");
+            assert!(output.lines().any(|line| line.trim_start().starts_with("pid") && line.ends_with(&format!("0x{:x}", std::process::id()))), "{output}");
+            assert_eq!(std::fs::read(prefix.join("drive_c/Program Files (x86)/Steam").join(file)).unwrap(), b"test dll");
+        }
+    }
 
     #[cfg(not(windows))]
     #[test]
@@ -3725,7 +3907,7 @@ mod tests {
         ] {
             let args = LaunchArgs { user: "-novid".into(), connect: payload.clone(), controller: 0 };
             assert!(spawn(&test_app, &dir, &args, None).is_err(), "spawn must fail closed for {payload}");
-            assert!(spawn_with_steamclient(&test_app, &dir, &args, "127.0.0.1:1:tok", "acct", None, None).is_err());
+            assert!(spawn_with_steamclient(&test_app, &dir, &args, "127.0.0.1:1:tok", "acct", 1, None, None).is_err());
             assert!(run_through_steam(480, &args, 1, false, || {}).unwrap_err().contains("refusing launch"));
             assert!(run_through_host(&test_app, &dir, &args, "acct", "tok", 1, None, || {}).unwrap_err().contains("refusing launch"));
             assert!(!pwned.exists(), "evil wrapper executed!");

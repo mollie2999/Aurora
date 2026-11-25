@@ -1526,7 +1526,7 @@ mod platform {
                             ry: ry_f,
                             lt: lt_f,
                             rt: rt_f,
-                            touchpads: [TouchpadFinger::default(); 2],
+                            touchpads: Default::default(),
                         });
                         let id = format!("xinput-{i}");
                         if rumble_target.as_deref() == Some(id.as_str()) && cal.rumble_enabled

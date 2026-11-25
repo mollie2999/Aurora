@@ -40,8 +40,8 @@ struct Step {
 enum Kind {
     /// A `.reg` file's text (REGEDIT4).
     Registry(String),
-    /// A program (real path) and its arguments.
-    Run(PathBuf, String),
+    /// One or more programs (real path, args) in a single `Run Process` group.
+    Run(Vec<(PathBuf, String)>),
 }
 
 /// Steps still to do before `app` starts, or `None`.
@@ -78,7 +78,16 @@ pub fn run(p: Pending, mut progress: impl FnMut(&str)) {
         progress(&step.label);
         let ok = match &step.kind {
             Kind::Registry(text) => import(&p.app, &p.install_dir, text),
-            Kind::Run(exe, args) => run_process(&p.app, &p.install_dir, exe, args),
+            Kind::Run(procs) => {
+                let mut res = Ok(());
+                for (exe, args) in procs {
+                    if let Err(e) = run_process(&p.app, &p.install_dir, exe, args) {
+                        res = Err(e);
+                        break;
+                    }
+                }
+                res
+            }
         };
         match ok {
             Ok(()) => {
@@ -90,15 +99,43 @@ pub fn run(p: Pending, mut progress: impl FnMut(&str)) {
     }
 }
 
+/// Resolve a relative path strictly inside `install_dir` (no `..`, no absolute
+/// paths, no symlink escape).
+fn resolve_inside_install_dir(install_dir: &Path, rel: &str) -> Option<PathBuf> {
+    if rel.is_empty() || rel.contains('\0') || rel.contains(':') || rel.starts_with('/') || rel.starts_with('\\') {
+        return None;
+    }
+    let canon_root = std::fs::canonicalize(install_dir).ok()?;
+    let mut cur = canon_root.clone();
+    let mut pushed = false;
+    for seg in rel.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return None;
+        }
+        cur.push(seg);
+        let meta = std::fs::symlink_metadata(&cur).ok()?;
+        if meta.file_type().is_symlink() {
+            return None;
+        }
+        pushed = true;
+    }
+    if !pushed {
+        return None;
+    }
+    let canon = std::fs::canonicalize(&cur).ok()?;
+    (canon.starts_with(&canon_root) && canon != canon_root && canon.is_file()).then_some(canon)
+}
+
 /// The game's scripts: the one its app info names, and any other
 /// `installscript` files near the top of its folder (most games only flag
 /// theirs in the depot manifest).
 fn find(app: &OwnedApp, install_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(rel) = &app.install_script {
-        let p = install_dir.join(rel.replace('\\', "/"));
-        if p.is_file() {
+        if let Some(p) = resolve_inside_install_dir(install_dir, rel) {
             out.push(p);
+        } else {
+            tracing::warn!("ignoring unsafe install_script path {:?} for app {}", rel, app.app_id);
         }
     }
     walk(install_dir, 0, &mut out);
@@ -160,15 +197,22 @@ fn plan(root: &vdf::Obj, script: &Path, install_dir: &Path, scope: &str, app: &O
         if done.contains(&key) || (!has_run.is_empty() && has_run_value(app, install_dir, has_run, name).is_some_and(|v| v >= minimum)) {
             continue;
         }
+        let mut procs = Vec::new();
         for n in 1.. {
             let Some(process) = o.str(&format!("process {n}")) else { break };
-            let exe = vars.real_path(&vars.expand(process));
+            let Some(exe) = vars.real_path(&vars.expand(process)) else {
+                tracing::warn!("install script step {name}: refusing unsafe process path {:?}", process);
+                continue;
+            };
             let args = vars.expand(o.str(&format!("command {n}")).unwrap_or_default());
             if !exe.is_file() {
                 tracing::debug!("install script step {name}: {} isn't there", exe.display());
                 continue;
             }
-            steps.push(Step { label: name.to_string(), key: key.clone(), kind: Kind::Run(exe, args) });
+            procs.push((exe, args));
+        }
+        if !procs.is_empty() {
+            steps.push(Step { label: name.to_string(), key, kind: Kind::Run(procs) });
         }
     }
     steps
@@ -208,17 +252,46 @@ impl Vars {
         out
     }
 
-    /// The real file for an expanded Windows path in the install folder.
-    fn real_path(&self, win: &str) -> PathBuf {
+    /// The real file for an expanded Windows path strictly inside the install folder.
+    fn real_path(&self, win: &str) -> Option<PathBuf> {
         let install = Self::win_path(&self.install_dir);
-        match win.get(..install.len()).filter(|p| p.eq_ignore_ascii_case(&install)) {
-            Some(_) => {
-                let rest = win[install.len()..].trim_start_matches('\\');
-                rest.split('\\').filter(|c| !c.is_empty()).fold(self.install_dir.clone(), |p, c| p.join(c))
-            }
-            None => PathBuf::from(win),
+        let prefix = win.get(..install.len())?;
+        if !prefix.eq_ignore_ascii_case(&install) {
+            return None;
         }
+        let rest = &win[install.len()..];
+        if !rest.is_empty() && !rest.starts_with(['\\', '/']) {
+            return None;
+        }
+        let rel = rest.trim_start_matches(['\\', '/']);
+        resolve_inside_install_dir(&self.install_dir, rel)
     }
+}
+
+fn is_safe_reg_key(key: &str) -> bool {
+    if key.is_empty()
+        || key.contains(['\r', '\n', '\0', '[', ']'])
+        || key.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let norm = key.replace('/', "\\");
+    let lower = norm.to_ascii_lowercase();
+    let Some(rest) = lower
+        .strip_prefix("hkey_local_machine\\software\\")
+        .or_else(|| lower.strip_prefix("hkey_current_user\\software\\"))
+    else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.starts_with("microsoft\\windows\\currentversion\\run")
+        && !rest.starts_with("microsoft\\windows nt\\currentversion\\image file execution options")
+        && !rest.starts_with("wow6432node\\microsoft\\windows\\currentversion\\run")
+        && !rest.starts_with("wow6432node\\microsoft\\windows nt\\currentversion\\image file execution options")
+}
+
+fn has_reg_control(s: &str) -> bool {
+    s.contains(['\r', '\n', '\0']) || s.chars().any(char::is_control)
 }
 
 fn replace_ci(s: &str, var: &str, value: &str) -> String {
@@ -240,6 +313,10 @@ fn replace_ci(s: &str, var: &str, value: &str) -> String {
 fn reg_file(reg: &vdf::Obj, vars: &Vars) -> String {
     let mut out = String::from("REGEDIT4\r\n\r\n");
     for (key, v) in reg.iter() {
+        if !is_safe_reg_key(key) {
+            tracing::warn!("install script: skipping disallowed registry key {:?}", key);
+            continue;
+        }
         let Some(o) = v.as_obj() else { continue };
         let mut lines = Vec::new();
         for src in [Some(o), o.obj("english")].into_iter().flatten() {
@@ -247,9 +324,16 @@ fn reg_file(reg: &vdf::Obj, vars: &Vars) -> String {
                 let Some(values) = values.as_obj() else { continue };
                 for (name, value) in values.iter() {
                     let Some(value) = value.as_str() else { continue };
+                    if has_reg_control(name) {
+                        continue;
+                    }
                     let name = if name.is_empty() { "@".to_string() } else { format!("\"{}\"", esc(name)) };
                     if kind.eq_ignore_ascii_case("string") {
-                        lines.push(format!("{name}=\"{}\"", esc(&vars.expand(value))));
+                        let expanded = vars.expand(value);
+                        if has_reg_control(&expanded) {
+                            continue;
+                        }
+                        lines.push(format!("{name}=\"{}\"", esc(&expanded)));
                     } else if kind.eq_ignore_ascii_case("dword") {
                         let n: i64 = value.trim().parse().unwrap_or(0);
                         lines.push(format!("{name}=dword:{:08x}", n as u32));
@@ -273,7 +357,10 @@ fn has_run_value(app: &OwnedApp, install_dir: &Path, key: &str, name: &str) -> O
     #[cfg(windows)]
     {
         let _ = (app, install_dir);
-        let out = quiet(Command::new("reg").args(["query", key, "/v", name, "/reg:32"])).output().ok()?;
+        let out = quiet(Command::new("reg").args(["query", key, "/v", name, "/reg:32"]))
+            .stdout(std::process::Stdio::piped())
+            .output()
+            .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         let hex = text.lines().find(|l| l.contains("REG_DWORD"))?.split_whitespace().last()?;
         return u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok();
@@ -335,6 +422,11 @@ fn import(app: &OwnedApp, install_dir: &Path, text: &str) -> Result<(), String> 
     result
 }
 
+fn installer_exit_ok(code: Option<i32>) -> bool {
+    // 0 = success, 3010 = ERROR_SUCCESS_REBOOT_REQUIRED (common for VC++/DX redists).
+    matches!(code, Some(0 | 3010))
+}
+
 /// Run one program and wait for it (an admin prompt on Windows when it asks
 /// for one, like most redistributable installers).
 fn run_process(app: &OwnedApp, install_dir: &Path, exe: &Path, args: &str) -> Result<(), String> {
@@ -346,7 +438,11 @@ fn run_process(app: &OwnedApp, install_dir: &Path, exe: &Path, args: &str) -> Re
         match quiet(Command::new(exe).args(&split).current_dir(&dir)).status() {
             Ok(s) => {
                 tracing::info!("{} exited with {s}", exe.display());
-                Ok(())
+                if installer_exit_ok(s.code()) {
+                    Ok(())
+                } else {
+                    Err(format!("{} exited with {s}", exe.display()))
+                }
             }
             // ERROR_ELEVATION_REQUIRED
             Err(e) if e.raw_os_error() == Some(740) => elevated::run_wait(exe, args, &dir),
@@ -367,7 +463,11 @@ fn run_process(app: &OwnedApp, install_dir: &Path, exe: &Path, args: &str) -> Re
         cmd.current_dir(&dir);
         let status = quiet(&mut cmd).status().map_err(|e| e.to_string())?;
         tracing::info!("{} exited with {status}", exe.display());
-        Ok(())
+        if installer_exit_ok(status.code()) {
+            Ok(())
+        } else {
+            Err(format!("{} exited with {status}", exe.display()))
+        }
     }
 }
 
@@ -399,7 +499,7 @@ fn quiet(cmd: &mut Command) -> &mut Command {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
 }
 
 fn data_dir() -> PathBuf {
@@ -456,6 +556,7 @@ mod elevated {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn WaitForSingleObject(handle: isize, ms: u32) -> u32;
+        fn GetExitCodeProcess(handle: isize, code: *mut u32) -> i32;
         fn CloseHandle(handle: isize) -> i32;
         fn GetLastError() -> u32;
     }
@@ -491,12 +592,18 @@ mod elevated {
             // 1223: the player said no to the admin prompt.
             return Err(format!("couldn't start {} with admin rights (error {})", exe.display(), unsafe { GetLastError() }));
         }
+        let mut exit_code: u32 = 0;
+        let mut got_code = false;
         if info.process != 0 {
             // SAFETY: a process handle we own (SEE_MASK_NOCLOSEPROCESS).
             unsafe {
                 WaitForSingleObject(info.process, u32::MAX);
+                got_code = GetExitCodeProcess(info.process, &mut exit_code) != 0;
                 CloseHandle(info.process);
             }
+        }
+        if got_code && !super::installer_exit_ok(Some(exit_code as i32)) {
+            return Err(format!("{} exited with code {exit_code}", exe.display()));
         }
         Ok(())
     }
@@ -508,11 +615,32 @@ mod tests {
 
     #[test]
     fn expands_and_maps_install_dir() {
-        let dir = if cfg!(windows) { PathBuf::from("C:\\Games\\Outlast") } else { PathBuf::from("/games/Outlast") };
+        let dir = std::env::temp_dir().join(format!("aurora-inst-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let eac = dir.join("EasyAntiCheat").join("EasyAntiCheat_EOS_Setup.exe");
+        std::fs::create_dir_all(eac.parent().unwrap()).unwrap();
+        std::fs::write(&eac, b"ok").unwrap();
         let v = Vars::new(&dir);
         let win = v.expand("%INSTALLDIR%\\EasyAntiCheat\\EasyAntiCheat_EOS_Setup.exe");
-        assert_eq!(v.real_path(&win), dir.join("EasyAntiCheat").join("EasyAntiCheat_EOS_Setup.exe"));
+        assert_eq!(v.real_path(&win), Some(std::fs::canonicalize(&eac).unwrap()));
         assert_eq!(v.expand("%installdir%"), Vars::win_path(&dir));
+        // Reject traversal and arbitrary external executables.
+        assert_eq!(v.real_path(&v.expand("%INSTALLDIR%\\..\\escape.exe")), None);
+        assert_eq!(v.real_path("C:\\Windows\\System32\\cmd.exe"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reg_file_rejects_disallowed_keys_and_newline_injection() {
+        let kv = vdf::parse(
+            r#""installscript" { "Registry" { "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" { "string" { "Evil" "calc.exe" } } "HKEY_LOCAL_MACHINE\\Software\\Game" { "string" { "Good" "ok" } } } }"#,
+        )
+        .unwrap();
+        let v = Vars::new(Path::new("/g"));
+        let text = reg_file(kv.path(&["installscript", "registry"]).unwrap(), &v);
+        assert!(!text.contains("CurrentVersion\\Run"));
+        assert!(text.contains("[HKEY_LOCAL_MACHINE\\Software\\Game]"));
+        assert!(!is_safe_reg_key("HKEY_LOCAL_MACHINE\\Software\\Game]\r\n[HKEY_LOCAL_MACHINE\\Bad"));
     }
 
     #[test]

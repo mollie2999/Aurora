@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Aurora
+GenericName=Steam client
+Comment=Unofficial Steam client written in Rust
+Exec=aurora
+Icon=io.github.mollie2999.Aurora
+Terminal=false
+Categories=Game;
+StartupWMClass=SteamInRust

@@ -1,6 +1,6 @@
 name: Website
 
-# Publishes site/ to GitHub Pages (https://mollie2999.github.io/Aurora/).
+# Publishes site/ to GitHub Pages (https://auroraclient.eu/).
 # The repository's Pages source must be set to "GitHub Actions".
 on:
   push:

@@ -171,7 +171,7 @@ impl Conn {
             remote_trusted: false,
             session: None,
             peer_protocol: 0,
-            snp: Snp::new(),
+            snp: Snp::for_peer(peer),
             reliable_out: Vec::new(),
             next_reliable: 0,
             last_reliable_in: 0,
@@ -364,7 +364,7 @@ impl Conn {
             return Err((END_REMOTE_BAD_CRYPT, "server must select exactly only one cipher".into()));
         }
         let cipher = if server { CIPHER_AES_GCM } else { info.ciphers[0] };
-        if cipher != CIPHER_AES_GCM && cipher != crypto::CIPHER_NULL {
+        if cipher != CIPHER_AES_GCM {
             return Err((END_REMOTE_BAD_CRYPT, format!("unknown cipher {cipher}")));
         }
         let local = self.crypt.take().ok_or((END_MISC_INTERNAL, "no local crypt".to_string()))?;
@@ -460,7 +460,7 @@ impl Conn {
             _ => {}
         }
         for a in &m.application_messages {
-            self.snp.inbox.push_back(snp::Msg { data: a.data().to_vec(), num: a.msg_num() as i64, reliable: false, lane: 0 });
+            self.snp.enqueue(snp::Msg { data: a.data().to_vec(), num: a.msg_num() as i64, reliable: false, lane: 0 });
         }
     }
 
@@ -494,7 +494,11 @@ impl Conn {
             match lead {
                 MSG_CONNECTION_CLOSED => {
                     let len = d.get(1..3).map(|l| u16::from_le_bytes([l[0], l[1]]) as usize).unwrap_or(0);
-                    if let Some(m) = d.get(3..3 + len).and_then(decode::<UdpConnectionClosed>) {
+                    if let Some(m) = d.get(3..3 + len).and_then(decode::<UdpConnectionClosed>)
+                        && self.ice.selected == Some(from)
+                        && m.from_connection_id == Some(self.remote_id)
+                        && m.to_connection_id == Some(self.local_id)
+                    {
                         self.closed_by_peer(m.reason_code(), m.debug(), now);
                         let nc = UdpNoConnection { from_connection_id: Some(self.local_id), to_connection_id: Some(self.remote_id) };
                         let mut pkt = vec![MSG_NO_CONNECTION];
@@ -502,7 +506,14 @@ impl Conn {
                         io.udp(from, &pkt);
                     }
                 }
-                MSG_NO_CONNECTION => self.closed_by_peer(END_PEER_SENT_NO_CONNECTION, "peer has no such connection", now),
+                MSG_NO_CONNECTION if self.ice.selected == Some(from) => {
+                    if let Some(m) = decode::<UdpNoConnection>(&d[1..])
+                        && m.from_connection_id == Some(self.remote_id)
+                        && m.to_connection_id == Some(self.local_id)
+                    {
+                        self.closed_by_peer(END_PEER_SENT_NO_CONNECTION, "peer has no such connection", now);
+                    }
+                }
                 _ => {}
             }
             return;

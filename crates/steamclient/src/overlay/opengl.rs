@@ -14,7 +14,7 @@ use crate::overlay::wire::VERTEX_SIZE;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::Win32::Foundation::{HMODULE, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{HDC, WindowFromDC};
@@ -35,7 +35,14 @@ thread_local! {
     static IN_SWAP: Cell<bool> = const { Cell::new(false) };
 }
 
-static RENDERER: Mutex<Option<GlRenderer>> = Mutex::new(None);
+#[derive(Default)]
+struct Renderers {
+    contexts: HashMap<usize, GlRenderer>,
+    textures: HashMap<u64, super::wire::TexSet>,
+}
+
+static RENDERERS: LazyLock<Mutex<Renderers>> = LazyLock::new(Mutex::default);
+static REAL_DELETE_CTX: AtomicUsize = AtomicUsize::new(0);
 
 /// Patch `wglSwapBuffers` / `SwapBuffers` IAT slots across all loaded game
 /// modules once `opengl32.dll` is loaded. Safe to call repeatedly as new
@@ -67,6 +74,10 @@ pub fn install_if_loaded() -> bool {
                 table.push((REAL_GDI_SWAP.load(Ordering::Acquire), hook_gdi_swap_buffers as *const () as usize));
             }
         }
+        if let Some(p) = GetProcAddress(opengl32, s!("wglDeleteContext")) {
+            REAL_DELETE_CTX.store(p as usize, Ordering::Release);
+            table.push((p as usize, hook_delete_context as *const () as usize));
+        }
         let patched = util::patch_all_modules(&table, &skip);
         if patched > 0 {
             crate::log!("overlay: OpenGL hooks in ({patched} IAT slots)");
@@ -85,6 +96,17 @@ unsafe extern "system" fn hook_gdi_swap_buffers(hdc: *mut c_void) -> BOOL {
     on_swap(hdc);
     let real: SwapBuffersFn = unsafe { std::mem::transmute(REAL_GDI_SWAP.load(Ordering::Acquire)) };
     unsafe { real(hdc) }
+}
+
+unsafe extern "system" fn hook_delete_context(ctx: *mut c_void) -> BOOL {
+    let real: unsafe extern "system" fn(*mut c_void) -> BOOL = unsafe { std::mem::transmute(REAL_DELETE_CTX.load(Ordering::Acquire)) };
+    let mut cache = RENDERERS.lock().unwrap_or_else(|e| e.into_inner());
+    if ctx == unsafe { current_gl_context() } {
+        cache.contexts.remove(&(ctx as usize));
+    }
+    let deleted = unsafe { real(ctx) };
+    if deleted.as_bool() { cache.contexts.remove(&(ctx as usize)); }
+    deleted
 }
 
 fn on_swap(hdc: *mut c_void) {
@@ -126,44 +148,50 @@ unsafe fn swap_inner(hdc: *mut c_void) {
         return;
     }
 
-    let Ok(mut guard) = RENDERER.lock() else { return };
-    if let Some(r) = guard.as_ref() {
-        if r.hglrc != ctx as usize {
-            crate::log!("overlay: OpenGL context changed, rebuilding resources");
-            *guard = None;
-        }
-    }
-
-    if guard.is_none() {
-        match unsafe { GlRenderer::new(ctx as usize, hwnd, size) } {
-            Ok(r) => {
-                if !util::claim_backend(Backend::OpenGl) {
-                    return;
-                }
-                crate::log!("overlay: drawing into the game's OpenGL context ({}x{})", size.0, size.1);
-                super::input::attach(hwnd);
-                super::hooked(size);
-                *guard = Some(r);
-            }
-            Err(e) => {
-                crate::log!("overlay: OpenGL init failed: {e}");
-                return;
-            }
-        }
-    }
-
-    let r = guard.as_mut().expect("just set");
-    if size != r.size {
-        r.size = size;
-        super::resized(size);
-    }
-    if hwnd != r.hwnd {
-        r.hwnd = hwnd;
-        super::input::attach(hwnd);
-    }
-
+    let Ok(mut cache) = RENDERERS.lock() else { return };
+    if !util::claim_backend(Backend::OpenGl) { return; }
+    super::input::attach(hwnd);
+    if !shared::with(|s| s.hooked) { super::hooked(size); }
+    if shared::with(|s| s.size != size) { super::resized(size); }
     let (ops, frame) = shared::take_for_present();
+    let key = ctx as usize;
+    let Renderers { contexts, textures } = &mut *cache;
     for op in ops {
+        let id = match &op { TexOp::Set(t) => t.id, TexOp::Free(id) => *id };
+        for (&context, r) in contexts.iter_mut() {
+            if context != key { r.dirty.insert(id); }
+        }
+        match &op {
+            TexOp::Free(id) => { textures.remove(id); }
+            TexOp::Set(t) if util::validate_tex_rgba(t.size, t.rgba.len()).is_some() => {
+                if let Some([x,y]) = t.pos {
+                    if let Some(full) = textures.get_mut(&id)
+                        && util::validate_tex_subrect([x,y], t.size, full.size) {
+                        full.linear = t.linear;
+                        for (row, bytes) in t.rgba.chunks_exact(t.size[0] as usize * 4).enumerate() {
+                            let offset = ((y as usize + row) * full.size[0] as usize + x as usize) * 4;
+                            full.rgba[offset..offset+bytes.len()].copy_from_slice(bytes);
+                        }
+                    }
+                } else { textures.insert(id, t.clone()); }
+            }
+            _ => {}
+        }
+        if let Some(r) = contexts.get_mut(&key) {
+            if !r.dirty.contains(&id) { unsafe { r.apply(op) }; }
+        }
+    }
+    if frame.as_ref().is_none_or(|f| f.meshes.is_empty()) { return; }
+    if !contexts.contains_key(&key) {
+        if contexts.len() >= 8 { return; }
+        let Ok(mut renderer) = (unsafe { GlRenderer::new(key, hwnd, size) }) else { return };
+        renderer.dirty.extend(textures.keys().copied());
+        contexts.insert(key, renderer);
+    }
+    let r = contexts.get_mut(&key).unwrap();
+    r.size = size;
+    for id in std::mem::take(&mut r.dirty) {
+        let op = textures.get(&id).cloned().map_or(TexOp::Free(id), TexOp::Set);
         unsafe { r.apply(op) };
     }
     if let Some(frame) = frame.filter(|f| !f.meshes.is_empty()) {
@@ -419,6 +447,7 @@ struct GlTex {
 }
 
 struct GlRenderer {
+    dirty: std::collections::HashSet<u64>,
     hglrc: usize,
     hwnd: HWND,
     size: (u32, u32),
@@ -436,6 +465,18 @@ struct GlRenderer {
 }
 
 unsafe impl Send for GlRenderer {}
+
+impl Drop for GlRenderer {
+    fn drop(&mut self) {
+        if unsafe { current_gl_context() } as usize != self.hglrc { return; }
+        unsafe {
+            for tex in self.textures.values() { (self.gl.delete_textures)(1, &tex.id); }
+            (self.gl.delete_buffers)(2, [self.vbo, self.ebo].as_ptr());
+            if let Some(delete) = self.gl.delete_vertex_arrays { delete(1, &self.vao); }
+            (self.gl.delete_program)(self.program);
+        }
+    }
+}
 
 impl GlRenderer {
     unsafe fn compile_shader(gl: &GlFns, kind: c_uint, src: &str) -> Option<c_uint> {
@@ -503,6 +544,7 @@ impl GlRenderer {
             (gl.gen_buffers)(1, &mut vbo);
             (gl.gen_buffers)(1, &mut ebo);
             Ok(Self {
+                dirty: Default::default(),
                 hglrc,
                 hwnd,
                 size,

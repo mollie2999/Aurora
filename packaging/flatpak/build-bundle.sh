@@ -22,6 +22,9 @@ build="$work/build"
 # The platform doubles as the SDK here because the payload is prebuilt.
 flatpak build-init --arch=x86_64 "$build" "$id" "$platform" "$platform" "$branch"
 install -Dm755 "$src/aurora" "$build/files/bin/aurora"
+install -Dm755 "$src/steamhost" "$build/files/bin/steamhost"
+install -Dm755 "$src/libVkLayer_aurora_overlay.so" "$build/files/bin/libVkLayer_aurora_overlay.so"
+install -Dm755 "$src/libaurora_htmlsurface.so" "$build/files/bin/libaurora_htmlsurface.so"
 if [[ -f "$src/libSDL3.so.0" ]]; then
     install -Dm755 "$src/libSDL3.so.0" "$build/files/bin/libSDL3.so.0"
 fi
@@ -47,6 +50,6 @@ if [ "$(printf '%s\n' "1.15.6" "$flatpak_version" | sort -V | head -n 1)" = 1.15
 fi
 flatpak build-finish --command=aurora \
     --share=network --share=ipc "${devices[@]}" \
-    --socket=wayland --socket=x11 --socket=pulseaudio "$build"
+    --socket=wayland --socket=fallback-x11 --socket=pulseaudio "$build"
 flatpak build-export --arch=x86_64 "$work/repo" "$build"
 flatpak build-bundle --arch=x86_64 --runtime-repo="$runtime_repo" "$work/repo" "$2" "$id"

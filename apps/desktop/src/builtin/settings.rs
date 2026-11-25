@@ -98,6 +98,8 @@ pub struct AppFlags {
     pub fps_counter: FpsCorner,
     /// High-contrast green color for the in-game FPS counter.
     pub fps_high_contrast: bool,
+    /// Show the "What's new" news shelf on the library home.
+    pub show_whats_new: bool,
 }
 
 pub type SharedFlags = std::sync::Arc<std::sync::Mutex<AppFlags>>;
@@ -602,7 +604,7 @@ fn appearance(
         Some("Install and manage declarative theme packages (.zip / .aurora-theme)."),
     );
 
-    let (themes_dir, mut hot_reload, last_error, active_id, script_error) = {
+    let (themes_dir, mut hot_reload, last_error, active_id, script_error, missing_bundled) = {
         let st = themes_state.lock().unwrap();
         let script_err = st.manager.resolved.as_ref().and_then(|r| {
             r.script_error
@@ -615,6 +617,7 @@ fn appearance(
             st.last_error.clone(),
             st.manager.active_id.clone(),
             script_err,
+            st.manager.missing_bundled_themes(),
         )
     };
 
@@ -632,6 +635,7 @@ fn appearance(
                         Ok(meta) => {
                             {
                                 let mut st = themes_state.lock().unwrap();
+                                st.manager.note_theme_installed(&meta.id);
                                 st.manager.scan();
                             }
                             ctx.act(Action::ActivateTheme(Some(meta.id.clone())));
@@ -648,6 +652,23 @@ fn appearance(
             if w::button(ui, t, Some(icons::REFRESH), "Reload", w::Kind::Ghost, w::Size::Md).clicked() {
                 ctx.act(Action::ReloadThemes);
                 ctx.toast("Themes reloaded");
+            }
+            if !missing_bundled.is_empty()
+                && w::button(ui, t, Some(icons::DOWNLOAD), "Restore Built-in Themes", w::Kind::Ghost, w::Size::Md).clicked()
+            {
+                let res = {
+                    let mut st = themes_state.lock().unwrap();
+                    st.manager.restore_bundled_themes()
+                };
+                match res {
+                    Ok(restored) => {
+                        ctx.act(Action::ReloadThemes);
+                        if !restored.is_empty() {
+                            ctx.toast(format!("Restored {} built-in theme(s)", restored.len()));
+                        }
+                    }
+                    Err(e) => ctx.toast(format!("Restore failed: {e}")),
+                }
             }
             ui.add_space(6.0);
             if ui.add(toggle(&mut hot_reload)).changed() {
@@ -742,6 +763,9 @@ fn appearance(
                                 if !item.manifest.meta.version.is_empty() {
                                     ui.label(w::text(format!("v{}", item.manifest.meta.version), 11.5, t.text_faint));
                                 }
+                                if themes::is_bundled_theme(id) {
+                                    ui.label(w::text("built-in", 11.5, t.text_faint));
+                                }
                                 if item.has_layout {
                                     ui.label(w::text("layout", 11.5, t.text_faint));
                                 }
@@ -792,7 +816,11 @@ fn appearance(
             if active_id.as_deref() == Some(id.as_str()) {
                 ctx.act(Action::ActivateTheme(None));
             }
-            match themes::uninstall_theme(&themes_dir, &id) {
+            let res = {
+                let mut st = themes_state.lock().unwrap();
+                st.manager.uninstall(&id)
+            };
+            match res {
                 Ok(()) => {
                     ctx.act(Action::ReloadThemes);
                     ctx.toast(format!("Uninstalled theme \"{id}\""));

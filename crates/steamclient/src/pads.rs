@@ -398,6 +398,17 @@ pub struct SteamInputPad {
     pub paddles: u8,
 }
 
+impl SteamInputPad {
+    pub fn input_type(self) -> i32 {
+        match self.family {
+            pads_shm::SLOT_FAMILY_XBOX => 3,
+            pads_shm::SLOT_FAMILY_PLAYSTATION => 5,
+            pads_shm::SLOT_FAMILY_SWITCH_PRO => 8,
+            _ => 4, // Generic gamepad
+        }
+    }
+}
+
 /// The four pads as XInput / games see them.
 pub fn all() -> [Option<Pad>; 4] {
     let mut pads: [Option<Pad>; 4] = std::array::from_fn(|i| XINPUT.as_ref().and_then(|x| real_state(x, i)));

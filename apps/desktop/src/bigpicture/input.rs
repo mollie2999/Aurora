@@ -25,11 +25,15 @@ pub enum Press {
     Rb,
     Lt,
     Rt,
+    L3,
+    R3,
     /// Right-stick vertical scroll tick: positive scrolls down, negative scrolls up.
     Scroll(i8),
     Start,
     Guide,
     QuickAccess,
+    /// Guide + X (or hardware keyboard toggle): show/hide the overlay OSK.
+    ToggleOsk,
 }
 
 /// What the last input came from: hints show buttons or keys to match.
@@ -42,6 +46,8 @@ pub enum Device {
 
 pub enum PadEvent {
     Press(Press),
+    /// Live touchpad contacts (`[left, right]` on dual-pad devices such as Steam Deck).
+    Touchpads([client::TouchpadFinger; 2]),
     /// How many controllers are connected now.
     Connected(usize),
 }
@@ -52,6 +58,8 @@ const BTN_DPAD_DOWN: u16 = 0x0002;
 const BTN_DPAD_LEFT: u16 = 0x0004;
 const BTN_DPAD_RIGHT: u16 = 0x0008;
 const BTN_START: u16 = 0x0010;
+const BTN_LSTICK: u16 = 0x0040;
+const BTN_RSTICK: u16 = 0x0080;
 const BTN_LB: u16 = 0x0100;
 const BTN_RB: u16 = 0x0200;
 const BTN_GUIDE: u16 = 0x0400;
@@ -117,13 +125,15 @@ fn button_press(bit: u16, swap: bool) -> Option<Press> {
         BTN_Y => Press::Y,
         BTN_LB => Press::Lb,
         BTN_RB => Press::Rb,
+        BTN_LSTICK => Press::L3,
+        BTN_RSTICK => Press::R3,
         BTN_START => Press::Start,
         BTN_GUIDE => Press::Guide,
         _ => return None,
     })
 }
 
-const TRACKED_BUTTONS: [u16; 8] = [
+const TRACKED_BUTTONS: [u16; 10] = [
     BTN_GUIDE,
     BTN_A,
     BTN_B,
@@ -131,12 +141,15 @@ const TRACKED_BUTTONS: [u16; 8] = [
     BTN_Y,
     BTN_LB,
     BTN_RB,
+    BTN_LSTICK,
+    BTN_RSTICK,
     BTN_START,
 ];
 
 #[derive(Default)]
 struct HeldDirections {
     prev_buttons: u16,
+    prev_misc: bool,
     dpad: [bool; 4],
     stick: [bool; 4],
     next: [Option<Instant>; 4],
@@ -146,16 +159,18 @@ struct HeldDirections {
     /// Analog trigger latching with hysteresis.
     lt_down: bool,
     rt_down: bool,
-    /// Guide button held: Guide + confirm emits QuickAccess without also emitting Guide or A.
+    /// Guide button held: Guide + A emits QuickAccess, Guide + X emits ToggleOsk.
     guide_down: bool,
     guide_chorded: bool,
 }
 
 const SCROLL_REPEAT: Duration = Duration::from_millis(65);
+const TRIGGER_PRESS_THRESHOLD: f32 = 0.45;
+const TRIGGER_RELEASE_THRESHOLD: f32 = 0.20;
 
 impl HeldDirections {
     fn update_sample(&mut self, sample: &client::LauncherPadSample, out: &mut Vec<Press>) {
-        // Button edges (Guide processed first so Guide+A chording works even in the same frame).
+        // Button edges (Guide processed first so Guide+A / Guide+X chording works in one frame).
         let changed = self.prev_buttons ^ sample.buttons;
         if changed != 0 {
             for bit in TRACKED_BUTTONS {
@@ -168,6 +183,10 @@ impl HeldDirections {
             }
             self.prev_buttons = sample.buttons;
         }
+        if sample.misc && !self.prev_misc {
+            out.push(Press::QuickAccess);
+        }
+        self.prev_misc = sample.misc;
 
         // D-pad.
         self.dpad[0] = sample.buttons & BTN_DPAD_UP != 0;
@@ -195,12 +214,12 @@ impl HeldDirections {
 
         // Analog triggers.
         let was_lt = self.lt_down;
-        self.lt_down = if was_lt { sample.lt > 0.35 } else { sample.lt > 0.65 };
+        self.lt_down = sample.lt > if was_lt { TRIGGER_RELEASE_THRESHOLD } else { TRIGGER_PRESS_THRESHOLD };
         if self.lt_down && !was_lt {
             out.push(Press::Lt);
         }
         let was_rt = self.rt_down;
-        self.rt_down = if was_rt { sample.rt > 0.35 } else { sample.rt > 0.65 };
+        self.rt_down = sample.rt > if was_rt { TRIGGER_RELEASE_THRESHOLD } else { TRIGGER_PRESS_THRESHOLD };
         if self.rt_down && !was_rt {
             out.push(Press::Rt);
         }
@@ -220,11 +239,15 @@ impl HeldDirections {
             return emit_guide.then_some(Press::Guide);
         }
         if self.guide_down {
-            let is_confirm = button_press(bit, swap) == Some(Press::A);
-            if is_confirm {
+            let mapped = button_press(bit, swap);
+            if mapped == Some(Press::A) || mapped == Some(Press::X) {
                 if pressed {
                     self.guide_chorded = true;
-                    return Some(Press::QuickAccess);
+                    return Some(if mapped == Some(Press::A) {
+                        Press::QuickAccess
+                    } else {
+                        Press::ToggleOsk
+                    });
                 }
                 return None;
             }
@@ -296,6 +319,7 @@ fn read_pads(frames: mpsc::Receiver<LauncherPadFrame>, tx: mpsc::Sender<PadEvent
     };
     let mut held = HashMap::<u32, HeldDirections>::new();
     let mut connected: Option<usize> = None;
+    let mut last_touchpads = [client::TouchpadFinger::default(); 2];
     let mut presses = Vec::new();
     loop {
         let wait = next_poll_timeout(&held, Instant::now());
@@ -318,6 +342,18 @@ fn read_pads(frames: mpsc::Receiver<LauncherPadFrame>, tx: mpsc::Sender<PadEvent
                     }
                     for p in presses.drain(..) {
                         if !send(PadEvent::Press(p)) {
+                            return;
+                        }
+                    }
+                    let touchpads = frame
+                        .pads
+                        .iter()
+                        .find(|p| p.touchpads.iter().any(|t| t.down || t.click))
+                        .map(|p| p.touchpads)
+                        .unwrap_or_default();
+                    if touchpads != last_touchpads {
+                        last_touchpads = touchpads;
+                        if !send(PadEvent::Touchpads(touchpads)) {
                             return;
                         }
                     }
@@ -520,6 +556,24 @@ mod tests {
         assert!(out.is_empty());
         held.update_sample(&client::LauncherPadSample { id: 1, buttons: 0, ..Default::default() }, &mut out);
         assert!(out.is_empty());
+
+        // Guide + X emits ToggleOsk immediately and suppresses Guide on release.
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: BTN_GUIDE, ..Default::default() }, &mut out);
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: BTN_GUIDE | BTN_X, ..Default::default() }, &mut out);
+        assert_eq!(out, [Press::ToggleOsk]);
+        out.clear();
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: 0, ..Default::default() }, &mut out);
+        assert!(out.is_empty());
+
+        // Dedicated Quick Access button (`misc`) emits QuickAccess on rising edge only.
+        held.update_sample(&client::LauncherPadSample { id: 1, misc: true, ..Default::default() }, &mut out);
+        held.update_sample(&client::LauncherPadSample { id: 1, misc: true, ..Default::default() }, &mut out);
+        assert_eq!(out, [Press::QuickAccess]);
+        out.clear();
+
+        // L3 / R3 emit cleanly.
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: BTN_LSTICK | BTN_RSTICK, ..Default::default() }, &mut out);
+        assert_eq!(out, [Press::L3, Press::R3]);
     }
 
     #[test]
@@ -535,14 +589,14 @@ mod tests {
         assert_eq!(held.due_scroll(now + SCROLL_REPEAT * 2), None);
 
         out.clear();
-        held.update_sample(&client::LauncherPadSample { id: 1, lt: 0.8, ..Default::default() }, &mut out);
+        held.update_sample(&client::LauncherPadSample { id: 1, lt: 0.50, ..Default::default() }, &mut out);
         assert_eq!(out, [Press::Lt]);
         out.clear();
         held.update_sample(&client::LauncherPadSample { id: 1, lt: 0.9, ..Default::default() }, &mut out);
         assert!(out.is_empty());
         held.update_sample(&client::LauncherPadSample { id: 1, lt: 0.1, ..Default::default() }, &mut out);
         assert!(out.is_empty());
-        held.update_sample(&client::LauncherPadSample { id: 1, lt: 0.8, ..Default::default() }, &mut out);
+        held.update_sample(&client::LauncherPadSample { id: 1, lt: 0.50, ..Default::default() }, &mut out);
         assert_eq!(out, [Press::Lt]);
     }
 

@@ -15,7 +15,7 @@ use extensions::{Ctx, Extension, Manifest, PageSpec};
 use local::manage::{Progress, VerifyReport};
 use model::{AppId, InstalledGame, art};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use ui::{Theme, icons, widgets as w};
@@ -155,9 +155,11 @@ struct Saved {
     hidden: BTreeSet<AppId>,
     custom: Vec<CustomGame>,
     collections: Vec<Collection>,
-    /// Hides the collection buttons, "+ Collection" and "Add to collection"
+    /// Hides the collection groups, "+ Collection" and "Add to collection"
     /// (shown by default; Settings → Library).
     hide_collections: bool,
+    /// Collapsed sidebar group keys (collections and built-in sections).
+    collapsed_groups: BTreeSet<String>,
     /// Collections as Steam last had them, for the account they belong to:
     /// the base of the three-way merge at sign-in.
     collections_base: Option<(u64, client::collections::Collections)>,
@@ -202,6 +204,14 @@ enum Filter {
     Playing,
     Favorites,
     Collection(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CollectionsView {
+    /// "Your Collections" overview grid with "+ Create a new collection" + collection cards.
+    Overview,
+    /// Managing one collection (index into `Library::collections`), with drag-and-drop.
+    Detail(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -298,6 +308,10 @@ pub struct Library {
     /// Games to put on the desktop once their install finishes.
     collections: Vec<Collection>,
     hide_collections: bool,
+    collapsed_groups: BTreeSet<String>,
+    collections_view: Option<CollectionsView>,
+    /// Game currently being dragged from the sidebar to drop into a collection.
+    dragging_game: Option<(AppId, String)>,
     /// See `Saved::collections_base`.
     collections_base: Option<(u64, client::collections::Collections)>,
     /// Signed-in account (collections belong to it).
@@ -341,6 +355,7 @@ impl Extension for Library {
 
     fn on_navigate(&mut self, _page: &str, arg: Option<&str>) {
         self.custom_selected = None;
+        self.collections_view = None;
         self.dialog = None;
         self.reader = None;
         if arg == Some("restore") {
@@ -497,6 +512,9 @@ impl Extension for Library {
             .and_then(|l| l.lock().ok())
             .map(|g| g.clone())
             .unwrap_or_default();
+        if self.hide_collections {
+            self.collections_view = None;
+        }
         if !custom_layout.is_empty() {
             crate::theme_renderer::render_library(self, &custom_layout, ui, &t, ctx);
         } else {
@@ -505,12 +523,15 @@ impl Extension for Library {
                 .resizable(false)
                 .frame(egui::Frame::new().fill(t.chrome).inner_margin(Margin { left: 12, right: 6, top: 14, bottom: 8 }))
                 .show(ui, |ui| self.sidebar(ui, &t, ctx));
-            egui::CentralPanel::default().frame(egui::Frame::new().fill(t.bg)).show(ui, |ui| match (self.custom_selected, self.selected) {
-                (Some(i), _) => self.custom_page(i, ui, &t, ctx),
-                (None, Some(id)) => self.game_page(id, ui, &t, ctx),
-                (None, None) => self.home(ui, &t, ctx),
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(t.bg)).show(ui, |ui| match (self.collections_view, self.custom_selected, self.selected) {
+                (Some(CollectionsView::Overview), _, _) => self.collections_overview(ui, &t, ctx),
+                (Some(CollectionsView::Detail(i)), _, _) => self.collection_detail(i, ui, &t, ctx),
+                (None, Some(i), _) => self.custom_page(i, ui, &t, ctx),
+                (None, None, Some(id)) => self.game_page(id, ui, &t, ctx),
+                (None, None, None) => self.home(ui, &t, ctx),
             });
         }
+        self.paint_drag_preview(ui, &t, ctx);
         self.add_dialog(ui, &t, ctx);
         self.import_dialog(ui, &t, ctx);
         self.reader(ui, &t, ctx);
@@ -547,8 +568,13 @@ impl Extension for Library {
     fn settings(&mut self, ui: &mut Ui, ctx: &mut Ctx) -> bool {
         let t = ctx.theme.clone();
         let mut show = !self.hide_collections;
-        super::settings::switch(ui, &t, t!("Show collections"), t!("Collection filters and the new collection button in the library sidebar, and the Add to collection menu on games."), &mut show);
+        super::settings::switch(ui, &t, t!("Show collections"), t!("Collection groups and the new collection button in the library sidebar, and the Add to collection menu on games."), &mut show);
         self.hide_collections = !show;
+        if let Some(flags) = &self.flags {
+            let mut f = *flags.lock().unwrap();
+            super::settings::switch(ui, &t, t!("Show What's new"), t!("Show recent news from the games you play on the library home."), &mut f.show_whats_new);
+            *flags.lock().unwrap() = f;
+        }
         // Non-Steam games added in the official client.
         egui::Frame::new().fill(t.surface).corner_radius(t.corner_small()).inner_margin(Margin::symmetric(14, 12)).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -586,6 +612,7 @@ impl Extension for Library {
             custom: self.custom.clone(),
             collections: self.collections.clone(),
             hide_collections: self.hide_collections,
+            collapsed_groups: self.collapsed_groups.clone(),
             collections_base: self.collections_base.clone(),
             through_steam: self.through_steam,
             pending_shortcuts: self.shortcut_after_install.clone(),
@@ -610,6 +637,7 @@ impl Extension for Library {
         self.custom = saved.custom;
         self.collections = saved.collections;
         self.hide_collections = saved.hide_collections;
+        self.collapsed_groups = saved.collapsed_groups;
         self.collections_base = saved.collections_base;
         self.through_steam = saved.through_steam;
         client::launch_through_steam(self.through_steam);
@@ -729,6 +757,11 @@ impl Library {
                 self.filter = Filter::All;
             }
         }
+        if let Some(CollectionsView::Detail(i)) = self.collections_view {
+            if i >= self.collections.len() {
+                self.collections_view = Some(CollectionsView::Overview);
+            }
+        }
         self.collections_base = Some((account, remote));
         self.collections_loaded = true;
         self.collections_retry = None;
@@ -787,8 +820,19 @@ impl Library {
                         }
                     }
                     None => {
-                        self.collections.push(Collection { name, games: game.into_iter().collect(), steam_id: Some(client::collections::new_id()) });
-                        self.filter = Filter::Collection(self.collections.len() - 1);
+                        let from_game = game.is_some();
+                        let col = Collection { name, games: game.into_iter().collect(), steam_id: Some(client::collections::new_id()) };
+                        self.collapsed_groups.remove(&collection_key(&col));
+                        self.collections.push(col);
+                        let new_idx = self.collections.len() - 1;
+                        if matches!(self.filter, Filter::Collection(_)) {
+                            self.filter = Filter::All;
+                        }
+                        if !from_game {
+                            self.selected = None;
+                            self.custom_selected = None;
+                            self.collections_view = Some(CollectionsView::Detail(new_idx));
+                        }
                     }
                 }
             }
@@ -865,13 +909,21 @@ impl Library {
 
     /// "What's new": the latest update posts from games you play, newest first.
     fn whats_new(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, recent: &[(AppId, &str, u64)]) {
+        if !self.whats_new_enabled() {
+            return;
+        }
         let ids: Vec<_> = recent.iter().map(|g| g.0).collect();
         let (posts, loading) = self.whats_new_posts(&ids);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         if posts.is_empty() && !loading {
             return;
         }
-        w::section(ui, t, t!("What's new"), None);
+        if w::section(ui, t, t!("What's new"), Some(t!("Hide"))) {
+            self.set_whats_new_enabled(false);
+            ctx.toast(t!("What's new hidden. You can turn it back on in Settings → Library."));
+            ui.ctx().request_repaint();
+            return;
+        }
         // Steam's event images are 16:9 (800x450): a 16:9 slot shows them whole.
         let card = vec2(300.0, 300.0 * 9.0 / 16.0 + 80.0);
         egui::ScrollArea::horizontal().id_salt("whats-new").show(ui, |ui| {
@@ -1097,6 +1149,17 @@ impl Library {
         Self { rt: Some(rt), egui: Some(egui), tile: 160.0, flags: Some(flags), layout: Some(layout), ..Default::default() }
     }
 
+    /// Settings > Library > "Show What's new" (on unless turned off).
+    fn whats_new_enabled(&self) -> bool {
+        self.flags.as_ref().is_none_or(|f| f.lock().unwrap().show_whats_new)
+    }
+
+    fn set_whats_new_enabled(&self, enabled: bool) {
+        if let Some(flags) = &self.flags {
+            flags.lock().unwrap().show_whats_new = enabled;
+        }
+    }
+
     /// Like Steam: queue games that need an update, unless auto-updates are
     /// off (globally, or "only when I launch it" for the game).
     fn auto_update(&mut self, ctx: &mut Ctx) {
@@ -1258,12 +1321,287 @@ impl Library {
         }
     }
 
+    fn sidebar_groups<'a>(
+        &self,
+        items: &'a [Entry<'a>],
+        ctx: &Ctx,
+        group_by: themes::LibraryGrouping,
+        rest_label: &str,
+        use_collections: bool,
+    ) -> Vec<SidebarGroup<'a>> {
+        let history = if group_by == themes::LibraryGrouping::LastPlayed {
+            Some(themed_recent_games(ctx).into_iter().map(|g| (g.0, g.2)).collect())
+        } else {
+            None
+        };
+        self.sidebar_groups_with_history(items, history.as_ref(), group_by, rest_label, use_collections)
+    }
+
+    fn sidebar_groups_with_history<'a>(
+        &self,
+        items: &'a [Entry<'a>],
+        history: Option<&BTreeMap<AppId, u64>>,
+        group_by: themes::LibraryGrouping,
+        rest_label: &str,
+        use_collections: bool,
+    ) -> Vec<SidebarGroup<'a>> {
+        let mut groups: Vec<SidebarGroup<'a>> = Vec::new();
+        if let Filter::Collection(i) = self.filter {
+            let (key, label) = self
+                .collections
+                .get(i)
+                .map(|c| (collection_key(c), c.name.clone()))
+                .unwrap_or_else(|| (format!("col-idx:{i}"), String::new()));
+            groups.push(SidebarGroup { key, label, collection: Some(i), games: items.iter().collect() });
+            return groups;
+        }
+        if self.filter == Filter::Favorites {
+            if !items.is_empty() {
+                groups.push(SidebarGroup {
+                    key: "sys:favorites".into(),
+                    label: t!("Favorites").to_string(),
+                    collection: None,
+                    games: items.iter().collect(),
+                });
+            }
+            return groups;
+        }
+        let favs: Vec<&Entry> = items.iter().filter(|e| self.favorites.contains(&e.app_id)).collect();
+        if !favs.is_empty() {
+            groups.push(SidebarGroup {
+                key: "sys:favorites".into(),
+                label: t!("Favorites").to_string(),
+                collection: None,
+                games: favs,
+            });
+        }
+        if group_by == themes::LibraryGrouping::LastPlayed {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let year = ui::calendar_date(now).0;
+            let mut dated: BTreeMap<PlayedGroup, Vec<&Entry>> = BTreeMap::new();
+            for e in items.iter().filter(|e| !self.favorites.contains(&e.app_id)) {
+                let played = history.and_then(|h| h.get(&e.app_id).copied());
+                dated.entry(played_group(played, now)).or_default().push(e);
+            }
+            for (group, mut games) in dated {
+                games.sort_by_key(|e| (std::cmp::Reverse(history.and_then(|h| h.get(&e.app_id).copied()).unwrap_or(0)), e.name));
+                let label = group.label(year);
+                groups.push(SidebarGroup { key: format!("played:{label}"), label, collection: None, games });
+            }
+            return groups;
+        }
+        if use_collections && !self.collections.is_empty() {
+            let filtering = !self.search.trim().is_empty() || self.filter != Filter::All || self.adv.count() > 0;
+            let mut order: Vec<usize> = (0..self.collections.len()).collect();
+            order.sort_by(|&a, &b| self.collections[a].name.to_lowercase().cmp(&self.collections[b].name.to_lowercase()).then(a.cmp(&b)));
+            let mut categorized: HashSet<AppId> = HashSet::new();
+            for i in order {
+                let c = &self.collections[i];
+                let games: Vec<&Entry> = items.iter().filter(|e| c.games.contains(&e.app_id)).collect();
+                for e in &games {
+                    categorized.insert(e.app_id);
+                }
+                if !games.is_empty() || !filtering {
+                    groups.push(SidebarGroup {
+                        key: collection_key(c),
+                        label: c.name.clone(),
+                        collection: Some(i),
+                        games,
+                    });
+                }
+            }
+            let uncategorized: Vec<&Entry> = items.iter().filter(|e| !self.favorites.contains(&e.app_id) && !categorized.contains(&e.app_id)).collect();
+            if !uncategorized.is_empty() {
+                groups.push(SidebarGroup {
+                    key: "sys:uncategorized".into(),
+                    label: t!("Uncategorized").to_string(),
+                    collection: None,
+                    games: uncategorized,
+                });
+            }
+            return groups;
+        }
+        let (installed, rest): (Vec<_>, Vec<_>) = items.iter().filter(|e| !self.favorites.contains(&e.app_id)).partition(|e| e.installed.is_some());
+        if !installed.is_empty() {
+            groups.push(SidebarGroup {
+                key: "sys:installed".into(),
+                label: t!("Installed").to_string(),
+                collection: None,
+                games: installed,
+            });
+        }
+        if !rest.is_empty() {
+            groups.push(SidebarGroup {
+                key: "sys:rest".into(),
+                label: rest_label.to_string(),
+                collection: None,
+                games: rest,
+            });
+        }
+        groups
+    }
+
+    fn search_group_id(&self, ui: &Ui, key: &str) -> egui::Id {
+        ui.make_persistent_id(("library-search-group", self.search.trim(), key))
+    }
+
+    fn is_group_open(&self, ui: &Ui, key: &str, searching: bool) -> bool {
+        if searching {
+            // Search results start expanded without losing the normal list's collapse choices.
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), self.search_group_id(ui, key), true).is_open()
+        } else {
+            !self.collapsed_groups.contains(key)
+        }
+    }
+
+    fn toggle_group(&mut self, ui: &Ui, key: &str, searching: bool) {
+        if searching {
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), self.search_group_id(ui, key), true);
+            state.toggle(ui);
+            state.store(ui.ctx());
+        } else if !self.collapsed_groups.remove(key) {
+            self.collapsed_groups.insert(key.to_string());
+        }
+    }
+
+    fn set_all_groups_open(&mut self, ui: &Ui, keys: &[String], open: bool, searching: bool) {
+        if searching {
+            for key in keys {
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), self.search_group_id(ui, key), true);
+                state.set_open(open);
+                state.store(ui.ctx());
+            }
+        } else if open {
+            for key in keys {
+                self.collapsed_groups.remove(key);
+            }
+        } else {
+            for key in keys {
+                self.collapsed_groups.insert(key.clone());
+            }
+        }
+    }
+
+    fn delete_collection(&mut self, index: usize) {
+        if index >= self.collections.len() {
+            return;
+        }
+        let removed = self.collections.remove(index);
+        self.collapsed_groups.remove(&collection_key(&removed));
+        match self.filter {
+            Filter::Collection(j) if j == index => self.filter = Filter::All,
+            Filter::Collection(j) if j > index => self.filter = Filter::Collection(j - 1),
+            _ => {}
+        }
+        match self.collections_view {
+            Some(CollectionsView::Detail(j)) if j == index => self.collections_view = Some(CollectionsView::Overview),
+            Some(CollectionsView::Detail(j)) if j > index => self.collections_view = Some(CollectionsView::Detail(j - 1)),
+            _ => {}
+        }
+    }
+
+    fn return_home(&mut self) {
+        self.selected = None;
+        self.custom_selected = None;
+        self.collections_view = None;
+        if matches!(self.filter, Filter::Collection(_)) {
+            self.filter = Filter::All;
+        }
+    }
+
+    fn toggle_collections_overview(&mut self) {
+        if self.hide_collections {
+            return;
+        }
+        self.selected = None;
+        self.custom_selected = None;
+        self.collections_view = if self.collections_view == Some(CollectionsView::Overview) {
+            None
+        } else {
+            Some(CollectionsView::Overview)
+        };
+    }
+
+    fn add_game_to_collection(&mut self, index: usize, app_id: AppId, ctx: &mut Ctx) {
+        let Some(c) = self.collections.get_mut(index) else { return };
+        if c.games.insert(app_id) {
+            ctx.toast(t!("Added to {name}", name = c.name));
+        }
+    }
+
+    /// Check whether a game dragged from the sidebar is hovering or dropped on `rect`.
+    fn check_drop_on_rect(&mut self, ui: &Ui, rect: Rect) -> (bool, Option<AppId>) {
+        if self.dragging_game.is_none() {
+            return (false, None);
+        }
+        let hovered = ui.ctx().pointer_latest_pos().is_some_and(|p| rect.contains(p));
+        let released = !ui.input(|i| i.pointer.any_down());
+        if hovered && released {
+            (true, self.dragging_game.take().map(|(id, _)| id))
+        } else {
+            (hovered, None)
+        }
+    }
+
+    /// Floating pill following the pointer while dragging a game from the sidebar.
+    fn paint_drag_preview(&mut self, ui: &Ui, t: &Theme, ctx: &Ctx) {
+        let Some((app_id, name)) = self.dragging_game.clone() else { return };
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) || !ui.input(|i| i.pointer.any_down()) {
+            self.dragging_game = None;
+            return;
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let Some(pos) = ui.ctx().pointer_latest_pos() else { return };
+        let icon_url = ctx.state.apps.as_ref().and_then(|a| a.get(&app_id)).and_then(|o| o.icon.as_deref()).map(|h| art::icon(app_id, h));
+        let header = art::header(app_id);
+        egui::Area::new(egui::Id::unique("library-drag-game-preview"))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .fixed_pos(pos + vec2(14.0, 12.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(t.raised)
+                    .stroke(Stroke::new(1.5, t.accent))
+                    .corner_radius(t.corner_small())
+                    .inner_margin(Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let (icon_rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                            let urls: Vec<&str> = icon_url.as_deref().into_iter().chain([header.as_str()]).collect();
+                            if !w::paint_cover_first(ui, icon_rect, &urls, CornerRadius::same(3)) {
+                                ui.painter().rect_filled(icon_rect, CornerRadius::same(3), t.surface_hover);
+                            }
+                            ui.label(w::text_medium(short(&name, 32), 13.0, t.text));
+                        });
+                    });
+            });
+    }
+
+    fn apply_group_menu(&mut self, ui: &Ui, act: Option<GroupMenuAct>, all_keys: &[String], searching: bool) {
+        match act {
+            Some(GroupMenuAct::Rename(i)) => {
+                if let Some(c) = self.collections.get(i) {
+                    self.naming = Some((Some(i), c.name.clone(), None));
+                }
+            }
+            Some(GroupMenuAct::Delete(i)) => self.delete_collection(i),
+            Some(GroupMenuAct::CollapseAll) => self.set_all_groups_open(ui, all_keys, false, searching),
+            Some(GroupMenuAct::ExpandAll) => self.set_all_groups_open(ui, all_keys, true, searching),
+            None => {}
+        }
+    }
+
     fn sidebar(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
         ui.horizontal(|ui| {
-            let home = home_button(ui, t, self.selected.is_none() && self.custom_selected.is_none(), ui.available_width() - 46.0);
+            let home = home_button(
+                ui,
+                t,
+                self.selected.is_none() && self.custom_selected.is_none() && self.collections_view.is_none(),
+                ui.available_width() - 46.0,
+            );
             if home.clicked() {
-                self.selected = None;
-                self.custom_selected = None;
+                self.return_home();
             }
             if w::icon_button(ui, t, icons::PLUS, t!("Add a non-Steam game"), false, 0).clicked() {
                 self.adding = Some(CustomGame::default());
@@ -1273,84 +1611,84 @@ impl Library {
         let width = ui.available_width() - 6.0;
         w::search(ui, t, &mut self.search, t!("Search games"), width);
         ui.add_space(6.0);
-        // The chips fill the search box's width (the Filters button below
-        // too), sharing the extra room; if they don't fit, they wrap.
+        // The chips fill the search box's width (the Filters + Collections row
+        // below aligns its split with the Installed / ★ split above).
         let chips = [(Filter::All, t!("All")), (Filter::Installed, t!("Installed")), (Filter::Favorites, icons::STAR), (Filter::Playing, t!("Played"))];
         let gap = 6.0;
-        let natural: f32 = chips.iter().map(|(_, l)| w::chip_width(ui, l)).sum::<f32>() + gap * (chips.len() - 1) as f32;
-        let extra = (width - natural) / chips.len() as f32;
+        // Collections (only when turned on in Settings → Library).
+        if self.hide_collections && matches!(self.filter, Filter::Collection(_)) {
+            self.filter = Filter::All;
+        }
+        let n = self.adv.count();
+        let filters_label = if n > 0 { format!("{}  {} ({n})", icons::FUNNEL, t!("Filters")) } else { format!("{}  {}", icons::FUNNEL, t!("Filters")) };
+        let collections_label = format!("{}  {}", icons::GRID, t!("Collections"));
+        let top_nat = [
+            w::chip_width(ui, chips[0].1),
+            w::chip_width(ui, chips[1].1),
+            w::chip_width(ui, chips[2].1),
+            w::chip_width(ui, chips[3].1),
+        ];
+        let bottom_nat = (!self.hide_collections).then(|| [w::chip_width(ui, &filters_label), w::chip_width(ui, &collections_label)]);
+        let (top_widths, bottom_widths) = sidebar_filter_widths(top_nat, bottom_nat, width, gap);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(gap, gap);
-            for (f, label) in chips {
-                let r = if extra > 0.0 { w::wide_chip(ui, t, label, self.filter == f, w::chip_width(ui, label) + extra) } else { w::chip(ui, t, label, self.filter == f) };
+            for (i, (f, label)) in chips.into_iter().enumerate() {
+                let r = if let Some(tw) = top_widths {
+                    w::wide_chip(ui, t, label, self.filter == f, tw[i])
+                } else {
+                    w::chip(ui, t, label, self.filter == f)
+                };
                 if r.clicked() {
                     self.filter = f;
                 }
             }
         });
         ui.add_space(gap - ui.spacing().item_spacing.y);
-        // Steam-style filters in a popup.
-        let n = self.adv.count();
-        let label = if n > 0 { format!("{}  {} ({n})", icons::FUNNEL, t!("Filters")) } else { format!("{}  {}", icons::FUNNEL, t!("Filters")) };
-        let r = w::wide_chip(ui, t, &label, n > 0, width);
-        egui::Popup::from_toggle_button_response(&r)
+        // Steam-style filters in a popup, paired with clickable "Collections" button when collections are on.
+        let filters_resp = if self.hide_collections {
+            w::wide_chip(ui, t, &filters_label, n > 0, width)
+        } else if let Some([fw, cw]) = bottom_widths {
+            let mut f_resp = None;
+            let mut c_resp = None;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = vec2(gap, gap);
+                f_resp = Some(w::wide_chip(ui, t, &filters_label, n > 0, fw));
+                c_resp = Some(w::wide_chip(ui, t, &collections_label, self.collections_view.is_some(), cw));
+            });
+            if c_resp.unwrap().on_hover_text(t!("Manage your collections")).clicked() {
+                self.toggle_collections_overview();
+            }
+            f_resp.unwrap()
+        } else {
+            let mut row = Vec::new();
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing = vec2(gap, gap);
+                let labels = [
+                    (filters_label.clone(), n > 0),
+                    (collections_label.clone(), self.collections_view.is_some()),
+                ];
+                row = chip_rows(ui, t, &labels, width, gap);
+            });
+            if row[1].clone().on_hover_text(t!("Manage your collections")).clicked() {
+                self.toggle_collections_overview();
+            }
+            row.swap_remove(0)
+        };
+        egui::Popup::from_toggle_button_response(&filters_resp)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .width(720.0)
             .show(|ui| self.adv_panel(ui, t, ctx));
-        // Collections (only when turned on in Settings → Library).
-        if self.hide_collections && matches!(self.filter, Filter::Collection(_)) {
-            self.filter = Filter::All;
-        }
-        if !self.hide_collections {
-        ui.add_space(gap);
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing = vec2(gap, gap);
-            let mut labels: Vec<(String, bool)> = self.collections.iter().enumerate().map(|(i, c)| (format!("{}  {}  {}", icons::STACK, short(&c.name, 24), c.games.len()), self.filter == Filter::Collection(i))).collect();
-            labels.push((format!("{}  {}", icons::PLUS, t!("Collection")), false));
-            let chips = chip_rows(ui, t, &labels, width, gap);
-            let mut remove = None;
-            for (i, c) in self.collections.iter().enumerate() {
-                let r = &chips[i];
-                if r.clicked() {
-                    self.filter = if self.filter == Filter::Collection(i) { Filter::All } else { Filter::Collection(i) };
-                }
-                r.context_menu(|ui| {
-                    if ui.button(format!("{}   {}", icons::NOTE, t!("Rename"))).clicked() {
-                        self.naming = Some((Some(i), c.name.clone(), None));
-                        ui.close();
-                    }
-                    if ui.button(format!("{}   {}", icons::TRASH, t!("Delete collection"))).clicked() {
-                        remove = Some(i);
-                        ui.close();
-                    }
-                });
-            }
-            if chips[self.collections.len()].clone().on_hover_text(t!("Make a new collection")).clicked() {
-                self.naming = Some((None, String::new(), None));
-            }
-            if let Some(i) = remove {
-                self.collections.remove(i);
-                self.filter = Filter::All;
-            }
-        });
-        }
         ui.add_space(8.0);
         let items = self.filtered(ctx);
-        let favs: Vec<&Entry> = items.iter().filter(|e| self.favorites.contains(&e.app_id)).collect();
-        let (installed, rest): (Vec<_>, Vec<_>) = items.iter().filter(|e| !self.favorites.contains(&e.app_id)).partition(|e| e.installed.is_some());
-        let mut groups: Vec<(String, Vec<&Entry>)> = Vec::new();
-        if let Filter::Collection(i) = self.filter {
-            let name = self.collections.get(i).map(|c| c.name.clone()).unwrap_or_default();
-            groups.push((format!("{name} — {}", items.len()), items.iter().collect()));
-        } else if !favs.is_empty() {
-            groups.push((t!("Favorites — {n}", n = favs.len()), favs));
+        let searching = !self.search.trim().is_empty();
+        let groups = self.sidebar_groups(&items, ctx, themes::LibraryGrouping::Installed, t!("Not installed"), !self.hide_collections);
+        let mut all_keys: Vec<String> = groups.iter().map(|g| g.key.clone()).collect();
+        if !self.custom.is_empty() {
+            all_keys.push("sys:non_steam".into());
         }
-        if !matches!(self.filter, Filter::Collection(_)) {
-            groups.push((t!("Installed — {n}", n = installed.len()), installed));
-        }
-        if !rest.is_empty() && !matches!(self.filter, Filter::Collection(_)) {
-            groups.push((t!("Not installed — {n}", n = rest.len()), rest));
-        }
+        let total_groups = all_keys.len();
+        let mut group_act: Option<GroupMenuAct> = None;
+        let mut drop_add: Option<(usize, AppId)> = None;
         if ctx.state.apps.is_none() {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(12.0).color(t.accent));
@@ -1365,73 +1703,124 @@ impl Library {
                     w::skeleton(ui, t, Rect::from_min_size(r.min + vec2(40.0, 9.0), vec2(80.0 + (i * 37 % 90) as f32, 12.0)), CornerRadius::same(4));
                 }
             }
-            for (title, list) in groups {
-                w::caption(ui, t, &title);
-                ui.add_space(2.0);
-                for e in list {
-                    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 34.0), Sense::click());
-                    if !ui.is_rect_visible(rect) {
-                        continue;
+            for group in groups {
+                let mut open = self.is_group_open(ui, &group.key, searching);
+                let hresp = sidebar_group_header(ui, t, &group.label, group.games.len(), open, ui.available_width() - 6.0);
+                if let Some(col_idx) = group.collection {
+                    let (drop_hover, dropped) = self.check_drop_on_rect(ui, hresp.rect);
+                    if drop_hover {
+                        ui.painter().rect_filled(hresp.rect, t.corner_small(), t.accent.gamma_multiply(0.2));
+                        ui.painter().rect_stroke(hresp.rect, t.corner_small(), Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
                     }
-                    let sel = self.selected == Some(e.app_id);
-                    let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                    if sel {
-                        ui.painter().rect_filled(rect, t.corner_small(), t.accent.gamma_multiply(0.16));
-                    } else if hover > 0.0 {
-                        ui.painter().rect_filled(rect, t.corner_small(), w::mix(Color32::TRANSPARENT, t.surface, hover));
-                    }
-                    let icon = Rect::from_min_size(rect.min + vec2(6.0, 5.0), vec2(24.0, 24.0));
-                    let url = e.owned.and_then(|o| o.icon.as_deref()).map(|h| art::icon(e.app_id, h));
-                    // The big header only when the game has no icon at all.
-                    let header = art::header(e.app_id);
-                    let urls: Vec<&str> = url.as_deref().into_iter().chain([header.as_str()]).collect();
-                    if !w::paint_cover_first(ui, icon, &urls, CornerRadius::same(4)) {
-                        ui.painter().rect_filled(icon, CornerRadius::same(4), t.surface_hover);
-                    }
-                    let setup = setup_state(ctx, e.app_id, e.installed.is_some());
-                    let busy = matches!(setup, Setup::Downloading(_) | Setup::Queued);
-                    let color = if busy { t.accent } else if sel { t.text } else if e.installed.is_some() { w::mix(t.text_dim, t.text, hover) } else { t.text_faint };
-                    let mut job = egui::text::LayoutJob::simple_singleline(e.name.to_owned(), w::font_medium(13.5), color);
-                    job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 50.0);
-                    let galley = ui.painter().layout_job(job);
-                    ui.painter().galley(pos2(icon.right() + 10.0, rect.center().y - galley.size().y / 2.0), galley, color);
-                    if ctx.state.playing == Some(e.app_id) {
-                        ui.painter().circle_filled(rect.right_center() - vec2(10.0, 0.0), 4.0, t.in_game);
-                    }
-                    // Installing: a thin bar along the bottom of the row, like Steam.
-                    if let Setup::Downloading(d) = &setup {
-                        let frac = d.fraction();
-                        let track = Rect::from_min_max(pos2(icon.right() + 10.0, rect.bottom() - 4.0), pos2(rect.right() - 8.0, rect.bottom() - 2.0));
-                        ui.painter().rect_filled(track, CornerRadius::same(1), t.raised);
-                        let fill = Rect::from_min_size(track.min, vec2(track.width() * frac, track.height()));
-                        ui.painter().rect_filled(fill, CornerRadius::same(1), if d.paused { t.text_faint } else { t.accent });
-                    }
-                    let id = e.app_id;
-                    self.game_menu(t, ctx, &resp, id, e.installed.is_some(), ctx.state.playing == Some(id));
-                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        self.selected = Some(id);
-                        self.custom_selected = None;
+                    if let Some(app_id) = dropped {
+                        drop_add = Some((col_idx, app_id));
                     }
                 }
-                ui.add_space(10.0);
+                if hresp.clicked() {
+                    self.toggle_group(ui, &group.key, searching);
+                    open = !open;
+                }
+                group_context_menu(&hresp, group.collection, total_groups, &mut group_act);
+                if !open {
+                    ui.add_space(2.0);
+                    continue;
+                }
+                ui.add_space(2.0);
+                if group.games.is_empty() && group.collection.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        ui.label(w::text(t!("Empty collection"), 12.0, t.text_faint));
+                    });
+                    ui.add_space(6.0);
+                    continue;
+                }
+                ui.push_id(&group.key, |ui| {
+                    for e in group.games {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 34.0), Sense::click_and_drag());
+                        if !ui.is_rect_visible(rect) {
+                            continue;
+                        }
+                        let sel = self.selected == Some(e.app_id);
+                        let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                        if sel {
+                            ui.painter().rect_filled(rect, t.corner_small(), t.accent.gamma_multiply(0.16));
+                        } else if hover > 0.0 {
+                            ui.painter().rect_filled(rect, t.corner_small(), w::mix(Color32::TRANSPARENT, t.surface, hover));
+                        }
+                        let icon = Rect::from_min_size(rect.min + vec2(6.0, 5.0), vec2(24.0, 24.0));
+                        let url = e.owned.and_then(|o| o.icon.as_deref()).map(|h| art::icon(e.app_id, h));
+                        // The big header only when the game has no icon at all.
+                        let header = art::header(e.app_id);
+                        let urls: Vec<&str> = url.as_deref().into_iter().chain([header.as_str()]).collect();
+                        if !w::paint_cover_first(ui, icon, &urls, CornerRadius::same(4)) {
+                            ui.painter().rect_filled(icon, CornerRadius::same(4), t.surface_hover);
+                        }
+                        let setup = setup_state(ctx, e.app_id, e.installed.is_some());
+                        let busy = matches!(setup, Setup::Downloading(_) | Setup::Queued);
+                        let color = if busy { t.accent } else if sel { t.text } else if e.installed.is_some() { w::mix(t.text_dim, t.text, hover) } else { t.text_faint };
+                        let mut job = egui::text::LayoutJob::simple_singleline(e.name.to_owned(), w::font_medium(13.5), color);
+                        job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 50.0);
+                        let galley = ui.painter().layout_job(job);
+                        ui.painter().galley(pos2(icon.right() + 10.0, rect.center().y - galley.size().y / 2.0), galley, color);
+                        if ctx.state.playing == Some(e.app_id) {
+                            ui.painter().circle_filled(rect.right_center() - vec2(10.0, 0.0), 4.0, t.in_game);
+                        }
+                        // Installing: a thin bar along the bottom of the row, like Steam.
+                        if let Setup::Downloading(d) = &setup {
+                            let frac = d.fraction();
+                            let track = Rect::from_min_max(pos2(icon.right() + 10.0, rect.bottom() - 4.0), pos2(rect.right() - 8.0, rect.bottom() - 2.0));
+                            ui.painter().rect_filled(track, CornerRadius::same(1), t.raised);
+                            let fill = Rect::from_min_size(track.min, vec2(track.width() * frac, track.height()));
+                            ui.painter().rect_filled(fill, CornerRadius::same(1), if d.paused { t.text_faint } else { t.accent });
+                        }
+                        let id = e.app_id;
+                        self.game_menu(t, ctx, &resp, id, e.installed.is_some(), ctx.state.playing == Some(id));
+                        if resp.drag_started_by(egui::PointerButton::Primary) {
+                            self.dragging_game = Some((id, e.name.to_owned()));
+                        }
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            self.selected = Some(id);
+                            self.custom_selected = None;
+                            self.collections_view = None;
+                        }
+                    }
+                });
+                ui.add_space(8.0);
             }
             if !self.custom.is_empty() {
-                w::caption(ui, t, &t!("Non-Steam — {n}", n = self.custom.len()));
-                for (i, g) in self.custom.iter().enumerate() {
-                    let sel = self.custom_selected == Some(i);
-                    let r = ui.add(egui::Button::selectable(sel, w::text_medium(format!("{}   {}", icons::CONTROLLER, g.name), 13.5, t.text_dim)).min_size(vec2(ui.available_width() - 6.0, 32.0)));
-                    if r.clicked() {
-                        self.custom_selected = Some(i);
-                        self.selected = None;
-                    }
+                let key = "sys:non_steam";
+                let mut open = self.is_group_open(ui, key, searching);
+                let hresp = sidebar_group_header(ui, t, t!("Non-Steam"), self.custom.len(), open, ui.available_width() - 6.0);
+                if hresp.clicked() {
+                    self.toggle_group(ui, key, searching);
+                    open = !open;
                 }
-                ui.add_space(10.0);
+                group_context_menu(&hresp, None, total_groups, &mut group_act);
+                if open {
+                    ui.add_space(2.0);
+                    for (i, g) in self.custom.iter().enumerate() {
+                        let sel = self.custom_selected == Some(i);
+                        let r = ui.add(egui::Button::selectable(sel, w::text_medium(format!("{}   {}", icons::CONTROLLER, g.name), 13.5, t.text_dim)).min_size(vec2(ui.available_width() - 6.0, 32.0)));
+                        if r.clicked() {
+                            self.custom_selected = Some(i);
+                            self.selected = None;
+                            self.collections_view = None;
+                        }
+                    }
+                    ui.add_space(8.0);
+                } else {
+                    ui.add_space(2.0);
+                }
             }
             if !self.hidden.is_empty() {
                 w::check(ui, t, &mut self.show_hidden, w::text(t!("Show hidden games"), 12.5, t.text_faint));
             }
         });
         drop(items);
+        if let Some((col_idx, app_id)) = drop_add {
+            self.add_game_to_collection(col_idx, app_id, ctx);
+        }
+        self.apply_group_menu(ui, group_act, &all_keys, searching);
     }
 
     fn add_dialog(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
@@ -1569,6 +1958,304 @@ impl Library {
             ctx.toast(t!("Imported {n} non-Steam games from Steam", n = n));
         } else if close || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.importing = None;
+        }
+    }
+
+    /// Steam-style "Your Collections" overview: "+ Create a new collection" plus a card for each collection.
+    fn collections_overview(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+        let mut open_detail: Option<usize> = None;
+        let mut rename_col: Option<(usize, String)> = None;
+        let mut delete_col: Option<usize> = None;
+        let mut create_new = false;
+        let mut drop_add: Option<(usize, AppId)> = None;
+
+        let mut order: Vec<usize> = (0..self.collections.len()).collect();
+        order.sort_by(|&a, &b| self.collections[a].name.to_lowercase().cmp(&self.collections[b].name.to_lowercase()).then(a.cmp(&b)));
+        let cards: Vec<Option<(usize, String, Vec<AppId>, usize)>> = std::iter::once(None)
+            .chain(order.into_iter().map(|i| {
+                let c = &self.collections[i];
+                let preview: Vec<AppId> = c.games.iter().copied().take(4).collect();
+                Some((i, c.name.clone(), preview, c.games.len()))
+            }))
+            .collect();
+
+        egui::ScrollArea::vertical().id_salt("lib-collections-overview").auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(24.0);
+            w::centered(ui, 1400.0, 28.0, |ui| {
+                ui.label(w::text_semibold(t!("Your collections").to_uppercase(), 14.0, t.text_dim));
+                ui.add_space(16.0);
+                let (card_w, card_h, gap) = (196.0_f32, 236.0_f32, 18.0_f32);
+                let avail = ui.available_width();
+                let cols = (((avail + gap) / (card_w + gap)).floor() as usize).max(1);
+                let radius = t.corner();
+                for row in cards.chunks(cols) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for card in row {
+                            let (rect, resp) = ui.allocate_exact_size(vec2(card_w, card_h), Sense::click());
+                            let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                            match card {
+                                None => {
+                                    ui.painter().rect_filled(rect, radius, w::mix(t.surface, t.surface_hover, hover));
+                                    ui.painter().rect_stroke(rect, radius, Stroke::new(1.0, w::mix(t.border, t.accent, hover * 0.65)), egui::StrokeKind::Inside);
+                                    ui.painter().text(
+                                        pos2(rect.center().x, rect.center().y - 24.0),
+                                        Align2::CENTER_CENTER,
+                                        icons::PLUS,
+                                        w::font(32.0),
+                                        w::mix(t.text_dim, t.text, hover),
+                                    );
+                                    let mut create_job = egui::text::LayoutJob::simple(
+                                        t!("Create a new collection").to_uppercase(),
+                                        w::font_bold(12.5),
+                                        w::mix(t.text_dim, t.text, hover),
+                                        card_w - 28.0,
+                                    );
+                                    create_job.halign = Align::Center;
+                                    let galley = ui.painter().layout_job(create_job);
+                                    ui.painter().galley(
+                                        pos2(rect.center().x, rect.center().y + 12.0),
+                                        galley,
+                                        w::mix(t.text_dim, t.text, hover),
+                                    );
+                                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        create_new = true;
+                                    }
+                                }
+                                Some((i, name, preview, count)) => {
+                                    let (drop_hover, dropped) = self.check_drop_on_rect(ui, rect);
+                                    if let Some(app_id) = dropped {
+                                        drop_add = Some((*i, app_id));
+                                    }
+                                    paint_collection_collage(ui, t, rect, preview, radius);
+                                    let scrim = if drop_hover {
+                                        Color32::from_black_alpha(120)
+                                    } else {
+                                        Color32::from_black_alpha((165.0 - hover * 35.0) as u8)
+                                    };
+                                    ui.painter().rect_filled(rect, radius, scrim);
+                                    let stroke = if drop_hover {
+                                        Stroke::new(2.0, t.accent)
+                                    } else {
+                                        Stroke::new(1.0, w::mix(t.border, t.text_faint, hover))
+                                    };
+                                    ui.painter().rect_stroke(rect, radius, stroke, egui::StrokeKind::Inside);
+                                    let mut job = egui::text::LayoutJob::simple(
+                                        name.to_uppercase(),
+                                        w::font_bold(15.0),
+                                        Color32::WHITE,
+                                        card_w - 24.0,
+                                    );
+                                    job.halign = Align::Center;
+                                    job.wrap.max_rows = 3;
+                                    let title_g = ui.painter().layout_job(job);
+                                    let count_g = ui.painter().layout_no_wrap(format!("( {count} )"), w::font_medium(13.0), Color32::from_white_alpha(205));
+                                    let total_h = title_g.size().y + 6.0 + count_g.size().y;
+                                    let top_y = rect.center().y - total_h * 0.5;
+                                    ui.painter().galley(pos2(rect.center().x, top_y), title_g, Color32::WHITE);
+                                    ui.painter().galley(pos2(rect.center().x - count_g.size().x * 0.5, top_y + total_h - count_g.size().y), count_g, Color32::from_white_alpha(205));
+                                    resp.context_menu(|ui| {
+                                        if ui.button(format!("{}   {}", icons::NOTE, t!("Rename"))).clicked() {
+                                            rename_col = Some((*i, name.clone()));
+                                            ui.close();
+                                        }
+                                        if ui.button(format!("{}   {}", icons::TRASH, t!("Delete collection"))).clicked() {
+                                            delete_col = Some(*i);
+                                            ui.close();
+                                        }
+                                    });
+                                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        open_detail = Some(*i);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    ui.add_space(gap);
+                }
+            });
+            ui.add_space(28.0);
+        });
+
+        if let Some((col_idx, app_id)) = drop_add {
+            self.add_game_to_collection(col_idx, app_id, ctx);
+        }
+        if create_new {
+            self.naming = Some((None, String::new(), None));
+        } else if let Some((i, name)) = rename_col {
+            self.naming = Some((Some(i), name, None));
+        } else if let Some(i) = delete_col {
+            self.delete_collection(i);
+        } else if let Some(i) = open_detail {
+            self.collections_view = Some(CollectionsView::Detail(i));
+        }
+    }
+
+    /// Steam-style single collection view with rename/delete and drag-and-drop from the sidebar.
+    fn collection_detail(&mut self, i: usize, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+        let Some((name, game_ids)) = self.collections.get(i).map(|c| (c.name.clone(), c.games.clone())) else {
+            self.collections_view = Some(CollectionsView::Overview);
+            return;
+        };
+        let mut back = false;
+        let mut rename = false;
+        let mut delete_this = false;
+        let mut open_game: Option<AppId> = None;
+        let mut remove_game: Option<AppId> = None;
+        let mut dropped_game: Option<AppId> = None;
+
+        let mut items: Vec<Entry> = entries(ctx.state, ctx.local)
+            .into_iter()
+            .filter(|e| game_ids.contains(&e.app_id))
+            .collect();
+        match self.sort {
+            Sort::Name => items.sort_by_key(|e| e.name.to_lowercase()),
+            Sort::Recent => items.sort_by_key(|e| std::cmp::Reverse(e.installed.and_then(|g| g.last_played))),
+            Sort::Playtime => items.sort_by_key(|e| std::cmp::Reverse(e.installed.and_then(|g| g.playtime_minutes))),
+            Sort::Size => items.sort_by_key(|e| std::cmp::Reverse(e.installed.map(|g| g.size_on_disk))),
+        }
+
+        let viewport_bottom = ui.max_rect().bottom();
+        egui::ScrollArea::vertical().id_salt(("lib-collection-detail", i)).auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(24.0);
+            w::centered(ui, 1400.0, 28.0, |ui| {
+                ui.horizontal(|ui| {
+                    if w::button(ui, t, Some(icons::BACK), t!("Collections"), w::Kind::Ghost, w::Size::Sm).clicked() {
+                        back = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.label(w::text_bold(&name, 22.0, t.text));
+                    if w::icon_button(ui, t, icons::NOTE, t!("Rename collection"), false, 0).clicked() {
+                        rename = true;
+                    }
+                    ui.label(w::text(format!("({})", items.len()), 15.0, t.text_faint));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if w::button(ui, t, Some(icons::TRASH), t!("Delete collection"), w::Kind::Ghost, w::Size::Sm).clicked() {
+                            delete_this = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                let (line_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                ui.painter().hline(line_rect.x_range(), line_rect.center().y, Stroke::new(1.0, t.border));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(w::text(t!("Sort"), 13.0, t.text_faint));
+                    w::segmented(ui, t, &mut self.sort, &[(Sort::Name, t!("Name")), (Sort::Recent, t!("Recent")), (Sort::Playtime, t!("Hours")), (Sort::Size, t!("Size"))]);
+                    ui.add_space(10.0);
+                    ui.label(w::text(icons::GRID, 15.0, t.text_faint));
+                    ui.add(egui::Slider::new(&mut self.tile, 110.0..=220.0).show_value(false)).on_hover_text(t!("Tile size"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self.dragging_game.is_some() {
+                            ui.label(w::text_medium(t!("Drop here to add to {name}", name = name.clone()), 13.0, t.accent));
+                        } else if !items.is_empty() {
+                            ui.label(w::text(t!("Drag games from the sidebar to add"), 12.5, t.text_faint));
+                        }
+                    });
+                });
+                ui.add_space(14.0);
+
+                let drop_top = ui.cursor().top();
+                let avail_w = ui.available_width();
+                let min_drop_h = (viewport_bottom - drop_top - 28.0).max(320.0);
+                let drop_rect = Rect::from_min_size(pos2(ui.cursor().left(), drop_top), vec2(avail_w, min_drop_h));
+
+                if items.is_empty() {
+                    let (rect, _) = ui.allocate_exact_size(vec2(avail_w, min_drop_h), Sense::hover());
+                    let (drop_hover, dropped) = self.check_drop_on_rect(ui, rect);
+                    if let Some(app_id) = dropped {
+                        dropped_game = Some(app_id);
+                    }
+                    if self.dragging_game.is_some() {
+                        let fill = if drop_hover { t.accent.gamma_multiply(0.1) } else { t.accent.gamma_multiply(0.03) };
+                        let stroke = if drop_hover { Stroke::new(2.0, t.accent) } else { Stroke::new(1.0, t.accent.gamma_multiply(0.45)) };
+                        ui.painter().rect_filled(rect, t.corner(), fill);
+                        ui.painter().rect_stroke(rect, t.corner(), stroke, egui::StrokeKind::Inside);
+                    }
+                    let msg_color = if drop_hover { t.accent } else { t.text_dim };
+                    ui.painter().text(
+                        pos2(rect.center().x, rect.top() + (rect.height() * 0.28).max(72.0)),
+                        Align2::CENTER_CENTER,
+                        t!("Drag games here to build this collection."),
+                        w::font(15.0),
+                        msg_color,
+                    );
+                } else {
+                    let gap = 14.0;
+                    let cols = (((avail_w + gap) / (self.tile + gap)).floor() as usize).max(1);
+                    let w_tile = ((avail_w - gap * (cols - 1) as f32) / cols as f32).floor();
+                    let size = vec2(w_tile, (w_tile * 1.5).round());
+                    for row in items.chunks(cols) {
+                        if w::skip_offscreen_row(ui, size.y) {
+                            ui.add_space(gap);
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for e in row {
+                                let r = w::game_tile(ui, t, &art::capsule(e.app_id), &art::header(e.app_id), e.name, e.installed.is_some(), size);
+                                let x_rect = Rect::from_min_size(pos2(r.rect.right() - 28.0, r.rect.top() + 6.0), vec2(22.0, 22.0));
+                                let pointer_in_x = ui.ctx().pointer_latest_pos().is_some_and(|p| x_rect.contains(p));
+                                let show_x = self.dragging_game.is_none() && (r.hovered() || pointer_in_x);
+                                let mut removed_here = false;
+                                if show_x {
+                                    let x_resp = ui.interact(x_rect, ui.scope_id().with(("col-rm", i, e.app_id)), Sense::click());
+                                    let bg = if x_resp.hovered() { t.danger } else { Color32::from_black_alpha(180) };
+                                    ui.painter().rect_filled(x_rect, CornerRadius::same(4), bg);
+                                    ui.painter().text(x_rect.center(), Align2::CENTER_CENTER, icons::X, w::font(12.0), Color32::WHITE);
+                                    if x_resp.on_hover_text(t!("Remove from collection")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        remove_game = Some(e.app_id);
+                                        removed_here = true;
+                                    }
+                                }
+                                self.game_menu(t, ctx, &r, e.app_id, e.installed.is_some(), ctx.state.playing == Some(e.app_id));
+                                if !removed_here && !pointer_in_x && r.clicked() {
+                                    open_game = Some(e.app_id);
+                                }
+                            }
+                        });
+                        ui.add_space(gap);
+                    }
+                    let used_bottom = ui.cursor().top();
+                    if used_bottom < drop_rect.bottom() {
+                        ui.allocate_exact_size(vec2(avail_w, drop_rect.bottom() - used_bottom), Sense::hover());
+                    }
+                    let full_drop_rect = Rect::from_min_max(drop_rect.min, pos2(drop_rect.right(), used_bottom.max(drop_rect.bottom())));
+                    let (drop_hover, dropped) = self.check_drop_on_rect(ui, full_drop_rect);
+                    if let Some(app_id) = dropped {
+                        dropped_game = Some(app_id);
+                    }
+                    if self.dragging_game.is_some() {
+                        let pad_rect = full_drop_rect.expand(6.0);
+                        let fill = if drop_hover { t.accent.gamma_multiply(0.08) } else { Color32::TRANSPARENT };
+                        let stroke = if drop_hover { Stroke::new(2.0, t.accent) } else { Stroke::new(1.0, t.accent.gamma_multiply(0.4)) };
+                        ui.painter().rect_filled(pad_rect, t.corner(), fill);
+                        ui.painter().rect_stroke(pad_rect, t.corner(), stroke, egui::StrokeKind::Inside);
+                    }
+                }
+            });
+            ui.add_space(28.0);
+        });
+        drop(items);
+
+        if let Some(app_id) = dropped_game {
+            self.add_game_to_collection(i, app_id, ctx);
+        }
+        if let Some(app_id) = remove_game {
+            if let Some(c) = self.collections.get_mut(i) {
+                c.games.remove(&app_id);
+            }
+        }
+        if back {
+            self.collections_view = Some(CollectionsView::Overview);
+        } else if rename {
+            self.naming = Some((Some(i), name, None));
+        } else if delete_this {
+            self.delete_collection(i);
+        } else if let Some(id) = open_game {
+            self.selected = Some(id);
+            self.custom_selected = None;
+            self.collections_view = None;
         }
     }
 
@@ -1819,6 +2506,12 @@ impl Library {
                             Some(_) if ctx.state.cloud_syncing.contains(&id) => {
                                 // Like Steam: the game starts once its saves are in sync.
                                 ui.add_enabled_ui(false, |ui| w::button(ui, t, Some(icons::CLOUD_CHECK), t!("Syncing Steam Cloud…"), w::Kind::Play, w::Size::Lg));
+                                ui.add(egui::Spinner::new().color(t.accent));
+                            }
+                            Some(_) if ctx.state.launching == Some(id) => {
+                                if w::button(ui, t, Some(icons::X), t!("Launching…"), w::Kind::Danger, w::Size::Lg).on_hover_text(t!("Cancel")).clicked() {
+                                    ctx.send(Command::StopGame { app_id: id });
+                                }
                                 ui.add(egui::Spinner::new().color(t.accent));
                             }
                             Some(g) => {
@@ -2351,6 +3044,7 @@ impl Library {
         match installed {
             Some(_) if self.uninstalling.contains_key(&id) => MainAction::Uninstalling,
             Some(_) if ctx.state.playing == Some(id) => MainAction::Running,
+            Some(_) if ctx.state.launching == Some(id) => MainAction::Preparing,
             Some(g) if self.needs_update(ctx, &g) => MainAction::Update,
             Some(_) if ctx.state.cloud_syncing.contains(&id) => MainAction::Syncing,
             Some(_) => MainAction::Play,
@@ -2446,6 +3140,8 @@ impl Library {
             ui.add_enabled_ui(false, |ui| w::button(ui, t, Some(icons::CLOCK), t!("Queued"), w::Kind::Secondary, w::Size::Lg));
         } else if ctx.state.playing == Some(id) {
             ui.add_enabled_ui(false, |ui| w::button(ui, t, Some(icons::PLAY), t!("Running"), w::Kind::Play, w::Size::Lg));
+        } else if ctx.state.launching == Some(id) {
+            ui.add_enabled_ui(false, |ui| w::button(ui, t, Some(icons::CLOCK), t!("Launching…"), w::Kind::Play, w::Size::Lg));
         } else if self.needs_update(ctx, g) {
             if w::button(ui, t, Some(icons::DOWNLOAD), t!("Update"), w::Kind::Primary, w::Size::Lg).clicked() {
                 self.queue_install(ctx, id, Some(g.library.clone()));
@@ -2795,6 +3491,166 @@ fn proton_submenu(ui: &mut Ui, t: &Theme, ctx: &Ctx, id: AppId) {
     });
 }
 
+/// One collapsible section in the library sidebar (a collection, Favorites,
+/// Uncategorized, Installed, etc.).
+struct SidebarGroup<'a> {
+    key: String,
+    label: String,
+    collection: Option<usize>,
+    games: Vec<&'a Entry<'a>>,
+}
+
+#[derive(Clone, Copy)]
+enum GroupMenuAct {
+    Rename(usize),
+    Delete(usize),
+    CollapseAll,
+    ExpandAll,
+}
+
+fn collection_key(c: &Collection) -> String {
+    match &c.steam_id {
+        Some(id) if !id.is_empty() => format!("col:{id}"),
+        _ => format!("col-name:{}", c.name),
+    }
+}
+
+fn sidebar_group_header(ui: &mut Ui, t: &Theme, title: &str, count: usize, open: bool, width: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+    if hover > 0.0 {
+        ui.painter().rect_filled(rect, t.corner_small(), w::mix(Color32::TRANSPARENT, t.surface, hover));
+    }
+    let caret = if open { icons::CARET_DOWN } else { icons::CARET_RIGHT };
+    let caret_color = w::mix(t.text_faint, t.text_dim, hover);
+    ui.painter().text(pos2(rect.left() + 10.0, rect.center().y), Align2::CENTER_CENTER, caret, w::font(11.0), caret_color);
+    let label_color = w::mix(t.text_dim, t.text, hover);
+    let count_text = format!(" · {count}");
+    let count_galley = ui.painter().layout_no_wrap(count_text, w::font_semibold(12.0), t.text_faint);
+    let text_left = rect.left() + 20.0;
+    let max_name_w = (rect.right() - text_left - count_galley.size().x - 6.0).max(24.0);
+    let mut name_job = egui::text::LayoutJob::simple_singleline(title.to_owned(), w::font_semibold(12.5), label_color);
+    name_job.wrap = egui::text::TextWrapping::truncate_at_width(max_name_w);
+    let name_galley = ui.painter().layout_job(name_job);
+    let count_x = text_left + name_galley.size().x;
+    ui.painter().galley(pos2(text_left, rect.center().y - name_galley.size().y / 2.0), name_galley, label_color);
+    ui.painter().galley(pos2(count_x, rect.center().y - count_galley.size().y / 2.0), count_galley, t.text_faint);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn group_context_menu(resp: &egui::Response, collection: Option<usize>, total_groups: usize, out: &mut Option<GroupMenuAct>) {
+    if collection.is_none() && total_groups <= 1 {
+        return;
+    }
+    resp.context_menu(|ui| {
+        if let Some(i) = collection {
+            if ui.button(format!("{}   {}", icons::NOTE, t!("Rename"))).clicked() {
+                *out = Some(GroupMenuAct::Rename(i));
+                ui.close();
+            }
+            if ui.button(format!("{}   {}", icons::TRASH, t!("Delete collection"))).clicked() {
+                *out = Some(GroupMenuAct::Delete(i));
+                ui.close();
+            }
+            if total_groups > 1 {
+                ui.separator();
+            }
+        }
+        if total_groups > 1 {
+            if ui.button(t!("Collapse all")).clicked() {
+                *out = Some(GroupMenuAct::CollapseAll);
+                ui.close();
+            }
+            if ui.button(t!("Expand all")).clicked() {
+                *out = Some(GroupMenuAct::ExpandAll);
+                ui.close();
+            }
+        }
+    });
+}
+
+/// Paint a 1–4 cover collage for a collection card, like Steam's Your Collections view.
+fn paint_collection_collage(ui: &Ui, t: &Theme, rect: Rect, games: &[AppId], radius: CornerRadius) {
+    ui.painter().rect_filled(rect, radius, t.raised);
+    if games.is_empty() {
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, icons::STACK, w::font(44.0), t.surface_hover);
+        return;
+    }
+    let cells: Vec<Rect> = match games.len() {
+        1 => vec![rect],
+        2 => {
+            let mid = rect.center().x;
+            vec![
+                Rect::from_min_max(rect.min, pos2(mid, rect.bottom())),
+                Rect::from_min_max(pos2(mid, rect.top()), rect.max),
+            ]
+        }
+        _ => {
+            let mid_x = rect.center().x;
+            let mid_y = rect.center().y;
+            vec![
+                Rect::from_min_max(rect.min, pos2(mid_x, mid_y)),
+                Rect::from_min_max(pos2(mid_x, rect.top()), pos2(rect.right(), mid_y)),
+                Rect::from_min_max(pos2(rect.left(), mid_y), pos2(mid_x, rect.bottom())),
+                Rect::from_min_max(pos2(mid_x, mid_y), rect.max),
+            ]
+        }
+    };
+    for (idx, cell) in cells.into_iter().enumerate() {
+        let Some(&id) = games.get(idx).or_else(|| games.first()) else { continue };
+        let cell_radius = if games.len() == 1 { radius } else { CornerRadius::ZERO };
+        w::paint_cover_first(ui, cell, &[&art::capsule(id), &art::header(id)], cell_radius);
+    }
+}
+
+/// Compute pixel-aligned widths for the top 4 filter chips (`All`, `Installed`,
+/// `★`, `Played`) and the 2 buttons below them (`Filters`, `Collections`) so the
+/// seam between `Filters` and `Collections` lines up with the seam between
+/// `Installed` and `★`.
+fn sidebar_filter_widths(
+    top: [f32; 4],
+    bottom: Option<[f32; 2]>,
+    width: f32,
+    gap: f32,
+) -> (Option<[f32; 4]>, Option<[f32; 2]>) {
+    let top_sum: f32 = top.iter().sum::<f32>() + gap * 3.0;
+    if top_sum > width {
+        return (None, None);
+    }
+    let extra = (width - top_sum) / 4.0;
+    let mut tw = [top[0] + extra, top[1] + extra, top[2] + extra, top[3] + extra];
+    let Some([b0, b1]) = bottom else {
+        return (Some(tw), None);
+    };
+    if b0 + gap + b1 > width {
+        return (Some(tw), None);
+    }
+    let left_span = tw[0] + gap + tw[1];
+    let right_span = tw[2] + gap + tw[3];
+    let left_min = (top[0] + gap + top[1]).max(b0);
+    let right_min = (top[2] + gap + top[3]).max(b1);
+    if right_span < right_min && left_span > left_min {
+        let shift = (right_min - right_span).min(left_span - left_min);
+        tw[0] -= shift * 0.5;
+        tw[1] -= shift * 0.5;
+        tw[2] += shift * 0.5;
+        tw[3] += shift * 0.5;
+    } else if left_span < left_min && right_span > right_min {
+        let shift = (left_min - left_span).min(right_span - right_min);
+        tw[0] += shift * 0.5;
+        tw[1] += shift * 0.5;
+        tw[2] -= shift * 0.5;
+        tw[3] -= shift * 0.5;
+    }
+    let final_left = tw[0] + gap + tw[1];
+    let final_right = tw[2] + gap + tw[3];
+    if final_left + 0.5 >= b0 && final_right + 0.5 >= b1 {
+        (Some(tw), Some([final_left, final_right]))
+    } else {
+        (Some(tw), None)
+    }
+}
+
 /// Chips in rows that fill `width`, like the library's filter chips: each
 /// row shares its spare room between its chips.
 fn chip_rows(ui: &mut Ui, t: &Theme, labels: &[(String, bool)], width: f32, gap: f32) -> Vec<egui::Response> {
@@ -2940,13 +3796,32 @@ impl PlayedGroup {
 }
 
 // The header arrows page the actual scroll area rather than dropping excess cards.
-fn themed_shelf_header(ui: &mut Ui, t: &Theme, title: &str, line: bool) -> f32 {
+fn themed_shelf_header(ui: &mut Ui, t: &Theme, title: &str, line: bool, on_hide: Option<&mut bool>) -> f32 {
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
     let g = ui.painter().layout_no_wrap(i18n::tr_dyn(title), w::font(16.0), t.text);
     let end = r.left() + g.size().x;
     ui.painter().galley(r.left_center() - vec2(0.0, g.size().y * 0.5), g, t.text);
+    let mut right_edge = r.right() - 80.0;
+    if let Some(hide) = on_hide {
+        let hide_label = t!("Hide");
+        let hg = ui.painter().layout_no_wrap(hide_label.to_string(), w::font(12.5), t.text_faint);
+        let hw = hg.size().x;
+        let hide_rect = Rect::from_min_size(pos2(r.right() - 78.0 - hw, r.top()), vec2(hw, 24.0));
+        let resp = ui.interact(hide_rect, ui.scope_id().with((title, "hide")), Sense::click());
+        let fg = if resp.hovered() { t.text } else { t.text_faint };
+        let hg = ui.painter().layout_no_wrap(hide_label.to_string(), w::font(12.5), fg);
+        let text_pos = pos2(hide_rect.left(), hide_rect.center().y - hg.size().y * 0.5);
+        ui.painter().galley(text_pos, hg, fg);
+        if resp.hovered() {
+            ui.painter().hline(hide_rect.x_range(), hide_rect.bottom() - 3.0, Stroke::new(1.0, fg));
+        }
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            *hide = true;
+        }
+        right_edge = hide_rect.left() - 16.0;
+    }
     if line {
-        ui.painter().hline((end + 20.0)..=(r.right() - 80.0).max(end + 20.0), r.center().y,
+        ui.painter().hline((end + 20.0)..=right_edge.max(end + 20.0), r.center().y,
             Stroke::new(6.0, t.surface_hover));
     }
     let mut delta = 0.0;
@@ -2977,21 +3852,32 @@ fn themed_shelf_scroll(ui: &Ui, salt: &str, delta: f32) -> egui::ScrollArea {
 
 impl crate::theme_renderer::LibraryHost for Library {
     fn is_detail_open(&self) -> bool {
-        self.custom_selected.is_some() || self.selected.is_some()
+        self.custom_selected.is_some() || self.selected.is_some() || self.collections_view.is_some()
+    }
+
+    fn is_collections_open(&self) -> bool {
+        self.collections_view.is_some()
+    }
+
+    fn whats_new_enabled(&self) -> bool {
+        Library::whats_new_enabled(self)
     }
 
     fn render_detail(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
-        match (self.custom_selected, self.selected) {
-            (Some(i), _) => self.custom_page(i, ui, t, ctx),
-            (None, Some(id)) => self.game_page(id, ui, t, ctx),
-            (None, None) => {}
+        match (self.collections_view, self.custom_selected, self.selected) {
+            (Some(CollectionsView::Overview), _, _) => self.collections_overview(ui, t, ctx),
+            (Some(CollectionsView::Detail(i)), _, _) => self.collection_detail(i, ui, t, ctx),
+            (None, Some(i), _) => self.custom_page(i, ui, t, ctx),
+            (None, None, Some(id)) => self.game_page(id, ui, t, ctx),
+            (None, None, None) => {}
         }
     }
 
     fn handle_library_action(&mut self, action: &str, ctx: &mut Ctx) {
         if action == "navigate:library" {
-            self.selected = None;
-            self.custom_selected = None;
+            self.return_home();
+        } else if action == "library:collections" {
+            self.toggle_collections_overview();
         } else if action == "add_game" {
             self.adding = Some(CustomGame::default());
         } else if let Some(rest) = action.strip_prefix("navigate:") {
@@ -3005,33 +3891,7 @@ impl crate::theme_renderer::LibraryHost for Library {
         }
     }
 
-    fn render_action_popup(&mut self, _ui: &mut Ui, t: &Theme, response: &egui::Response, action: &str) {
-        if action != "library:collections" { return; }
-        egui::Popup::menu(response).width(220.0).show(|ui| {
-            if w::menu_item(ui, t, icons::BOOKS, t!("All Games")).clicked() {
-                self.filter = Filter::All;
-                self.selected = None;
-                self.custom_selected = None;
-                ui.close();
-            }
-            if !self.hide_collections {
-                for (index, collection) in self.collections.iter().enumerate() {
-                    let label = format!("{} ({})", collection.name, collection.games.len());
-                    if w::menu_item(ui, t, icons::STACK, &label).clicked() {
-                        self.filter = Filter::Collection(index);
-                        self.selected = None;
-                        self.custom_selected = None;
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                if w::menu_item(ui, t, icons::PLUS, t!("New collection…")).clicked() {
-                    self.naming = Some((None, String::new(), None));
-                    ui.close();
-                }
-            }
-        });
-    }
+    fn render_action_popup(&mut self, _ui: &mut Ui, _t: &Theme, _response: &egui::Response, _action: &str) {}
 
     fn render_search(
         &mut self,
@@ -3171,41 +4031,19 @@ impl crate::theme_renderer::LibraryHost for Library {
         show_counts: bool,
         style: &themes::NodeStyle,
     ) {
-        let items = self.filtered(ctx);
-        let favs: Vec<&Entry> = items.iter().filter(|e| self.favorites.contains(&e.app_id)).collect();
-        let (installed, rest): (Vec<_>, Vec<_>) = items.iter().filter(|e| !self.favorites.contains(&e.app_id)).partition(|e| e.installed.is_some());
-        let mut groups: Vec<(String, Vec<&Entry>)> = Vec::new();
-        let fmt_hdr = |label: String, n: usize| {
-            if show_counts { format!("{} ({n})", label.to_uppercase()) } else { label.to_uppercase() }
-        };
-        if let Filter::Collection(i) = self.filter {
-            let name = self.collections.get(i).map(|c| c.name.clone()).unwrap_or_default();
-            groups.push((name, items.iter().collect()));
-        } else {
-            if !favs.is_empty() {
-                groups.push((t!("Favorites").to_string(), favs));
-            }
-            if group_by == themes::LibraryGrouping::LastPlayed {
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                let year = ui::calendar_date(now).0;
-                let history: BTreeMap<_, _> = themed_recent_games(ctx).into_iter().map(|g| (g.0, g.2)).collect();
-                let mut dated: BTreeMap<PlayedGroup, Vec<&Entry>> = BTreeMap::new();
-                for e in items.iter().filter(|e| !self.favorites.contains(&e.app_id)) {
-                    dated.entry(played_group(history.get(&e.app_id).copied(), now)).or_default().push(e);
-                }
-                for (group, mut games) in dated {
-                    games.sort_by_key(|e| (std::cmp::Reverse(history.get(&e.app_id).copied().unwrap_or(0)), e.name));
-                    groups.push((group.label(year), games));
-                }
-            } else {
-                if !installed.is_empty() {
-                    groups.push((t!("Installed").to_string(), installed));
-                }
-                if !rest.is_empty() {
-                    groups.push((t!("All games").to_string(), rest));
-                }
-            }
+        if self.hide_collections && matches!(self.filter, Filter::Collection(_)) {
+            self.filter = Filter::All;
         }
+        let items = self.filtered(ctx);
+        let searching = !self.search.trim().is_empty();
+        let groups = self.sidebar_groups(&items, ctx, group_by, t!("All games"), !self.hide_collections && group_headers);
+        let mut all_keys: Vec<String> = groups.iter().map(|g| g.key.clone()).collect();
+        if !self.custom.is_empty() {
+            all_keys.push("sys:non_steam".into());
+        }
+        let total_groups = all_keys.len();
+        let mut group_act: Option<GroupMenuAct> = None;
+        let mut drop_add: Option<(usize, AppId)> = None;
 
         if ctx.state.apps.is_none() {
             ui.horizontal(|ui| {
@@ -3218,101 +4056,162 @@ impl crate::theme_renderer::LibraryHost for Library {
         let row_h = row_height.clamp(20.0, 48.0);
         let ic_sz = icon_size.clamp(14.0, (row_h - 4.0).max(14.0));
 
-        let collection = if let Filter::Collection(i) = self.filter { Some(i) } else { None };
         egui::ScrollArea::vertical().id_salt("lib-side-themed").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            for (label, list) in groups {
+            for group in groups {
                 if group_headers {
-                    // Search results start expanded without losing the normal list's collapse choices.
-                    let searching = !self.search.trim().is_empty();
-                    let id = ui.make_persistent_id(("library-group", group_by as u8, collection, searching, &label));
-                    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+                    let mut open = self.is_group_open(ui, &group.key, searching);
                     let (hrect, hresp) = ui.allocate_exact_size(vec2(ui.available_width() - 4.0, 24.0), Sense::click());
-                    if hresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        state.toggle(ui);
-                    }
-                    state.store(ui.ctx());
-                    ui.painter().rect_filled(hrect, CornerRadius::ZERO, t.raised.gamma_multiply(0.45));
-                    let mark = if state.is_open() { "−" } else { "+" };
-                    let title = fmt_hdr(label, list.len());
-                    ui.painter().text(hrect.left_center() + vec2(2.0, 0.0), Align2::LEFT_CENTER,
-                        format!("{mark} {title}"), w::font(11.5), t.text_dim);
-                    if !state.is_open() {
-                        continue;
-                    }
-                }
-                for e in list {
-                    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 4.0, row_h), Sense::click());
-                    if !ui.is_rect_visible(rect) {
-                        continue;
-                    }
-                    let sel = self.selected == Some(e.app_id);
-                    let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.08);
-                    if sel {
-                        ui.painter().rect_filled(rect, CornerRadius::same(2), t.accent.gamma_multiply(0.22));
-                    } else if hover > 0.0 {
-                        ui.painter().rect_filled(rect, CornerRadius::same(2), t.surface_hover.gamma_multiply(hover * 0.75));
-                    }
-                    let icon = Rect::from_min_size(pos2(rect.left() + 18.0, rect.center().y - ic_sz * 0.5), vec2(ic_sz, ic_sz));
-                    let url = e.owned.and_then(|o| o.icon.as_deref()).map(|h| art::icon(e.app_id, h));
-                    let header = art::header(e.app_id);
-                    let urls: Vec<&str> = url.as_deref().into_iter().chain([header.as_str()]).collect();
-                    if !w::paint_cover_first(ui, icon, &urls, CornerRadius::same(2)) {
-                        ui.painter().rect_filled(icon, CornerRadius::same(2), t.surface_hover);
-                    }
-                    let setup = setup_state(ctx, e.app_id, e.installed.is_some());
-                    let busy = matches!(setup, Setup::Downloading(_) | Setup::Queued);
-                    let color = if busy {
-                        t.accent
-                    } else if sel || e.installed.is_some() {
-                        t.text
+                    let hhover = ui.ctx().animate_bool_with_time(hresp.id, hresp.hovered(), 0.08);
+                    let hresp = hresp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let drop_hover = if let Some(col_idx) = group.collection {
+                        let (dh, dropped) = self.check_drop_on_rect(ui, hrect);
+                        if let Some(app_id) = dropped {
+                            drop_add = Some((col_idx, app_id));
+                        }
+                        dh
                     } else {
-                        t.text_dim
+                        false
                     };
-                    let mut job = egui::text::LayoutJob::simple_singleline(e.name.to_string(), w::font(fs), color);
-                    job.wrap = egui::text::TextWrapping::truncate_at_width((rect.right() - icon.right() - 11.0).max(40.0));
-                    let galley = ui.painter().layout_job(job);
-                    ui.painter().galley(pos2(icon.right() + 7.0, rect.center().y - galley.size().y * 0.5), galley, color);
-                    if ctx.state.playing == Some(e.app_id) {
-                        ui.painter().circle_filled(rect.right_center() - vec2(8.0, 0.0), 3.5, t.in_game);
+                    if hresp.clicked() {
+                        self.toggle_group(ui, &group.key, searching);
+                        open = !open;
                     }
-                    if let Setup::Downloading(d) = &setup {
-                        let frac = d.fraction();
-                        let track = Rect::from_min_max(pos2(icon.right() + 7.0, rect.bottom() - 2.5), pos2(rect.right() - 6.0, rect.bottom() - 1.0));
-                        ui.painter().rect_filled(track, CornerRadius::ZERO, t.raised);
-                        let fill = Rect::from_min_size(track.min, vec2(track.width() * frac, track.height()));
-                        ui.painter().rect_filled(fill, CornerRadius::ZERO, if d.paused { t.text_faint } else { t.accent });
+                    group_context_menu(&hresp, group.collection, total_groups, &mut group_act);
+                    let bg = if drop_hover {
+                        t.accent.gamma_multiply(0.25)
+                    } else {
+                        w::mix(t.raised.gamma_multiply(0.45), t.surface_hover.gamma_multiply(0.55), hhover)
+                    };
+                    ui.painter().rect_filled(hrect, CornerRadius::ZERO, bg);
+                    if drop_hover {
+                        ui.painter().rect_stroke(hrect, CornerRadius::ZERO, Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
                     }
-                    let id = e.app_id;
-                    self.game_menu(t, ctx, &resp, id, e.installed.is_some(), ctx.state.playing == Some(id));
-                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        self.selected = Some(id);
-                        self.custom_selected = None;
+                    let mark = if open { "−" } else { "+" };
+                    let count_suffix = if show_counts { format!(" ({})", group.games.len()) } else { String::new() };
+                    let count_galley = ui.painter().layout_no_wrap(count_suffix, w::font(11.5), t.text_faint);
+                    let label_x = hrect.left() + 4.0;
+                    let max_title_w = (hrect.right() - label_x - count_galley.size().x - 6.0).max(24.0);
+                    let title_color = w::mix(t.text_dim, t.text, hhover);
+                    let mut title_job = egui::text::LayoutJob::simple_singleline(format!("{mark} {}", group.label.to_uppercase()), w::font(11.5), title_color);
+                    title_job.wrap = egui::text::TextWrapping::truncate_at_width(max_title_w);
+                    let title_galley = ui.painter().layout_job(title_job);
+                    let count_x = label_x + title_galley.size().x;
+                    ui.painter().galley(pos2(label_x, hrect.center().y - title_galley.size().y * 0.5), title_galley, title_color);
+                    ui.painter().galley(pos2(count_x, hrect.center().y - count_galley.size().y * 0.5), count_galley, t.text_faint);
+                    if !open {
+                        ui.add_space(2.0);
+                        continue;
                     }
                 }
+                if group.games.is_empty() && group.collection.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        ui.label(w::text(t!("Empty collection"), 11.5, t.text_faint));
+                    });
+                    ui.add_space(6.0);
+                    continue;
+                }
+                ui.push_id(&group.key, |ui| {
+                    for e in group.games {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 4.0, row_h), Sense::click_and_drag());
+                        if !ui.is_rect_visible(rect) {
+                            continue;
+                        }
+                        let sel = self.selected == Some(e.app_id);
+                        let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.08);
+                        if sel {
+                            ui.painter().rect_filled(rect, CornerRadius::same(2), t.accent.gamma_multiply(0.22));
+                        } else if hover > 0.0 {
+                            ui.painter().rect_filled(rect, CornerRadius::same(2), t.surface_hover.gamma_multiply(hover * 0.75));
+                        }
+                        let icon = Rect::from_min_size(pos2(rect.left() + 18.0, rect.center().y - ic_sz * 0.5), vec2(ic_sz, ic_sz));
+                        let url = e.owned.and_then(|o| o.icon.as_deref()).map(|h| art::icon(e.app_id, h));
+                        let header = art::header(e.app_id);
+                        let urls: Vec<&str> = url.as_deref().into_iter().chain([header.as_str()]).collect();
+                        if !w::paint_cover_first(ui, icon, &urls, CornerRadius::same(2)) {
+                            ui.painter().rect_filled(icon, CornerRadius::same(2), t.surface_hover);
+                        }
+                        let setup = setup_state(ctx, e.app_id, e.installed.is_some());
+                        let busy = matches!(setup, Setup::Downloading(_) | Setup::Queued);
+                        let color = if busy {
+                            t.accent
+                        } else if sel || e.installed.is_some() {
+                            t.text
+                        } else {
+                            t.text_dim
+                        };
+                        let mut job = egui::text::LayoutJob::simple_singleline(e.name.to_string(), w::font(fs), color);
+                        job.wrap = egui::text::TextWrapping::truncate_at_width((rect.right() - icon.right() - 11.0).max(40.0));
+                        let galley = ui.painter().layout_job(job);
+                        ui.painter().galley(pos2(icon.right() + 7.0, rect.center().y - galley.size().y * 0.5), galley, color);
+                        if ctx.state.playing == Some(e.app_id) {
+                            ui.painter().circle_filled(rect.right_center() - vec2(8.0, 0.0), 3.5, t.in_game);
+                        }
+                        if let Setup::Downloading(d) = &setup {
+                            let frac = d.fraction();
+                            let track = Rect::from_min_max(pos2(icon.right() + 7.0, rect.bottom() - 2.5), pos2(rect.right() - 6.0, rect.bottom() - 1.0));
+                            ui.painter().rect_filled(track, CornerRadius::ZERO, t.raised);
+                            let fill = Rect::from_min_size(track.min, vec2(track.width() * frac, track.height()));
+                            ui.painter().rect_filled(fill, CornerRadius::ZERO, if d.paused { t.text_faint } else { t.accent });
+                        }
+                        let id = e.app_id;
+                        self.game_menu(t, ctx, &resp, id, e.installed.is_some(), ctx.state.playing == Some(id));
+                        if resp.drag_started_by(egui::PointerButton::Primary) {
+                            self.dragging_game = Some((id, e.name.to_owned()));
+                        }
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            self.selected = Some(id);
+                            self.custom_selected = None;
+                            self.collections_view = None;
+                        }
+                    }
+                });
                 ui.add_space(6.0);
             }
             if !self.custom.is_empty() {
+                let key = "sys:non_steam";
+                let mut open = true;
                 if group_headers {
-                    let (hrect, _) = ui.allocate_exact_size(vec2(ui.available_width() - 4.0, 20.0), Sense::hover());
-                    let label = format!("— {}", fmt_hdr(t!("Non-Steam").to_string(), self.custom.len()));
-                    ui.painter().text(pos2(hrect.left() + 2.0, hrect.center().y), Align2::LEFT_CENTER, label, w::font_semibold(10.5), t.text_faint);
-                }
-                for (i, g) in self.custom.iter().enumerate() {
-                    let sel = self.custom_selected == Some(i);
-                    let r = ui.add(egui::Button::selectable(sel, w::text(format!("{}  {}", icons::CONTROLLER, g.name), fs, t.text)).min_size(vec2(ui.available_width() - 4.0, row_h)));
-                    if r.clicked() {
-                        self.custom_selected = Some(i);
-                        self.selected = None;
+                    open = self.is_group_open(ui, key, searching);
+                    let (hrect, hresp) = ui.allocate_exact_size(vec2(ui.available_width() - 4.0, 24.0), Sense::click());
+                    let hhover = ui.ctx().animate_bool_with_time(hresp.id, hresp.hovered(), 0.08);
+                    let hresp = hresp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if hresp.clicked() {
+                        self.toggle_group(ui, key, searching);
+                        open = !open;
                     }
+                    group_context_menu(&hresp, None, total_groups, &mut group_act);
+                    ui.painter().rect_filled(hrect, CornerRadius::ZERO, w::mix(t.raised.gamma_multiply(0.45), t.surface_hover.gamma_multiply(0.55), hhover));
+                    let mark = if open { "−" } else { "+" };
+                    let suffix = if show_counts { format!(" ({})", self.custom.len()) } else { String::new() };
+                    let label = format!("{mark} {}{suffix}", t!("Non-Steam").to_uppercase());
+                    ui.painter().text(pos2(hrect.left() + 4.0, hrect.center().y), Align2::LEFT_CENTER, label, w::font(11.5), w::mix(t.text_dim, t.text, hhover));
                 }
-                ui.add_space(6.0);
+                if open {
+                    for (i, g) in self.custom.iter().enumerate() {
+                        let sel = self.custom_selected == Some(i);
+                        let r = ui.add(egui::Button::selectable(sel, w::text(format!("{}  {}", icons::CONTROLLER, g.name), fs, t.text)).min_size(vec2(ui.available_width() - 4.0, row_h)));
+                        if r.clicked() {
+                            self.custom_selected = Some(i);
+                            self.selected = None;
+                            self.collections_view = None;
+                        }
+                    }
+                    ui.add_space(6.0);
+                } else {
+                    ui.add_space(2.0);
+                }
             }
             if !self.hidden.is_empty() {
                 w::check(ui, t, &mut self.show_hidden, w::text(t!("Show hidden games"), 12.0, t.text_faint));
             }
         });
         drop(items);
+        if let Some((col_idx, app_id)) = drop_add {
+            self.add_game_to_collection(col_idx, app_id, ctx);
+        }
+        self.apply_group_menu(ui, group_act, &all_keys, searching);
     }
 
     fn render_whats_new(
@@ -3329,6 +4228,9 @@ impl crate::theme_renderer::LibraryHost for Library {
         gap: f32,
         _style: &themes::NodeStyle,
     ) {
+        if !self.whats_new_enabled() {
+            return;
+        }
         let account_recent = themed_recent_games(ctx);
 
         let mut posts: Vec<(AppId, usize, store::events::GameEvent)> = Vec::new();
@@ -3345,7 +4247,14 @@ impl crate::theme_renderer::LibraryHost for Library {
         if posts.is_empty() && !loading {
             return;
         }
-        let scroll_delta = title.map(|hdr| themed_shelf_header(ui, t, hdr, false)).unwrap_or(0.0);
+        let mut hide = false;
+        let scroll_delta = title.map(|hdr| themed_shelf_header(ui, t, hdr, false, Some(&mut hide))).unwrap_or(0.0);
+        if hide {
+            self.set_whats_new_enabled(false);
+            ctx.toast(t!("What's new hidden. You can turn it back on in Settings → Library."));
+            ui.ctx().request_repaint();
+            return;
+        }
         ui.add_space(4.0);
         let radius = CornerRadius::same(card_radius);
         let top_off = if date_above { 18.0 } else { 0.0 };
@@ -3425,7 +4334,7 @@ impl crate::theme_renderer::LibraryHost for Library {
         if account_recent.is_empty() {
             return;
         }
-        let scroll_delta = title.map(|hdr| themed_shelf_header(ui, t, hdr, true)).unwrap_or(0.0);
+        let scroll_delta = title.map(|hdr| themed_shelf_header(ui, t, hdr, true, None)).unwrap_or(0.0);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let age = now.saturating_sub(account_recent[0].2) / 86_400;
         let when = match age {
@@ -3449,6 +4358,7 @@ impl crate::theme_renderer::LibraryHost for Library {
                 let (fid, fname, _) = &account_recent[0];
                 let finstalled = ctx.local.games.iter().find(|g| g.app_id == *fid).cloned();
                 let fplaying = ctx.state.playing == Some(*fid);
+                let flaunching = !fplaying && ctx.state.launching == Some(*fid);
                 let feat_w = featured_width.min(avail).max(1.0);
                 let (rect, resp) = ui.allocate_exact_size(vec2(feat_w, capsule_height), Sense::click());
                 let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
@@ -3471,13 +4381,15 @@ impl crate::theme_renderer::LibraryHost for Library {
                 let bhover = ui.ctx().animate_bool_with_time(btn_resp.id, btn_resp.hovered(), 0.08);
                 let (btn_bg, btn_icon, btn_tip) = if fplaying {
                     (t.danger, icons::STOP, t!("Stop"))
+                } else if flaunching {
+                    (t.danger, icons::CLOCK, t!("Launching…"))
                 } else if finstalled.is_some() {
                     (t.play, icons::PLAY, t!("Play"))
                 } else {
                     (t.accent, icons::DOWNLOAD, t!("Install"))
                 };
                 ui.painter().rect_filled(btn_rect, CornerRadius::same(2), w::mix(btn_bg, Color32::WHITE, bhover * 0.14));
-                if !fplaying && finstalled.is_some() {
+                if !fplaying && !flaunching && finstalled.is_some() {
                     // Crisp filled white play triangle matching Steam's Play button.
                     let c = btn_rect.center();
                     let tri = vec![
@@ -3490,7 +4402,7 @@ impl crate::theme_renderer::LibraryHost for Library {
                     ui.painter().text(btn_rect.center(), Align2::CENTER_CENTER, btn_icon, w::font(20.0), Color32::WHITE);
                 }
                 if btn_resp.on_hover_text(btn_tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    if fplaying {
+                    if fplaying || flaunching {
                         stop = Some(*fid);
                     } else if let Some(g) = &finstalled {
                         launch = Some((*fid, g.install_dir.clone()));
@@ -3651,37 +4563,90 @@ mod themed_library_tests {
     use super::*;
 
     #[test]
-    fn steam_collections_picker_selects_existing_collection_and_returns_home() {
+    fn steam_collections_button_opens_overview_and_drops_dragged_games() {
         use crate::theme_renderer::LibraryHost as _;
         let ctx = egui::Context::default();
         let mut library = Library::default();
         library.selected = Some(42);
-        library.collections.push(Collection { name: "My collection".into(), games: [42].into_iter().collect(), steam_id: None });
-        let theme = Theme::default();
-        let button_center = std::cell::Cell::new(egui::Pos2::ZERO);
-        let mut render = |events: Vec<egui::Event>| {
-            let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(500.0, 400.0))), events, ..Default::default() }, |ui| {
-                let response = ui.button("Collections");
-                button_center.set(response.rect.center());
-                library.render_action_popup(ui, &theme, &response, "library:collections");
-            });
-            output.textures_delta.clear();
-            output
-        };
-        let _ = render(vec![]);
-        let pos = button_center.get();
-        let click = |pos| vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }, egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }];
-        let _ = render(click(pos));
-        let output = render(vec![]);
-        let collection = output.shapes.iter().find_map(|shape| {
-            if let egui::Shape::Text(text) = &shape.shape {
-                if text.galley.job.text == "My collection (1)" { return Some(text.pos + text.galley.rect.center().to_vec2()); }
-            }
-            None
-        }).expect("existing collection appears in popup");
-        let _ = render(click(collection));
-        assert!(library.filter == Filter::Collection(0));
+        library.collections.push(Collection { name: "My collection".into(), games: BTreeSet::new(), steam_id: None });
+
+        // Clicking the Collections button opens the Your Collections view and clears game selection.
+        library.toggle_collections_overview();
+        assert_eq!(library.collections_view, Some(CollectionsView::Overview));
+        assert!(library.is_collections_open());
+        assert!(library.is_detail_open());
         assert_eq!(library.selected, None);
+
+        // Dragging a game over a drop zone and releasing drops that game.
+        library.dragging_game = Some((620, "Portal 2".into()));
+        let zone = Rect::from_min_size(pos2(20.0, 20.0), vec2(200.0, 200.0));
+        let mut dropped = None;
+        let mut out = ctx.run_ui(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 400.0))),
+            events: vec![
+                egui::Event::PointerMoved(pos2(80.0, 80.0)),
+                egui::Event::PointerButton { pos: pos2(80.0, 80.0), button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+            ],
+            ..Default::default()
+        }, |ui| {
+            let (hovered, id) = library.check_drop_on_rect(ui, zone);
+            assert!(hovered);
+            dropped = id;
+        });
+        out.textures_delta.clear();
+        assert_eq!(dropped, Some(620));
+        assert!(library.dragging_game.is_none());
+
+        // Clicking Home closes the collections view.
+        library.return_home();
+        assert_eq!(library.collections_view, None);
+        assert!(!library.is_collections_open());
+    }
+
+    #[test]
+    fn sidebar_filters_and_collections_align_with_installed_and_star() {
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        let theme = Theme::default();
+        let width = 256.0;
+        let gap = 6.0;
+        let mut top_rects = [Rect::NOTHING; 4];
+        let mut filters_rect = Rect::NOTHING;
+        let mut collections_rect = Rect::NOTHING;
+        let mut out = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(300.0, 200.0))), ..Default::default() },
+            |ui| {
+                let top_labels = ["All", "Installed", icons::STAR, "Played"];
+                let filters_label = format!("{}  Filters", icons::FUNNEL);
+                let collections_label = format!("{}  Collections", icons::GRID);
+                let top_nat = [
+                    w::chip_width(ui, top_labels[0]),
+                    w::chip_width(ui, top_labels[1]),
+                    w::chip_width(ui, top_labels[2]),
+                    w::chip_width(ui, top_labels[3]),
+                ];
+                let bottom_nat = [w::chip_width(ui, &filters_label), w::chip_width(ui, &collections_label)];
+                let (tw, bw) = sidebar_filter_widths(top_nat, Some(bottom_nat), width, gap);
+                let tw = tw.expect("top row fits");
+                let [fw, cw] = bw.expect("bottom row aligns");
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(gap, gap);
+                    for (i, label) in top_labels.into_iter().enumerate() {
+                        top_rects[i] = w::wide_chip(ui, &theme, label, false, tw[i]).rect;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(gap, gap);
+                    filters_rect = w::wide_chip(ui, &theme, &filters_label, false, fw).rect;
+                    collections_rect = w::wide_chip(ui, &theme, &collections_label, false, cw).rect;
+                });
+            },
+        );
+        out.textures_delta.clear();
+        assert!((filters_rect.left() - top_rects[0].left()).abs() < 0.5);
+        assert!((filters_rect.right() - top_rects[1].right()).abs() < 0.5);
+        assert!((collections_rect.left() - top_rects[2].left()).abs() < 0.5);
+        assert!((collections_rect.right() - top_rects[3].right()).abs() < 0.5);
     }
 
     #[test]
@@ -3752,6 +4717,106 @@ mod themed_library_tests {
         assert_eq!(args.user, "-novid");
         assert_eq!(args.controller, 2);
         assert_eq!(lib.launch_args_for(440).controller, 0);
+    }
+
+    #[test]
+    fn whats_new_enabled_respects_shared_flags() {
+        let mut lib = Library::default();
+        assert!(lib.whats_new_enabled());
+
+        let flags = std::sync::Arc::new(std::sync::Mutex::new(super::super::settings::AppFlags {
+            show_whats_new: true,
+            ..Default::default()
+        }));
+        lib.flags = Some(flags.clone());
+        assert!(lib.whats_new_enabled());
+
+        lib.set_whats_new_enabled(false);
+        assert!(!lib.whats_new_enabled());
+        assert!(!flags.lock().unwrap().show_whats_new);
+    }
+
+    #[test]
+    fn sidebar_groups_sort_by_collections_with_uncategorized_and_favorites() {
+        let mut lib = Library::default();
+        lib.favorites.insert(10);
+        lib.collections = vec![
+            Collection { name: "Valve".into(), games: [10, 20].into_iter().collect(), steam_id: Some("uc-valve".into()) },
+            Collection { name: "Capcom".into(), games: [30].into_iter().collect(), steam_id: Some("uc-capcom".into()) },
+            Collection { name: "Empty".into(), games: BTreeSet::new(), steam_id: Some("uc-empty".into()) },
+        ];
+        let items = vec![
+            Entry { app_id: 10, name: "Portal 2", installed: None, owned: None },
+            Entry { app_id: 20, name: "Half-Life 2", installed: None, owned: None },
+            Entry { app_id: 30, name: "Resident Evil", installed: None, owned: None },
+            Entry { app_id: 40, name: "Stray", installed: None, owned: None },
+        ];
+        let groups = lib.sidebar_groups_with_history(&items, None, themes::LibraryGrouping::Installed, "Not installed", true);
+        let summary: Vec<(&str, Vec<AppId>)> = groups.iter().map(|g| (g.label.as_str(), g.games.iter().map(|e| e.app_id).collect())).collect();
+        assert_eq!(summary, vec![
+            ("Favorites", vec![10]),
+            ("Capcom", vec![30]),
+            ("Empty", vec![]),
+            ("Valve", vec![10, 20]),
+            ("Uncategorized", vec![40]),
+        ]);
+        // Search/filtering hides empty collections.
+        lib.search = "portal".into();
+        let filtered_items = vec![Entry { app_id: 10, name: "Portal 2", installed: None, owned: None }];
+        let filtered_groups = lib.sidebar_groups_with_history(&filtered_items, None, themes::LibraryGrouping::Installed, "Not installed", true);
+        let labels: Vec<&str> = filtered_groups.iter().map(|g| g.label.as_str()).collect();
+        assert_eq!(labels, vec!["Favorites", "Valve"]);
+
+        // Hiding collections falls back to Installed / Not installed.
+        lib.search.clear();
+        let fallback = lib.sidebar_groups_with_history(&items, None, themes::LibraryGrouping::Installed, "Not installed", false);
+        let fallback_labels: Vec<&str> = fallback.iter().map(|g| g.label.as_str()).collect();
+        assert_eq!(fallback_labels, vec!["Favorites", "Not installed"]);
+    }
+
+    #[test]
+    fn sidebar_collection_dropdown_toggles_persists_and_cleans_up_on_delete() {
+        let ctx = egui::Context::default();
+        let theme = Theme::default();
+        let mut lib = Library::default();
+        lib.collections = vec![
+            Collection { name: "Capcom".into(), games: [1].into_iter().collect(), steam_id: Some("uc-1".into()) },
+            Collection { name: "Valve".into(), games: [2].into_iter().collect(), steam_id: Some("uc-2".into()) },
+        ];
+        let key = collection_key(&lib.collections[0]);
+        let header_center = std::cell::Cell::new(egui::Pos2::ZERO);
+        let render = |events: Vec<egui::Event>, lib: &mut Library| {
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(300.0, 200.0))), events, ..Default::default() }, |ui| {
+                let open = lib.is_group_open(ui, &key, false);
+                let resp = sidebar_group_header(ui, &theme, "Capcom", 1, open, 240.0);
+                header_center.set(resp.rect.center());
+                if resp.clicked() {
+                    lib.toggle_group(ui, &key, false);
+                }
+            });
+            out.textures_delta.clear();
+        };
+        let click = |pos| vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+        ];
+        render(vec![], &mut lib);
+        assert!(!lib.collapsed_groups.contains(&key));
+        render(click(header_center.get()), &mut lib);
+        assert!(lib.collapsed_groups.contains(&key));
+
+        // Collapse state survives save/load.
+        let saved = lib.save().expect("save");
+        let mut restored = Library::default();
+        restored.load(&saved);
+        assert!(restored.collapsed_groups.contains(&key));
+
+        // Deleting a collection removes its collapse entry and keeps Filter::Collection aligned.
+        restored.filter = Filter::Collection(1);
+        restored.delete_collection(0);
+        assert!(!restored.collapsed_groups.contains(&key));
+        assert!(restored.filter == Filter::Collection(0));
     }
 }
 

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>io.github.mollie2999.Aurora</id>
-  <name>Aurora Steam Client</name>
+  <name>Aurora</name>
   <summary>Browse your Steam library with a native client</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
@@ -13,7 +13,29 @@
     <p>This experimental sandboxed build is intended for the desktop client. Use a native Aurora package for integration with Steam and Proton.</p>
   </description>
   <launchable type="desktop-id">io.github.mollie2999.Aurora.desktop</launchable>
-  <url type="homepage">https://mollie2999.github.io/Aurora/</url>
+  <url type="homepage">https://auroraclient.eu/</url>
   <url type="bugtracker">https://github.com/mollie2999/Aurora/issues</url>
+  <url type="vcs-browser">https://github.com/mollie2999/Aurora</url>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/mollie2999/Aurora/v1.0.0-rc4/docs/media/en/library.png</image>
+      <caption>Browse your game library</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/mollie2999/Aurora/v1.0.0-rc4/docs/media/en/store.png</image>
+      <caption>Explore the Steam store</caption>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="1.0.0-rc5" date="2026-11-25" type="development">
+      <url type="details">https://github.com/mollie2999/Aurora/releases/tag/v1.0.0-rc5</url>
+    </release>
+    <release version="1.0.0-rc4" date="2026-11-24" type="development">
+      <url type="details">https://github.com/mollie2999/Aurora/releases/tag/v1.0.0-rc4</url>
+    </release>
+    <release version="0.9.2" date="2026-11-19">
+      <url type="details">https://github.com/mollie2999/Aurora/releases/tag/v0.9.2</url>
+    </release>
+  </releases>
   <content_rating type="oars-1.1" />
 </component>

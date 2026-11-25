@@ -590,7 +590,7 @@ const ALL: u64 = u64::MAX;
 /// The pad, the active set's name, active layers, and calibration context for a controller.
 fn context(s: &mut Input, handle: u64) -> Option<(Pad, bool, PadCalibration, String, Vec<String>)> {
     poll(s);
-    let mut entry = s.pads[slot_for(&s.pads, handle)?]?;
+    let mut entry = s.pads.get(slot_for(&s.pads, handle)?).copied().flatten()?;
     let c = cal(s);
     if !entry.calibrated && c.nintendo_layout {
         entry.pad.buttons = pads_shm::swap_nintendo_buttons(entry.pad.buttons);
@@ -859,6 +859,9 @@ fn family_input_type(family: u8) -> i32 {
 }
 
 extern "C" fn input_type(_t: This, handle: u64) -> i32 {
+    if !crate::pads::steam_input_enabled() {
+        return 0;
+    }
     let mut s = st();
     poll(&mut s);
     slot_for(&s.pads, handle).and_then(|i| s.pads[i]).map_or(0, |p| family_input_type(p.family))

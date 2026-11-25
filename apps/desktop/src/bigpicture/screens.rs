@@ -409,45 +409,53 @@ fn home(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f32) -> f32 {
         y += 90.0 * s;
     }
 
-    // What's new in the games you play (cards open the inline article reader).
+    if f.app.shared_flags().lock().unwrap().show_whats_new {
+        whats_new(bp, ui, f, &mut y, first, &recent);
+    }
+    y - top + 40.0 * s
+}
+
+/// What's new in the games you play (cards open the inline article reader).
+fn whats_new(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, y: &mut f32, first: Option<AppId>, recent: &[(AppId, String, u64)]) {
+    let s = f.s;
     let mut ids: Vec<AppId> = first.into_iter().collect();
     ids.extend(recent.iter().map(|g| g.0).filter(|id| Some(*id) != first));
     let (posts, loading) = with_library(f.app, f.actions, |lib, _| lib.whats_new_posts(&ids)).unwrap_or_default();
-    if !posts.is_empty() || loading && !ids.is_empty() {
-        heading(ui, f, &mut y, t!("What's new"));
-        let tile = vec2(440.0 * s, 206.0 * s);
-        if posts.is_empty() {
-            for i in 0..4 {
-                let r = Rect::from_min_size(pos2(f.view.left() + f.pad + i as f32 * (tile.x + 26.0 * s), y), tile);
-                paint::skeleton(ui, &f.t, r, paint::radius(10.0 * s));
+    if posts.is_empty() && (!loading || ids.is_empty()) {
+        return;
+    }
+    heading(ui, f, y, t!("What's new"));
+    let tile = vec2(440.0 * s, 206.0 * s);
+    if posts.is_empty() {
+        for i in 0..4 {
+            let r = Rect::from_min_size(pos2(f.view.left() + f.pad + i as f32 * (tile.x + 26.0 * s), *y), tile);
+            paint::skeleton(ui, &f.t, r, paint::radius(10.0 * s));
+        }
+        *y += tile.y;
+    } else {
+        let posts: Vec<_> = posts.into_iter().take(12).collect();
+        let tiles = shelf(bp, ui, f, y, "news", posts.len(), tile, |i| Id::unique(("bp-news", posts[i].0, posts[i].1)));
+        for (i, r, hit) in tiles {
+            let (id, idx, e) = &posts[i];
+            let game = f.app.state.app_name(*id).unwrap_or_default().to_string();
+            let header = art::header(*id);
+            let urls: Vec<&str> = e.capsule.as_deref().into_iter().chain(e.header.as_deref()).chain(std::iter::once(header.as_str())).collect();
+            let age = now_unix().saturating_sub(e.time) / 86_400;
+            let when = match age {
+                0 => t!("Today").to_string(),
+                1 => t!("Yesterday").to_string(),
+                _ => ui::date(e.time),
+            };
+            wide(bp, ui, f, r, &hit, i + 2, &urls, &e.title, &format!("{game} · {when}"), f.t.text_faint);
+            if hit.focused {
+                bp.bg_want = Some(*id);
             }
-            y += tile.y;
-        } else {
-            let posts: Vec<_> = posts.into_iter().take(12).collect();
-            let tiles = shelf(bp, ui, f, &mut y, "news", posts.len(), tile, |i| Id::unique(("bp-news", posts[i].0, posts[i].1)));
-            for (i, r, hit) in tiles {
-                let (id, idx, e) = &posts[i];
-                let game = f.app.state.app_name(*id).unwrap_or_default().to_string();
-                let header = art::header(*id);
-                let urls: Vec<&str> = e.capsule.as_deref().into_iter().chain(e.header.as_deref()).chain(std::iter::once(header.as_str())).collect();
-                let age = now_unix().saturating_sub(e.time) / 86_400;
-                let when = match age {
-                    0 => t!("Today").to_string(),
-                    1 => t!("Yesterday").to_string(),
-                    _ => ui::date(e.time),
-                };
-                wide(bp, ui, f, r, &hit, i + 2, &urls, &e.title, &format!("{game} · {when}"), f.t.text_faint);
-                if hit.focused {
-                    bp.bg_want = Some(*id);
-                }
-                if hit.activated {
-                    bp.open(Page::News(*id, *idx), f.now);
-                }
+            if hit.activated {
+                bp.open(Page::News(*id, *idx), f.now);
             }
         }
-        y += 90.0 * s;
     }
-    y - top + 40.0 * s
+    *y += 90.0 * s;
 }
 
 /// Inline What's New article reader (scrolls with up/down or right stick).

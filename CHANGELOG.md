@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.0.0-rc5](https://github.com/mollie2999/Aurora/compare/v1.0.0-rc4...v1.0.0-rc5) (2026-11-25)
+
+### New
+
+* **Official Linux AppImage:** added a portable x86-64 `.AppImage` release asset with embedded Gear Lever / AppImageUpdate `.zsync` update metadata for SteamOS, Bazzite, and immutable distros. ([#92](https://github.com/mollie2999/Aurora/pull/92))
+* **Library collections:** added collapsible sidebar collections and a Steam-style collections manager for organizing your library. ([#98](https://github.com/mollie2999/Aurora/pull/98))
+* **Bundled default themes:** bundled the **Adwaita** and **Aurora Desktop** themes directly with Aurora. ([#99](https://github.com/mollie2999/Aurora/pull/99))
+* **Hide "What's new" shelf:** added a **Show What's new** toggle in Library settings (desktop and Big Picture) plus a shelf **Hide** action that hides the news shelf across default, custom-themed, and Big Picture views and stops fetching it. ([#97](https://github.com/mollie2999/Aurora/pull/97))
+
+### Fixes
+
+* **Headless `ISteamHTMLSurface` compatibility:** added `libaurora_htmlsurface.so` (`html_shim`) and `steamclient` support so `ISteamHTMLSurface::CreateBrowser` completes cleanly under the headless Steam host, fixing startup hangs in games like Microsoft Flight Simulator (2020). ([#104](https://github.com/mollie2999/Aurora/pull/104))
+* **Play/Stop button state lag:** eliminated lag updating the Play/Stop button state when launching and exiting games. ([#94](https://github.com/mollie2999/Aurora/pull/94))
+* **Flatpak packaging:** bundled `steamhost`, `libVkLayer_aurora_overlay.so`, and `libaurora_htmlsurface.so` with Flatpak releases and switched X11 access to `--socket=fallback-x11`. ([#91](https://github.com/mollie2999/Aurora/pull/91), [#103](https://github.com/mollie2999/Aurora/pull/103))
+
+### Security, reliability & performance
+
+* Hardened installscript handling, IPC (including Windows pipe spawning), launch paths, CDN/PICS, plugins, and auth; improved backup safety, depot key handling, Steam Cloud sync, installer replacement, and theme loading. ([#100](https://github.com/mollie2999/Aurora/pull/100), [#101](https://github.com/mollie2999/Aurora/pull/101))
+* Hardened GNS/P2P, overlay queues/focus/GL cache, `steamclient` IPC, `steamhost`, video ranges/HLS/ffdec, image and store caches, updater, Flatpak sandbox permissions, and CI workflow permissions. ([#102](https://github.com/mollie2999/Aurora/pull/102), [#103](https://github.com/mollie2999/Aurora/pull/103))
+
 ## [1.0.0-rc4](https://github.com/mollie2999/Aurora/compare/v1.0.0-rc3...v1.0.0-rc4) (2026-11-24)
 
 ### New

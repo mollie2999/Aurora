@@ -35,11 +35,30 @@ const UNUSED_FOR: Duration = Duration::from_secs(5);
 /// and the failed-entry set is capped to avoid unbounded growth in long sessions.
 const FAILED_TTL: Duration = Duration::from_secs(120);
 const MAX_FAILED_ENTRIES: usize = 2048;
+/// Cap retained in-memory `Entry::Ready` bytes (e.g. animated WebP/GIF) so
+/// long sessions do not grow unboundedly.
+const MAX_READY_BYTES: usize = 32 * 1024 * 1024;
+static WRITES_SINCE_TRIM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TRIM_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn maybe_schedule_trim(rt: &tokio::runtime::Handle, dir: &PathBuf) {
+    use std::sync::atomic::Ordering;
+    if WRITES_SINCE_TRIM.fetch_add(1, Ordering::Relaxed) >= 64
+        && !TRIM_RUNNING.swap(true, Ordering::AcqRel)
+    {
+        WRITES_SINCE_TRIM.store(0, Ordering::Relaxed);
+        let trim_dir = dir.clone();
+        rt.spawn_blocking(move || {
+            trim(&trim_dir);
+            TRIM_RUNNING.store(false, Ordering::Release);
+        });
+    }
+}
 
 #[derive(Clone)]
 enum Entry {
     Pending,
-    Ready(Bytes, Option<String>),
+    Ready(Bytes, Option<String>, std::time::Instant),
     /// `disk_cached`: true for persistent 403/404/410 `.missing` markers; false
     /// for transient failures that should auto-retry after `FAILED_TTL`.
     Failed { err: String, at: std::time::Instant, disk_cached: bool },
@@ -72,7 +91,9 @@ pub fn size() -> u64 {
 
 /// Delete every saved picture (Settings → Storage).
 pub fn clear(ctx: &egui::Context) {
-    let _ = std::fs::remove_dir_all(dir());
+    let d = dir();
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::create_dir_all(&d);
     ctx.forget_all_images();
 }
 
@@ -132,7 +153,7 @@ impl BytesLoader for ImageCache {
             if let Some(e) = map.get(uri) {
                 match e {
                     Entry::Pending => return Ok(BytesPoll::Pending { size: None }),
-                    Entry::Ready(bytes, mime) => return Ok(BytesPoll::Ready { size: None, bytes: bytes.clone(), mime: mime.clone() }),
+                    Entry::Ready(bytes, mime, _) => return Ok(BytesPoll::Ready { size: None, bytes: bytes.clone(), mime: mime.clone() }),
                     Entry::Failed { err, at, disk_cached } => {
                         let ttl = if *disk_cached { FRESH_FOR } else { FAILED_TTL };
                         let elapsed = at.elapsed();
@@ -152,8 +173,9 @@ impl BytesLoader for ImageCache {
             map.insert(uri.to_string(), Entry::Pending);
         }
         let (uri, ctx) = (uri.to_string(), ctx.clone());
+        let cache_dir = self.dir.clone();
         let path = self.dir.join(Self::key(&uri));
-        let (http, slots, entries) = (self.http.clone(), self.slots.clone(), self.entries.clone());
+        let (http, slots, entries, rt_handle) = (self.http.clone(), self.slots.clone(), self.entries.clone(), self.rt.clone());
         self.rt.spawn(async move {
             let done = |e: Entry| {
                 let mut map = entries.lock().unwrap();
@@ -183,6 +205,27 @@ impl BytesLoader for ImageCache {
                     }
                 }
                 map.insert(uri.clone(), e);
+                let mut ready_bytes: usize = map
+                    .values()
+                    .map(|v| if let Entry::Ready(b, _, _) = v { b.len() } else { 0 })
+                    .sum();
+                if ready_bytes > MAX_READY_BYTES {
+                    let mut oldest: Vec<(std::time::Instant, usize, String)> = map
+                        .iter()
+                        .filter_map(|(k, v)| match v {
+                            Entry::Ready(b, _, at) if k != &uri => Some((*at, b.len(), k.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    oldest.sort_unstable_by_key(|(at, _, _)| *at);
+                    for (_, len, k) in oldest {
+                        if ready_bytes <= MAX_READY_BYTES / 2 {
+                            break;
+                        }
+                        map.remove(&k);
+                        ready_bytes = ready_bytes.saturating_sub(len);
+                    }
+                }
                 ctx.request_repaint();
             };
             // 1. Check disk cache off the async worker threads so bursts of cached
@@ -217,7 +260,7 @@ impl BytesLoader for ImageCache {
 
             let (has_saved, meta) = match disk {
                 DiskHit::Fresh(bytes, mime) => {
-                    done(Entry::Ready(Bytes::from(bytes), mime));
+                    done(Entry::Ready(Bytes::from(bytes), mime, std::time::Instant::now()));
                     return;
                 }
                 DiskHit::KnownMissing(status) => {
@@ -226,7 +269,7 @@ impl BytesLoader for ImageCache {
                 }
                 DiskHit::Stale(bytes, meta) => {
                     let mime = meta.mime.clone();
-                    done(Entry::Ready(Bytes::from(bytes), mime));
+                    done(Entry::Ready(Bytes::from(bytes), mime, std::time::Instant::now()));
                     (true, meta)
                 }
                 DiskHit::Miss => (false, Meta::default()),
@@ -265,9 +308,12 @@ impl BytesLoader for ImageCache {
                         Ok(bytes) => {
                             let shared = Bytes::from(bytes);
                             let mime = meta.mime.clone();
-                            done(Entry::Ready(shared.clone(), mime));
+                            done(Entry::Ready(shared.clone(), mime, std::time::Instant::now()));
                             let write_path = path.clone();
                             let _ = tokio::task::spawn_blocking(move || {
+                                if let Some(parent) = write_path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
                                 let tmp = write_path.with_extension("part");
                                 if std::fs::write(&tmp, &shared[..]).is_ok() {
                                     let _ = std::fs::rename(&tmp, &write_path);
@@ -275,6 +321,7 @@ impl BytesLoader for ImageCache {
                                 }
                             })
                             .await;
+                            maybe_schedule_trim(&rt_handle, &cache_dir);
                         }
                         Err(e) if !has_saved => done(Entry::Failed { err: e, at: std::time::Instant::now(), disk_cached: false }),
                         Err(_) => {}
@@ -288,9 +335,13 @@ impl BytesLoader for ImageCache {
                         let missing = path.with_extension("missing");
                         let text = status.to_string();
                         let _ = tokio::task::spawn_blocking(move || {
+                            if let Some(parent) = missing.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
                             let _ = std::fs::write(&missing, text);
                         })
                         .await;
+                        maybe_schedule_trim(&rt_handle, &cache_dir);
                     }
                     done(Entry::Failed { err: format!("HTTP {status}"), at: std::time::Instant::now(), disk_cached });
                 }
@@ -311,7 +362,7 @@ impl BytesLoader for ImageCache {
     }
 
     fn byte_size(&self) -> usize {
-        self.entries.lock().unwrap().values().map(|e| if let Entry::Ready(b, _) = e { b.len() } else { 0 }).sum()
+        self.entries.lock().unwrap().values().map(|e| if let Entry::Ready(b, _, _) = e { b.len() } else { 0 }).sum()
     }
 }
 
@@ -399,17 +450,29 @@ impl egui::load::TextureLoader for UnloadUnused {
     }
 }
 
-/// Delete the oldest pictures until the folder is under 80% of the limit.
+/// Delete expired `.missing` markers and the oldest pictures until the folder
+/// is under 80% of the limit.
 fn trim(dir: &PathBuf) {
     let Ok(read) = std::fs::read_dir(dir) else { return };
-    let mut files: Vec<(SystemTime, u64, PathBuf)> = read
-        .flatten()
-        .filter(|e| e.path().extension().is_none())
-        .filter_map(|e| {
-            let m = e.metadata().ok()?;
-            Some((m.modified().ok()?, m.len(), e.path()))
-        })
-        .collect();
+    let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    for e in read.flatten() {
+        let path = e.path();
+        match path.extension().and_then(|s| s.to_str()) {
+            Some("missing") => {
+                if age(&path).is_some_and(|a| a >= FRESH_FOR) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            None => {
+                if let Ok(m) = e.metadata()
+                    && let Ok(mod_t) = m.modified()
+                {
+                    files.push((mod_t, m.len(), path));
+                }
+            }
+            _ => {}
+        }
+    }
     let mut total: u64 = files.iter().map(|f| f.1).sum();
     if total <= MAX_BYTES {
         return;

@@ -320,7 +320,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aurora"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "client",
  "directories",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "auth"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "base64 0.22.1",
  "net",
@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "client"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "auth",
  "depot",
@@ -716,6 +716,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.10.7",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1062,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "depot"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -1555,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "extensions"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "client",
  "egui",
@@ -2353,6 +2354,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "html_shim"
+version = "1.0.0-rc5"
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2478,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "i18n"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "sys-locale",
  "toml 1.2.1+spec-1.1.0",
@@ -2645,7 +2650,7 @@ dependencies = [
 
 [[package]]
 name = "installer"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "directories",
  "eframe",
@@ -2653,6 +2658,7 @@ dependencies = [
  "flate2",
  "i18n",
  "rfd",
+ "tempfile",
  "ui",
  "windows-sys 0.61.2",
  "winresource",
@@ -2975,7 +2981,7 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "local"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "directories",
  "fs4",
@@ -3149,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "serde",
 ]
@@ -3276,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "net"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "flate2",
  "futures-util",
@@ -4039,7 +4045,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plugins"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "model",
  "rhai",
@@ -4305,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "prost",
  "prost-build",
@@ -5274,7 +5280,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "steamclient"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "aes-gcm",
  "crc32fast",
@@ -5294,14 +5300,14 @@ dependencies = [
 
 [[package]]
 name = "steamhost"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "store"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "model",
  "reqwest",
@@ -5431,7 +5437,7 @@ dependencies = [
 
 [[package]]
 name = "themes"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "egui",
  "flate2",
@@ -5440,6 +5446,7 @@ dependencies = [
  "rhai",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "toml 1.2.1+spec-1.1.0",
  "tracing",
@@ -5959,7 +5966,7 @@ dependencies = [
 
 [[package]]
 name = "ui"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "eframe",
  "egui",
@@ -6099,7 +6106,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vdf"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -6145,7 +6152,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "egui",
  "i18n",
@@ -6159,7 +6166,7 @@ dependencies = [
 
 [[package]]
 name = "vk_overlay"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 
 [[package]]
 name = "walkdir"
@@ -7058,7 +7065,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "1.0.0-rc4"
+version = "1.0.0-rc5"
 dependencies = [
  "sha2",
  "zip",

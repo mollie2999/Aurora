@@ -119,6 +119,7 @@ pub struct State {
     pub group_bans: HashMap<GroupChatId, Result<Vec<GroupBanInfo>, String>>,
     /// Member search results for large/virtualized groups.
     pub group_member_search: HashMap<GroupChatId, Vec<Persona>>,
+    pub launching: Option<AppId>,
     pub playing: Option<AppId>,
     /// The running game's lobby, if it's in one ("Invite to lobby").
     pub game_lobby: Option<u64>,
@@ -323,8 +324,11 @@ impl State {
             Event::CloudSyncing { app_id } => {
                 self.cloud_syncing.insert(*app_id);
             }
-            Event::CloudReport { report, .. } => {
+            Event::CloudReport { report, held_launch } => {
                 self.cloud_syncing.remove(&report.app_id);
+                if held_launch.is_some() && self.launching == Some(report.app_id) {
+                    self.launching = None;
+                }
                 self.cloud.insert(report.app_id, report.clone());
             }
             Event::Notifications(n) => {
@@ -653,7 +657,13 @@ impl State {
             }
             // A developer attaching a game by hand: nothing to show.
             Event::GameAttached { .. } | Event::GameOverlay { .. } => {}
+            Event::GameLaunching { app_id } => {
+                self.launching = Some(*app_id);
+            }
             Event::GameStarted { app_id } => {
+                if self.launching == Some(*app_id) {
+                    self.launching = None;
+                }
                 self.playing = Some(*app_id);
                 self.game_lobby = None;
                 self.game_connect = None;
@@ -661,13 +671,23 @@ impl State {
                 let me = self.steam_id;
                 self.personas.entry(me).or_insert_with(|| Persona { steam_id: me, ..Default::default() }).game_app_id = Some(*app_id);
             }
-            Event::GameStopped { .. } => {
-                self.playing = None;
-                self.game_lobby = None;
-                self.game_connect = None;
-                if let Some(p) = self.personas.get_mut(&self.steam_id) {
-                    p.game_app_id = None;
-                    p.game_name = None;
+            Event::GameStopped { app_id } => {
+                if self.launching == Some(*app_id) {
+                    self.launching = None;
+                }
+                if self.playing == Some(*app_id) {
+                    self.playing = None;
+                    self.game_lobby = None;
+                    self.game_connect = None;
+                    if let Some(p) = self.personas.get_mut(&self.steam_id) {
+                        p.game_app_id = None;
+                        p.game_name = None;
+                    }
+                }
+            }
+            Event::AntiCheatWarning { app_id, .. } => {
+                if self.launching == Some(*app_id) {
+                    self.launching = None;
                 }
             }
             Event::GameLobby { app_id, lobby } if self.playing == Some(*app_id) => self.game_lobby = *lobby,
@@ -676,8 +696,18 @@ impl State {
             Event::LoggedOut { reason } => {
                 *self = State { last_error: Some(reason.clone()), ..Default::default() };
             }
-            Event::Error(msg) => self.last_error = Some(msg.clone()),
-            Event::KeyActivated(_) | Event::WorkshopUnsubscribed { .. } | Event::StoreError(_) => {}
+            Event::Error(msg) => {
+                if self.playing.is_none() {
+                    self.launching = None;
+                }
+                self.last_error = Some(msg.clone());
+            }
+            Event::StoreError(_) => {
+                if self.playing.is_none() {
+                    self.launching = None;
+                }
+            }
+            Event::KeyActivated(_) | Event::WorkshopUnsubscribed { .. } => {}
             Event::WorkshopResults { .. } | Event::WorkshopSubscribed { .. } | Event::WorkshopSync { .. } | Event::FreeLicense { .. } => {}
             Event::Download(d) => {
                 self.downloads.insert(d.app_id, d.clone());
@@ -735,7 +765,7 @@ impl State {
             Event::Link(l) => self.link = *l,
             Event::OfflinePlaytime(list) => self.offline_playtime = list.iter().map(|&(a, total, pending)| (a, (total, pending))).collect(),
             Event::CloudPending(list) => self.cloud_pending = list.iter().copied().collect(),
-            Event::CloudSkipped { .. } | Event::AntiCheatWarning { .. } => {}
+            Event::CloudSkipped { .. } => {}
             Event::InputConfigInspected { .. }
             | Event::ControllerLayouts { .. }
             | Event::ControllerLayoutDownloaded { .. }
@@ -1047,5 +1077,39 @@ mod group_tests {
         assert_eq!(r.fraction(), 0.8);
         s.apply(&Event::RestoreFinished { result: Err("cancelled".into()) });
         assert!(s.restoring.is_none());
+    }
+
+    #[test]
+    fn tracks_game_launching_and_playing_transitions() {
+        let mut s = State::default();
+        s.apply(&Event::GameLaunching { app_id: 730 });
+        assert_eq!(s.launching, Some(730));
+        assert_eq!(s.playing, None);
+
+        s.apply(&Event::GameStarted { app_id: 730 });
+        assert_eq!(s.launching, None);
+        assert_eq!(s.playing, Some(730));
+
+        // Unrelated GameStopped does not clear active playing app.
+        s.apply(&Event::GameStopped { app_id: 440 });
+        assert_eq!(s.playing, Some(730));
+
+        s.apply(&Event::GameStopped { app_id: 730 });
+        assert_eq!(s.playing, None);
+
+        // Launch failure clears launching state.
+        s.apply(&Event::GameLaunching { app_id: 570 });
+        s.apply(&Event::Error("failed".into()));
+        assert_eq!(s.launching, None);
+
+        // Anti-cheat warning pauses launch and clears launching state.
+        s.apply(&Event::GameLaunching { app_id: 570 });
+        s.apply(&Event::AntiCheatWarning {
+            app_id: 570,
+            install_dir: std::path::PathBuf::new(),
+            args: crate::LaunchArgs::default(),
+            skip_cloud: false,
+        });
+        assert_eq!(s.launching, None);
     }
 }

@@ -200,7 +200,7 @@ pub(crate) async fn query(conn: &Connection, app_id: AppId, cursor: Option<Commu
         if !items.is_empty() {
             return Ok(CommunityPage { items, next });
         }
-        last_page = CommunityPage { items, next: None };
+        last_page = CommunityPage { items, next };
     }
     Ok(last_page)
 }

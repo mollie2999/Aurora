@@ -135,20 +135,45 @@ impl Cdn {
         }
     }
 
-    async fn get(&self, path: &str) -> Result<Vec<u8>> {
+const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+
+    async fn get(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
         let mut last = None;
         for attempt in 0..5 {
             let s = self.pick(attempt)?;
             let url = format!("https://{}{}", s.host, path);
             let start = Instant::now();
             match self.http.get(&url).send().await.and_then(|r| r.error_for_status()) {
-                Ok(r) => match r.bytes().await {
-                    Ok(b) => {
-                        self.record(&s.host, b.len(), start.elapsed());
-                        return Ok(Vec::from(b));
+                Ok(mut r) => {
+                    if r.content_length().is_some_and(|n| n > max_bytes as u64) {
+                        return Err(Error::Format(format!("CDN response exceeds {} byte limit", max_bytes)));
                     }
-                    Err(e) => last = Some(e),
-                },
+                    let cap = r.content_length().map(|n| (n as usize).min(max_bytes)).unwrap_or(0);
+                    let mut buf = Vec::with_capacity(cap);
+                    let mut stream_err = None;
+                    loop {
+                        match r.chunk().await {
+                            Ok(Some(chunk)) => {
+                                if buf.len().saturating_add(chunk.len()) > max_bytes {
+                                    return Err(Error::Format(format!("CDN response exceeds {} byte limit", max_bytes)));
+                                }
+                                buf.extend_from_slice(&chunk);
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                stream_err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = stream_err {
+                        last = Some(e);
+                    } else {
+                        self.record(&s.host, buf.len(), start.elapsed());
+                        return Ok(buf);
+                    }
+                }
                 Err(e) => {
                     if e.status().map(|s| s.as_u16()) == Some(401) || e.status().map(|s| s.as_u16()) == Some(403) {
                         return Err(Error::Http(e));
@@ -168,11 +193,11 @@ impl Cdn {
         } else {
             format!("/depot/{depot}/manifest/{gid}/5")
         };
-        self.get(&path).await
+        self.get(&path, Self::MAX_MANIFEST_BYTES).await
     }
 
     pub async fn chunk(&self, depot: u32, sha: &[u8]) -> Result<Vec<u8>> {
-        self.get(&format!("/depot/{depot}/chunk/{}", crate::chunk::hex(sha))).await
+        self.get(&format!("/depot/{depot}/chunk/{}", crate::chunk::hex(sha)), Self::MAX_CHUNK_BYTES).await
     }
 }
 

@@ -830,7 +830,7 @@ fn is_ancestor_of(x11: &X11, dpy: *mut Display, maybe_anc: Window, mut child: Wi
 }
 
 fn window_has_focus(x11: &X11, dpy: *mut Display, win: Window, shield: Window) -> bool {
-    let Some(get_focus) = x11.XGetInputFocus else { return true };
+    let Some(get_focus) = x11.XGetInputFocus else { return false };
     let mut focus: Window = 0;
     let mut revert: c_int = 0;
     unsafe { get_focus(dpy, &mut focus, &mut revert) };
@@ -841,7 +841,7 @@ fn window_has_focus(x11: &X11, dpy: *mut Display, win: Window, shield: Window) -
     if focus == win || (shield != 0 && focus == shield) {
         return true;
     }
-    is_ancestor_of(x11, dpy, focus, win) || is_ancestor_of(x11, dpy, win, focus)
+    is_ancestor_of(x11, dpy, win, focus)
 }
 
 unsafe fn create_shield(x11: &X11, dpy: *mut Display, win: Window, win_w: u32, win_h: u32, arrow_cursor: Cursor) -> Window {
@@ -869,11 +869,12 @@ unsafe fn create_shield(x11: &X11, dpy: *mut Display, win: Window, win_w: u32, w
 }
 
 unsafe fn try_grab_ptr(x11: &X11, dpy: *mut Display, shield: Window, win: Window, ptr_mask: c_uint, arrow_cursor: Cursor) -> (bool, c_int) {
+    if !window_has_focus(x11, dpy, win, shield) { return (false, 3); }
     let primary = if shield != 0 { shield } else { win };
     let mut code = unsafe {
         (x11.XGrabPointer)(dpy, primary, 0, ptr_mask, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC, 0, arrow_cursor, CURRENT_TIME)
     };
-    if code != GRAB_SUCCESS && shield != 0 && shield != win {
+    if code != GRAB_SUCCESS && shield != 0 && shield != win && window_has_focus(x11, dpy, win, shield) {
         let fb = unsafe {
             (x11.XGrabPointer)(dpy, win, 0, ptr_mask, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC, 0, arrow_cursor, CURRENT_TIME)
         };
@@ -885,11 +886,12 @@ unsafe fn try_grab_ptr(x11: &X11, dpy: *mut Display, shield: Window, win: Window
 }
 
 unsafe fn try_grab_kbd(x11: &X11, dpy: *mut Display, shield: Window, win: Window) -> (bool, c_int) {
+    if !window_has_focus(x11, dpy, win, shield) { return (false, 3); }
     let primary = if shield != 0 { shield } else { win };
     let mut code = unsafe {
         (x11.XGrabKeyboard)(dpy, primary, 0, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC, CURRENT_TIME)
     };
-    if code != GRAB_SUCCESS && shield != 0 && shield != win {
+    if code != GRAB_SUCCESS && shield != 0 && shield != win && window_has_focus(x11, dpy, win, shield) {
         let fb = unsafe {
             (x11.XGrabKeyboard)(dpy, win, 0, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC, CURRENT_TIME)
         };
@@ -1056,10 +1058,11 @@ fn input_loop() {
             let esc_down = key_down(&keymap, kc_esc);
             let shot_down = combo_matches(&keymap, cur_sh.0, cur_sh.2, mods_kc);
             let (ov_rise, _, shot_rise) = latch.poll(ov_down, esc_down, shot_down);
-            if shot_rise {
+            let focused = (ov_rise || shot_rise) && window_has_focus(&x11, dpy, ACTIVE_WINDOW.load(Ordering::Relaxed) as Window, 0);
+            if shot_rise && focused {
                 shared().request_screenshot();
             }
-            if ov_rise {
+            if ov_rise && focused {
                 shared().notify_opened(true);
                 break;
             }
@@ -1094,6 +1097,10 @@ fn input_loop() {
             }
         };
 
+        if !window_has_focus(&x11, dpy, win, 0) {
+            shared().notify_opened(false);
+            continue;
+        }
         let (mut win_w, mut win_h) = query_geom(win);
         let arrow_cursor = x11.XCreateFontCursor.map(|f| unsafe { f(dpy, XC_LEFT_PTR) }).unwrap_or(0);
         // Create a child InputOnly shield window inside `win` (NOT a top-level

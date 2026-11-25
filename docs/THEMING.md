@@ -2,19 +2,21 @@
 
 Aurora includes a **Declarative Theme Engine** inspired by Millennium and CSS box-model layouts. A theme is a self-contained folder (or `.zip` package) that can restyle colors and typography, completely rearrange the window chrome and library layout via `layout.toml`, expose user-configurable `[options.*]`, bundle custom fonts/backgrounds/logos, and draw custom ambient effects with sandboxed `theme.rhai` scripts.
 
-Two complete packages are included:
+Two complete packages are bundled with Aurora and automatically installed on launch (for both fresh installs and updates):
 
 - [Aurora Desktop (Steam replica)](examples/steam-replica/README.md): Steam-style chrome and library shelves, with Modern, Classic Blue and VGUI Olive palettes.
 - [Adwaita](examples/adwaita/README.md): compact AdwSteamGtk-inspired chrome around Aurora's default library, with optional native GTK4/libadwaita styling on Linux.
 
-To create installable ZIPs from a checkout, run these commands from the repository root (Python 3 is only needed to package the files):
+Open **Settings → Appearance** to activate either theme right away. If you uninstall a bundled theme and later want it back, click **Restore Built-in Themes** in **Settings → Appearance**.
+
+To package a modified copy from a repository checkout as an installable ZIP (Python 3 is only needed to create the archive):
 
 ```sh
 python3 -m zipfile -c steam-replica-theme.zip docs/examples/steam-replica
 python3 -m zipfile -c adwaita-theme.zip docs/examples/adwaita
 ```
 
-Install either ZIP through **Settings → Appearance → Install Theme…**, then activate it. Keep Adwaita's bundled fonts and license files in the package.
+Install a custom ZIP through **Settings → Appearance → Install Theme…**, then activate it. Keep Adwaita's bundled fonts and license files in the package.
 
 ---
 

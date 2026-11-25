@@ -64,8 +64,8 @@ pub use input_config::{
 };
 pub use pads::{
     ConnectedPadSummary, ConnectionKind, ControllerFamily, ControllerSettings, DetectedController, DetectionSnapshot,
-    FamilyToggles, LauncherPadFrame, LauncherPadSample, LiveInput, PadCalibration, SteamInputDecision, app_controller,
-    connected_summary as connected_pad_summary, effective_controller_override, poll_ui as poll_controllers,
+    FamilyToggles, LauncherPadFrame, LauncherPadSample, LiveInput, PadCalibration, SteamInputDecision, TouchpadFinger,
+    app_controller, connected_summary as connected_pad_summary, effective_controller_override, poll_ui as poll_controllers,
     refresh_ui as refresh_controllers, resolve_steam_input, set_app_controller, set_app_controllers,
     set_settings as set_controller_settings, settings as controller_settings, subscribe_launcher_pads,
     trigger_test_rumble, virtual_pad_available, virtual_pad_backend, virtual_pad_hint,
@@ -551,6 +551,8 @@ pub enum Event {
     Personas(Vec<Persona>),
     /// Names of games outside your library (e.g. what friends are playing).
     AppNames(Vec<(AppId, String)>),
+    /// A game has been asked to launch and is preparing (workshop/cloud/host startup).
+    GameLaunching { app_id: AppId },
     GameStarted { app_id: AppId },
     /// The `STEAMINRUST_IPC` value for a game started by hand ([`Command::AttachGame`]).
     GameAttached { app_id: AppId, env: String },

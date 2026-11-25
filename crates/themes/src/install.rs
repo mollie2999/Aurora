@@ -273,11 +273,21 @@ fn read_zip_string(archive: &mut zip::ZipArchive<File>, idx: usize) -> Result<St
     String::from_utf8(buf).map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidData, e)))
 }
 
-fn commit_tmp_dir(tmp_dir: &Path, final_dir: &Path) -> Result<(), Error> {
-    if final_dir.exists() {
-        fs::remove_dir_all(final_dir)?;
+pub(crate) fn commit_tmp_dir(tmp_dir: &Path, final_dir: &Path) -> Result<(), Error> {
+    if !final_dir.try_exists()? {
+        return Ok(fs::rename(tmp_dir, final_dir)?);
     }
-    fs::rename(tmp_dir, final_dir)?;
+    let holder = tempfile::Builder::new().prefix(".theme-backup-").tempdir_in(final_dir.parent().unwrap_or(Path::new(".")))?;
+    let backup = holder.path().join("previous");
+    fs::rename(final_dir, &backup)?;
+    if let Err(e) = fs::rename(tmp_dir, final_dir) {
+        if let Err(restore) = fs::rename(&backup, final_dir) {
+            let recovery = holder.keep();
+            return Err(Error::Io(io::Error::other(format!("{e}; restore failed: {restore}; backup in {}", recovery.display()))));
+        }
+        return Err(Error::Io(e));
+    }
+    holder.close()?;
     Ok(())
 }
 

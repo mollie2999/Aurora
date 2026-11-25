@@ -193,22 +193,76 @@ impl Connection {
     }
 
     /// Like [`request`](Self::request), but collects replies until `done` says
-    /// the last one arrived (PICS sends large answers in several parts).
+    /// the last one arrived (PICS sends large answers in several parts), bounded
+    /// by a total deadline, packet count, and aggregate byte budget.
     pub async fn request_many(
         &self,
         emsg: u32,
         body: &impl Message,
         done: impl Fn(&Packet) -> bool,
     ) -> Result<Vec<Packet>> {
+        const MAX_MULTI_TIMEOUT: Duration = Duration::from_secs(120);
+        const MAX_MULTI_PACKETS: usize = 256;
+        const MAX_MULTI_BYTES: usize = 128 * 1024 * 1024;
         let (id, mut rx, _guard) = self.start_job();
         let header = CMsgProtoBufHeader { jobid_source: Some(id), ..Default::default() };
         self.send_with(emsg, header, body)?;
+        let total_deadline = tokio::time::Instant::now() + MAX_MULTI_TIMEOUT;
         let mut out = Vec::new();
+        let mut total_bytes = 0usize;
         loop {
-            match tokio::time::timeout(DEFAULT_TIMEOUT, rx.recv()).await {
+            let now = tokio::time::Instant::now();
+            let Some(rem) = total_deadline.checked_duration_since(now) else {
+                return Err(Error::Timeout);
+            };
+            match tokio::time::timeout(DEFAULT_TIMEOUT.min(rem), rx.recv()).await {
                 Ok(Some(p)) => {
+                    total_bytes = total_bytes.saturating_add(p.body.len());
+                    if out.len() >= MAX_MULTI_PACKETS || total_bytes > MAX_MULTI_BYTES {
+                        return Err(Error::Timeout);
+                    }
                     let finished = done(&p);
                     out.push(p);
+                    if finished {
+                        return Ok(out);
+                    }
+                }
+                Ok(None) => return Err(Error::Disconnected),
+                Err(_) => return Err(Error::Timeout),
+            }
+        }
+    }
+
+    /// Like [`request_many`](Self::request_many), decoding each packet once into `T`.
+    pub async fn request_many_decoded<T: Message + Default>(
+        &self,
+        emsg: u32,
+        body: &impl Message,
+        done: impl Fn(&T) -> bool,
+    ) -> Result<Vec<T>> {
+        const MAX_MULTI_TIMEOUT: Duration = Duration::from_secs(120);
+        const MAX_MULTI_PACKETS: usize = 256;
+        const MAX_MULTI_BYTES: usize = 128 * 1024 * 1024;
+        let (id, mut rx, _guard) = self.start_job();
+        let header = CMsgProtoBufHeader { jobid_source: Some(id), ..Default::default() };
+        self.send_with(emsg, header, body)?;
+        let total_deadline = tokio::time::Instant::now() + MAX_MULTI_TIMEOUT;
+        let mut out = Vec::new();
+        let mut total_bytes = 0usize;
+        loop {
+            let now = tokio::time::Instant::now();
+            let Some(rem) = total_deadline.checked_duration_since(now) else {
+                return Err(Error::Timeout);
+            };
+            match tokio::time::timeout(DEFAULT_TIMEOUT.min(rem), rx.recv()).await {
+                Ok(Some(p)) => {
+                    total_bytes = total_bytes.saturating_add(p.body.len());
+                    if out.len() >= MAX_MULTI_PACKETS || total_bytes > MAX_MULTI_BYTES {
+                        return Err(Error::Timeout);
+                    }
+                    let decoded: T = p.body()?;
+                    let finished = done(&decoded);
+                    out.push(decoded);
                     if finished {
                         return Ok(out);
                     }

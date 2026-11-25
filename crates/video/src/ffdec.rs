@@ -10,7 +10,7 @@ use std::collections::BinaryHeap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::OnceLock;
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -71,7 +71,7 @@ impl Proc {
             .map_err(|e| format!("couldn't start ffmpeg: {e}"))?;
         let stdin = child.stdin.take();
         let mut stdout = child.stdout.take().ok_or("ffmpeg has no stdout")?;
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(8);
         std::thread::Builder::new()
             .name("video-ffmpeg-out".into())
             .spawn(move || {
@@ -217,7 +217,7 @@ impl H264 {
         // reordering), wait a little for each picture so they come out
         // while a segment decodes, not all at its end. Never forever: a
         // stream that holds more frames just runs a bit later.
-        let mut in_flight = self.pending.len() - got.len();
+        let mut in_flight = self.pending.len().saturating_sub(got.len());
         while in_flight > IN_FLIGHT {
             match p.out.recv_timeout(std::time::Duration::from_millis(250)) {
                 Ok(b) => {

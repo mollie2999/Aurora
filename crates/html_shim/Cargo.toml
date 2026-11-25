@@ -1,0 +1,13 @@
+[package]
+name = "html_shim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Linux LD_PRELOAD shim completing ISteamHTMLSurface::CreateBrowser when running under Aurora's headless steamhost (without steamwebhelper)"
+
+[lib]
+name = "aurora_htmlsurface"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]

@@ -4,13 +4,8 @@
 //! `IDXGISwapChain::Present` / `Present1` / `ResizeBuffers` / `ResizeBuffers1`
 //! hooks already intercept D3D12 frames and hand non-D3D11 swap chains here.
 //!
-//! Because `IDXGISwapChain` does not expose its `ID3D12CommandQueue`, we patch
-//! `ID3D12CommandQueue::ExecuteCommandLists` (vtable slot 10, W^X-safe) once
-//! `d3d12.dll` is loaded and record the Direct queue associated with each
-//! `ID3D12Device`. We then submit our own self-contained D3D12 command list
-//! (root signature + PSO + shader-visible SRV heap + fence) directly on that
-//! queue before the real `Present` runs — no `D3D11On12` dependency, so this
-//! works on both Windows and Linux Proton (VKD3D-Proton).
+//! Capture the Direct queue passed to DXGI at swapchain creation. DXGI private
+//! interface data ties its reference to the lifetime of that specific chain.
 
 use super::util::{self, Backend};
 use super::{Frame, TexOp, shared};
@@ -18,97 +13,77 @@ use crate::overlay::wire::VERTEX_SIZE;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, RECT};
-use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::Graphics::Dxgi::{IDXGISwapChain, IDXGISwapChain3};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory2, IDXGISwapChain, IDXGISwapChain3};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::{HRESULT, Interface, s, w};
 
-type ExecuteCommandListsFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
-
-static REAL_EXECUTE: AtomicUsize = AtomicUsize::new(0);
-
-/// `ID3D12CommandQueue::ExecuteCommandLists` vtable slot:
-/// IUnknown (0..2), ID3D12Object (3..6), ID3D12DeviceChild (7),
-/// UpdateTileMappings (8), CopyTileMappings (9), ExecuteCommandLists (10).
-const SLOT_EXECUTE_COMMAND_LISTS: usize = 10;
-
+type Raw = *mut c_void;
 const MAX_SRVS: usize = 256;
-
-/// Captured Direct command queues keyed by `ID3D12Device` raw pointer.
-static QUEUES: LazyLock<Mutex<HashMap<usize, ID3D12CommandQueue>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-/// Lock-free fast-path pointer for a already-captured Direct command queue.
-/// Safe against ABA reuse because `QUEUES` holds a strong COM reference to it.
-static KNOWN_DIRECT_QUEUE: AtomicUsize = AtomicUsize::new(0);
+const QUEUE_KEY: windows::core::GUID = windows::core::GUID::from_u128(0xa72ab65f_51bb_460f_af69_86a63ffc7349);
 static RENDERER: Mutex<Option<D3d12Renderer>> = Mutex::new(None);
 
-/// Install the `ID3D12CommandQueue::ExecuteCommandLists` vtable hook if
-/// `d3d12.dll` is already loaded in the process. Safe to call repeatedly.
-pub fn install_if_loaded() -> bool {
-    if REAL_EXECUTE.load(Ordering::Acquire) != 0 {
-        return true;
-    }
-    unsafe {
-        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-        let Ok(module) = GetModuleHandleW(w!("d3d12.dll")) else {
-            return false;
-        };
-        type CreateDeviceFn = unsafe extern "system" fn(*mut c_void, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
-        let Some(p) = GetProcAddress(module, s!("D3D12CreateDevice")) else {
-            return false;
-        };
-        let create_device: CreateDeviceFn = std::mem::transmute(p);
-        let mut dev_raw: *mut c_void = std::ptr::null_mut();
-        let hr = create_device(std::ptr::null_mut(), D3D_FEATURE_LEVEL_11_0, &ID3D12Device::IID, &mut dev_raw);
-        if hr.is_err() || dev_raw.is_null() {
-            return false;
+macro_rules! creation_hook {
+    ($hook:ident, $original:ident, $($arg:ident),+) => {
+        static $original: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn $hook(this: Raw, device: Raw, $($arg: Raw,)+ out: *mut Raw) -> HRESULT {
+            // DXGI creation arguments between pDevice and ppSwapChain are all pointers or HWNDs.
+            let real: unsafe extern "system" fn(Raw, Raw, $(creation_hook!(@type $arg),)+ *mut Raw) -> HRESULT =
+                unsafe { std::mem::transmute($original.load(Ordering::Acquire)) };
+            let hr = unsafe { real(this, device, $($arg,)+ out) };
+            if hr.is_ok() && !out.is_null() {
+                unsafe { associate(*out, device) };
+            }
+            hr
         }
-        let device = ID3D12Device::from_raw(dev_raw);
-        let qdesc = D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
-            Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
-            NodeMask: 0,
-        };
-        let Ok(queue): windows::core::Result<ID3D12CommandQueue> = device.CreateCommandQueue(&qdesc) else {
-            return false;
-        };
-        let vtable = *(queue.as_raw() as *mut *mut usize);
-        if util::patch_vtable(vtable, SLOT_EXECUTE_COMMAND_LISTS, hook_execute_command_lists as *const () as usize, &REAL_EXECUTE) {
-            crate::log!("overlay: D3D12 command queue hook in");
-            true
-        } else {
-            false
-        }
+    };
+    (@type $arg:ident) => { Raw };
+}
+creation_hook!(create_chain, CREATE, desc);
+creation_hook!(create_hwnd, HWND_CREATE, hwnd, desc, fullscreen, output);
+creation_hook!(create_core, CORE_CREATE, window, desc, output);
+creation_hook!(create_composition, COMPOSITION_CREATE, desc, output);
+
+unsafe fn associate(chain: Raw, device: Raw) {
+    let Some(sc) = (unsafe { IDXGISwapChain::from_raw_borrowed(&chain) }) else { return };
+    let Some(dev) = (unsafe { windows::core::IUnknown::from_raw_borrowed(&device) }) else { return };
+    if let Ok(q) = dev.cast::<ID3D12CommandQueue>()
+        && unsafe { q.GetDesc() }.Type == D3D12_COMMAND_LIST_TYPE_DIRECT
+    {
+        let _ = unsafe { sc.SetPrivateDataInterface(&QUEUE_KEY, &q) };
     }
 }
 
-unsafe extern "system" fn hook_execute_command_lists(this: *mut c_void, count: u32, lists: *const *mut c_void) {
-    let this_addr = this as usize;
-    if this_addr != 0 && KNOWN_DIRECT_QUEUE.load(Ordering::Acquire) != this_addr {
-        let _ = std::panic::catch_unwind(|| unsafe {
-            if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&this) {
-                if q.GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
-                    let mut dev: Option<ID3D12Device> = None;
-                    if q.GetDevice(&mut dev).is_ok() {
-                        if let Some(dev) = dev {
-                            if let Ok(mut map) = QUEUES.lock() {
-                                let stored = map.entry(dev.as_raw() as usize).or_insert_with(|| q.clone());
-                                KNOWN_DIRECT_QUEUE.store(stored.as_raw() as usize, Ordering::Release);
-                            }
-                        }
-                    }
-                }
-            }
-        });
+pub fn install_if_loaded() -> bool {
+    static INSTALLED: Mutex<bool> = Mutex::new(false);
+    let mut installed = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
+    if *installed { return true; }
+    unsafe {
+        if windows::Win32::System::LibraryLoader::GetModuleHandleW(w!("dxgi.dll")).is_err() { return false; }
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory2>() else { return false };
+        let vt = *(factory.as_raw() as *mut *mut usize);
+        *installed = util::patch_vtable(vt, 10, create_chain as *const () as usize, &CREATE)
+            & util::patch_vtable(vt, 15, create_hwnd as *const () as usize, &HWND_CREATE)
+            & util::patch_vtable(vt, 16, create_core as *const () as usize, &CORE_CREATE)
+            & util::patch_vtable(vt, 24, create_composition as *const () as usize, &COMPOSITION_CREATE);
     }
-    let real: ExecuteCommandListsFn = unsafe { std::mem::transmute(REAL_EXECUTE.load(Ordering::Acquire)) };
-    unsafe { real(this, count, lists) }
+    *installed
+}
+
+/// ResizeBuffers1 can assign a different present queue to each back buffer.
+pub unsafe fn invalidate_queue(this: Raw) {
+    if let Some(sc) = unsafe { IDXGISwapChain::from_raw_borrowed(&this) } {
+        let _ = unsafe { sc.SetPrivateData(&QUEUE_KEY, 0, std::ptr::null()) };
+    }
+    if let Ok(mut guard) = RENDERER.lock()
+        && guard.as_ref().is_some_and(|r| r.swapchain == this as usize)
+    { *guard = None; }
 }
 
 /// Called from `d3d11.rs` when `ResizeBuffers` / `ResizeBuffers1` is invoked.
@@ -151,11 +126,14 @@ unsafe fn present_inner(this: *mut c_void) {
         let Ok(device): windows::core::Result<ID3D12Device> = (unsafe { sc.GetDevice() }) else {
             return;
         };
-        let queue = QUEUES.lock().ok().and_then(|m| m.get(&(device.as_raw() as usize)).cloned());
-        let Some(queue) = queue else {
-            // Command queue hasn't called ExecuteCommandLists yet; try again next frame.
+        let mut raw = std::ptr::null_mut::<c_void>();
+        let mut len = size_of::<Raw>() as u32;
+        if unsafe { sc.GetPrivateData(&QUEUE_KEY, &mut len, (&raw mut raw).cast()) }.is_err() || raw.is_null() {
             return;
-        };
+        }
+        // GetPrivateData returns an owned IUnknown reference for interface data.
+        let unknown = unsafe { windows::core::IUnknown::from_raw(raw) };
+        let Ok(queue) = unknown.cast::<ID3D12CommandQueue>() else { return };
         match unsafe { D3d12Renderer::new(&sc3, this as usize, device, queue) } {
             Ok(r) => {
                 if !util::claim_backend(Backend::D3d12) {
@@ -937,15 +915,7 @@ impl D3d12Renderer {
             self.cmd_list.Close()?;
 
             let list: ID3D12CommandList = self.cmd_list.cast()?;
-            // Call the real ExecuteCommandLists directly to avoid re-entering our hook.
-            let real_exec = REAL_EXECUTE.load(Ordering::Acquire);
-            if real_exec != 0 {
-                let f: ExecuteCommandListsFn = std::mem::transmute(real_exec);
-                let raw_list = list.as_raw();
-                f(self.queue.as_raw(), 1, &raw_list);
-            } else {
-                self.queue.ExecuteCommandLists(&[Some(list)]);
-            }
+            self.queue.ExecuteCommandLists(&[Some(list)]);
 
             let sig = self.next_fence;
             self.next_fence += 1;

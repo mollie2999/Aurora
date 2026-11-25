@@ -322,12 +322,23 @@ pub struct DetectionSnapshot {
     pub note: Option<String>,
 }
 
+/// Normalized single-finger touchpad contact for a handheld/controller trackpad (`0.0..=1.0`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TouchpadFinger {
+    pub down: bool,
+    pub click: bool,
+    pub x: f32,
+    pub y: f32,
+}
+
 /// Normalized gamepad snapshot streamed to Aurora's launcher / Big Picture UI.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LauncherPadSample {
     pub id: u32,
     /// XInput button bitmask (plus `0x0400` for Guide).
     pub buttons: u16,
+    /// Dedicated misc / Share / Steam Deck Quick Access (`⋯`) button.
+    pub misc: bool,
     /// Left stick in `[-1.0, 1.0]` (`+Y` is up).
     pub lx: f32,
     pub ly: f32,
@@ -337,6 +348,8 @@ pub struct LauncherPadSample {
     /// Triggers in `[0.0, 1.0]`.
     pub lt: f32,
     pub rt: f32,
+    /// Up to 2 trackpad contacts (`[left, right]` on dual-pad controllers like Steam Deck; `[0]` on DualSense).
+    pub touchpads: [TouchpadFinger; 2],
 }
 
 /// One controller state frame emitted by Aurora's unified SDL3 host reader.
@@ -488,6 +501,9 @@ mod sdl_dyn {
         pub joystick_name_for_id: Option<unsafe extern "C" fn(u32) -> *const c_char>,
         pub joystick_vendor_for_id: Option<unsafe extern "C" fn(u32) -> u16>,
         pub joystick_product_for_id: Option<unsafe extern "C" fn(u32) -> u16>,
+        pub num_touchpads: Option<unsafe extern "C" fn(Gp) -> i32>,
+        pub num_touchpad_fingers: Option<unsafe extern "C" fn(Gp, i32) -> i32>,
+        pub touchpad_finger: Option<unsafe extern "C" fn(Gp, i32, i32, *mut bool, *mut f32, *mut f32, *mut f32) -> bool>,
     }
 
     unsafe impl Send for Sdl {}
@@ -619,6 +635,9 @@ mod sdl_dyn {
             joystick_name_for_id: opt!("SDL_GetJoystickNameForID"),
             joystick_vendor_for_id: opt!("SDL_GetJoystickVendorForID"),
             joystick_product_for_id: opt!("SDL_GetJoystickProductForID"),
+            num_touchpads: opt!("SDL_GetNumGamepadTouchpads"),
+            num_touchpad_fingers: opt!("SDL_GetNumGamepadTouchpadFingers"),
+            touchpad_finger: opt!("SDL_GetGamepadTouchpadFinger"),
         })
     }
 
@@ -753,6 +772,36 @@ mod sdl_dyn {
             (has_a || has_g).then_some((accel, gyro))
         });
         (buttons, misc, touchpad, paddles, sticks, triggers, motion)
+    }
+
+    pub fn read_touchpads(sdl: &Sdl, gp: Gp, touchpad_btn: bool) -> [super::TouchpadFinger; 2] {
+        let mut out = [super::TouchpadFinger::default(); 2];
+        let (Some(n_pads), Some(n_fingers), Some(get_finger)) =
+            (sdl.num_touchpads, sdl.num_touchpad_fingers, sdl.touchpad_finger)
+        else {
+            return out;
+        };
+        let count = unsafe { n_pads(gp) }.clamp(0, 2) as usize;
+        for (pad_idx, slot) in out.iter_mut().take(count).enumerate() {
+            let fingers = unsafe { n_fingers(gp, pad_idx as i32) };
+            for f_idx in 0..fingers {
+                let (mut down, mut x, mut y, mut pressure) = (false, 0.0f32, 0.0f32, 0.0f32);
+                if unsafe { get_finger(gp, pad_idx as i32, f_idx, &mut down, &mut x, &mut y, &mut pressure) } && down {
+                    slot.down = true;
+                    slot.x = x.clamp(0.0, 1.0);
+                    slot.y = y.clamp(0.0, 1.0);
+                    break;
+                }
+            }
+        }
+        // SDL3's HIDAPI Steam Deck driver maps left pad click to `SDL_GAMEPAD_BUTTON_TOUCHPAD`
+        // (index 20) and right pad click to `SDL_GAMEPAD_BUTTON_MISC2` (index 21).
+        let right_btn = unsafe { (sdl.button)(gp, 21) };
+        out[0].click = touchpad_btn && (out[0].down || !out[1].down || right_btn);
+        if count >= 2 {
+            out[1].click = right_btn || (touchpad_btn && out[1].down && !out[0].down);
+        }
+        out
     }
 
     pub fn enable_sensors(sdl: &Sdl, gp: Gp) -> bool {
@@ -1066,7 +1115,11 @@ mod platform {
 
     fn run_sdl_loop(sdl: &'static Sdl, shared: Option<&'static Shared>) {
         unsafe {
-            for (k, v) in [(c"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", c"1"), (c"SDL_JOYSTICK_THREAD", c"1")] {
+            for (k, v) in [
+                (c"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", c"1"),
+                (c"SDL_JOYSTICK_THREAD", c"1"),
+                (c"SDL_JOYSTICK_HIDAPI_STEAMDECK", c"1"),
+            ] {
                 (sdl.set_hint)(k.as_ptr(), v.as_ptr());
             }
         }
@@ -1209,15 +1262,18 @@ mod platform {
                 let ry_f = sticks[3] as f32 / 32767.0;
                 let lt_f = triggers[0].max(0) as f32 / 32767.0;
                 let rt_f = triggers[1].max(0) as f32 / 32767.0;
+                let touchpads = sdl_dyn::read_touchpads(sdl, o.gp, touchpad);
                 launcher_pads.push(LauncherPadSample {
                     id: o.id,
                     buttons,
+                    misc,
                     lx: lx_f.clamp(-1.0, 1.0),
                     ly: ly_f.clamp(-1.0, 1.0),
                     rx: rx_f.clamp(-1.0, 1.0),
                     ry: ry_f.clamp(-1.0, 1.0),
                     lt: lt_f.clamp(0.0, 1.0),
                     rt: rt_f.clamp(0.0, 1.0),
+                    touchpads,
                 });
 
                 summary.total += 1;
@@ -1463,12 +1519,14 @@ mod platform {
                         launcher_pads.push(LauncherPadSample {
                             id: i as u32 + 1,
                             buttons: xp.buttons,
+                            misc: false,
                             lx: lx_f,
                             ly: ly_f,
                             rx: rx_f,
                             ry: ry_f,
                             lt: lt_f,
                             rt: rt_f,
+                            touchpads: [TouchpadFinger::default(); 2],
                         });
                         let id = format!("xinput-{i}");
                         if rumble_target.as_deref() == Some(id.as_str()) && cal.rumble_enabled
@@ -1584,7 +1642,11 @@ mod platform {
     fn read_loop() {
         if let Some(sdl) = sdl_dyn::sdl() {
             unsafe {
-                for (k, v) in [(c"SDL_NO_SIGNAL_HANDLERS", c"1"), (c"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", c"1")] {
+                for (k, v) in [
+                    (c"SDL_NO_SIGNAL_HANDLERS", c"1"),
+                    (c"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", c"1"),
+                    (c"SDL_JOYSTICK_HIDAPI_STEAMDECK", c"1"),
+                ] {
                     (sdl.set_hint)(k.as_ptr(), v.as_ptr());
                 }
             }
@@ -1803,15 +1865,18 @@ mod platform {
                 let ry_f = (sticks[3] as f32 / 32767.0).clamp(-1.0, 1.0);
                 let lt_f = (triggers[0].max(0) as f32 / 32767.0).clamp(0.0, 1.0);
                 let rt_f = (triggers[1].max(0) as f32 / 32767.0).clamp(0.0, 1.0);
+                let touchpads = sdl_dyn::read_touchpads(sdl, o.gp, touchpad);
                 launcher_pads.push(LauncherPadSample {
                     id: o.id,
                     buttons,
+                    misc,
                     lx: lx_f,
                     ly: ly_f,
                     rx: rx_f,
                     ry: ry_f,
                     lt: lt_f,
                     rt: rt_f,
+                    touchpads,
                 });
 
                 summary.total += 1;
@@ -2072,28 +2137,33 @@ mod platform {
     }
 
     #[derive(Default)]
-    struct RawLinuxState {
-        buttons: u16,
-        misc: bool,
-        lx: f32,
-        ly: f32,
-        rx: f32,
-        ry: f32,
-        lt: f32,
-        rt: f32,
+    pub(super) struct RawLinuxState {
+        pub(super) buttons: u16,
+        pub(super) misc: bool,
+        pub(super) lx: f32,
+        pub(super) ly: f32,
+        pub(super) rx: f32,
+        pub(super) ry: f32,
+        pub(super) lt: f32,
+        pub(super) rt: f32,
         hat_x: i32,
         hat_y: i32,
+        pub(super) touchpads: [super::TouchpadFinger; 2],
+    }
+
+    pub(super) fn is_steam_deck_evdev(vendor_id: u16, product_id: u16, name: &str) -> bool {
+        vendor_id == 0x28de && (product_id == 0x1205 || name.to_ascii_lowercase().contains("steam deck"))
     }
 
     enum OpenNode {
-        Evdev { file: File, bounds: HashMap<u16, (i32, i32)>, raw: RawLinuxState },
+        Evdev { file: File, bounds: HashMap<u16, (i32, i32)>, raw: RawLinuxState, is_deck: bool },
         Js { file: File, raw: RawLinuxState },
         MetadataOnly,
     }
 
     fn query_abs_bounds(fd: i32) -> HashMap<u16, (i32, i32)> {
         let mut map = HashMap::new();
-        for code in [0u16, 1, 2, 3, 4, 5, 16, 17] {
+        for code in [0u16, 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 21] {
             let mut info = [0i32; 6];
             let req = ((2u32 << 30) | (24u32 << 16) | ((b'E' as u32) << 8) | (0x40 + code as u32)) as libc::Ioctl;
             if unsafe { libc::ioctl(fd, req, info.as_mut_ptr()) } >= 0 {
@@ -2131,7 +2201,8 @@ mod platform {
             && let Ok(f) = File::options().read(true).custom_flags(libc::O_NONBLOCK).open(ev)
         {
             let bounds = query_abs_bounds(f.as_raw_fd());
-            return OpenNode::Evdev { file: f, bounds, raw: RawLinuxState::default() };
+            let is_deck = is_steam_deck_evdev(p.vendor_id, p.product_id, &p.name);
+            return OpenNode::Evdev { file: f, bounds, raw: RawLinuxState::default(), is_deck };
         }
         if let Some(js) = &p.js_node
             && let Ok(f) = File::options().read(true).custom_flags(libc::O_NONBLOCK).open(js)
@@ -2141,9 +2212,80 @@ mod platform {
         OpenNode::MetadataOnly
     }
 
+    pub(super) fn apply_evdev_event(
+        bounds: &HashMap<u16, (i32, i32)>,
+        raw: &mut RawLinuxState,
+        is_deck: bool,
+        kind: u16,
+        code: u16,
+        value: i32,
+    ) {
+        match kind {
+            0x01 => {
+                let down = value != 0;
+                match code {
+                    0x100 => raw.misc = down,                           // BTN_MISC (Deck Quick Access `⋯`)
+                    0x121 if is_deck => raw.touchpads[0].click = down,  // BTN_THUMB (Deck left pad click)
+                    0x122 if is_deck => raw.touchpads[1].click = down,  // BTN_THUMB2 (Deck right pad click)
+                    0x126 if is_deck => raw.touchpads[0].down = down,   // BTN_BASE (Deck left pad touch)
+                    0x127 if is_deck => raw.touchpads[1].down = down,   // BTN_BASE2 (Deck right pad touch)
+                    0x130 => set_bit(&mut raw.buttons, 0x1000, down),   // BTN_SOUTH
+                    0x131 => set_bit(&mut raw.buttons, 0x2000, down),   // BTN_EAST
+                    0x134 => set_bit(&mut raw.buttons, 0x4000, down),   // BTN_WEST (X)
+                    0x133 => set_bit(&mut raw.buttons, 0x8000, down),   // BTN_NORTH (Y)
+                    0x136 => set_bit(&mut raw.buttons, 0x0100, down),   // BTN_TL
+                    0x137 => set_bit(&mut raw.buttons, 0x0200, down),   // BTN_TR
+                    0x13a => set_bit(&mut raw.buttons, 0x0020, down),   // BTN_SELECT
+                    0x13b => set_bit(&mut raw.buttons, 0x0010, down),   // BTN_START
+                    0x13c => set_bit(&mut raw.buttons, super::shm::GUIDE, down), // BTN_MODE
+                    0x13d => set_bit(&mut raw.buttons, 0x0040, down),   // BTN_THUMBL
+                    0x13e => set_bit(&mut raw.buttons, 0x0080, down),   // BTN_THUMBR
+                    0x220 => set_bit(&mut raw.buttons, 0x0001, down),   // DPAD_UP
+                    0x221 => set_bit(&mut raw.buttons, 0x0002, down),   // DPAD_DOWN
+                    0x222 => set_bit(&mut raw.buttons, 0x0004, down),   // DPAD_LEFT
+                    0x223 => set_bit(&mut raw.buttons, 0x0008, down),   // DPAD_RIGHT
+                    0x138 => raw.lt = if down { 1.0 } else { 0.0 },     // BTN_TL2
+                    0x139 => raw.rt = if down { 1.0 } else { 0.0 },     // BTN_TR2
+                    _ => {}
+                }
+            }
+            0x03 => {
+                let (min, max) = bounds.get(&code).copied().unwrap_or((-32768, 32767));
+                match code {
+                    0x00 => raw.lx = norm_axis(value, min, max),
+                    0x01 => raw.ly = -norm_axis(value, min, max),
+                    0x03 => raw.rx = norm_axis(value, min, max),
+                    0x04 => raw.ry = -norm_axis(value, min, max),
+                    0x02 if !is_deck => raw.lt = norm_trigger(value, if min < 0 { 0 } else { min }, max),
+                    0x05 if !is_deck => raw.rt = norm_trigger(value, if min < 0 { 0 } else { min }, max),
+                    // Linux `hid-steam` maps Deck RT to ABS_HAT2X (0x14) and LT to ABS_HAT2Y (0x15),
+                    // and puts Left/Right Trackpad axes on ABS_HAT0X/Y (0x10/0x11) and ABS_HAT1X/Y (0x12/0x13).
+                    0x14 if is_deck => raw.rt = norm_trigger(value, if min < 0 { 0 } else { min }, max),
+                    0x15 if is_deck => raw.lt = norm_trigger(value, if min < 0 { 0 } else { min }, max),
+                    0x10 if is_deck => raw.touchpads[0].x = norm_trigger(value, min, max),
+                    0x11 if is_deck => raw.touchpads[0].y = norm_trigger(value, min, max),
+                    0x12 if is_deck => raw.touchpads[1].x = norm_trigger(value, min, max),
+                    0x13 if is_deck => raw.touchpads[1].y = norm_trigger(value, min, max),
+                    0x10 => {
+                        raw.hat_x = value;
+                        set_bit(&mut raw.buttons, 0x0004, value < 0);
+                        set_bit(&mut raw.buttons, 0x0008, value > 0);
+                    }
+                    0x11 => {
+                        raw.hat_y = value;
+                        set_bit(&mut raw.buttons, 0x0001, value < 0);
+                        set_bit(&mut raw.buttons, 0x0002, value > 0);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn poll_open_node(node: &mut OpenNode) {
         match node {
-            OpenNode::Evdev { file, bounds, raw } => {
+            OpenNode::Evdev { file, bounds, raw, is_deck } => {
                 let mut buf = [0u8; std::mem::size_of::<InputEvent>() * 16];
                 while let Ok(n) = file.read(&mut buf) {
                     let sz = std::mem::size_of::<InputEvent>();
@@ -2152,54 +2294,7 @@ mod platform {
                     }
                     for chunk in buf[..n].chunks_exact(sz) {
                         let ev = unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast::<InputEvent>()) };
-                        match ev.kind {
-                            0x01 => {
-                                let down = ev.value != 0;
-                                match ev.code {
-                                    0x130 => set_bit(&mut raw.buttons, 0x1000, down), // BTN_SOUTH
-                                    0x131 => set_bit(&mut raw.buttons, 0x2000, down), // BTN_EAST
-                                    0x134 => set_bit(&mut raw.buttons, 0x4000, down), // BTN_WEST (X)
-                                    0x133 => set_bit(&mut raw.buttons, 0x8000, down), // BTN_NORTH (Y)
-                                    0x136 => set_bit(&mut raw.buttons, 0x0100, down), // BTN_TL
-                                    0x137 => set_bit(&mut raw.buttons, 0x0200, down), // BTN_TR
-                                    0x13a => set_bit(&mut raw.buttons, 0x0020, down), // BTN_SELECT
-                                    0x13b => set_bit(&mut raw.buttons, 0x0010, down), // BTN_START
-                                    0x13c => set_bit(&mut raw.buttons, super::shm::GUIDE, down), // BTN_MODE
-                                    0x13d => set_bit(&mut raw.buttons, 0x0040, down), // BTN_THUMBL
-                                    0x13e => set_bit(&mut raw.buttons, 0x0080, down), // BTN_THUMBR
-                                    0x220 => set_bit(&mut raw.buttons, 0x0001, down), // DPAD_UP
-                                    0x221 => set_bit(&mut raw.buttons, 0x0002, down), // DPAD_DOWN
-                                    0x222 => set_bit(&mut raw.buttons, 0x0004, down), // DPAD_LEFT
-                                    0x223 => set_bit(&mut raw.buttons, 0x0008, down), // DPAD_RIGHT
-                                    0x138 => raw.lt = if down { 1.0 } else { 0.0 },   // BTN_TL2
-                                    0x139 => raw.rt = if down { 1.0 } else { 0.0 },   // BTN_TR2
-                                    _ => {}
-                                }
-                            }
-                            0x03 => {
-                                let (min, max) = bounds.get(&ev.code).copied().unwrap_or((-32768, 32767));
-                                match ev.code {
-                                    0x00 => raw.lx = norm_axis(ev.value, min, max),
-                                    0x01 => raw.ly = -norm_axis(ev.value, min, max),
-                                    0x03 => raw.rx = norm_axis(ev.value, min, max),
-                                    0x04 => raw.ry = -norm_axis(ev.value, min, max),
-                                    0x02 => raw.lt = norm_trigger(ev.value, if min < 0 { 0 } else { min }, max),
-                                    0x05 => raw.rt = norm_trigger(ev.value, if min < 0 { 0 } else { min }, max),
-                                    0x10 => {
-                                        raw.hat_x = ev.value;
-                                        set_bit(&mut raw.buttons, 0x0004, ev.value < 0);
-                                        set_bit(&mut raw.buttons, 0x0008, ev.value > 0);
-                                    }
-                                    0x11 => {
-                                        raw.hat_y = ev.value;
-                                        set_bit(&mut raw.buttons, 0x0001, ev.value < 0);
-                                        set_bit(&mut raw.buttons, 0x0002, ev.value > 0);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            _ => {}
-                        }
+                        apply_evdev_event(bounds, raw, *is_deck, ev.kind, ev.code, ev.value);
                     }
                 }
             }
@@ -2282,6 +2377,18 @@ mod platform {
                         next.push((pad, existing_node));
                     } else {
                         let node = open_node(&pad);
+                        let kind = match node {
+                            OpenNode::Evdev { .. } => "evdev",
+                            OpenNode::Js { .. } => "js",
+                            OpenNode::MetadataOnly => "sysfs",
+                        };
+                        tracing::info!(
+                            "controllers: detected \"{}\" via fallback ({}, vid={:04x}, pid={:04x})",
+                            pad.name,
+                            kind,
+                            pad.vendor_id,
+                            pad.product_id
+                        );
                         next.push((pad, node));
                     }
                 }
@@ -2322,12 +2429,14 @@ mod platform {
                     launcher_pads.push(LauncherPadSample {
                         id: idx as u32 + 1,
                         buttons: raw.buttons,
+                        misc: raw.misc,
                         lx: raw.lx,
                         ly: raw.ly,
                         rx: raw.rx,
                         ry: raw.ry,
                         lt: raw.lt,
                         rt: raw.rt,
+                        touchpads: raw.touchpads,
                     });
                 }
                 if ui_active() {
@@ -2335,7 +2444,7 @@ mod platform {
                         OpenNode::Evdev { raw, .. } | OpenNode::Js { raw, .. } => build_live_input(
                             raw.buttons,
                             raw.misc,
-                            false,
+                            raw.touchpads[0].click || raw.touchpads[1].click,
                             [false; 4],
                             raw.lx,
                             raw.ly,
@@ -2617,5 +2726,45 @@ mod tests {
         };
         assert!(switch_pad.needs_translation(0, &all, false));
         assert!(!switch_pad.needs_translation(2, &all, true));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn steam_deck_evdev_maps_triggers_touchpads_and_qam_without_dpad_collision() {
+        let mut bounds = std::collections::HashMap::new();
+        bounds.insert(0x10, (-32767, 32767));
+        bounds.insert(0x11, (-32767, 32767));
+        bounds.insert(0x12, (-32767, 32767));
+        bounds.insert(0x13, (-32767, 32767));
+        bounds.insert(0x14, (0, 32767));
+        bounds.insert(0x15, (0, 32767));
+
+        let mut raw = platform::RawLinuxState::default();
+        assert!(platform::is_steam_deck_evdev(0x28de, 0x1205, "Steam Deck"));
+        // ABS_HAT2Y (LT) and ABS_HAT2X (RT) drive triggers.
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x03, 0x15, 32767);
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x03, 0x14, 16384);
+        assert!((raw.lt - 1.0).abs() < 0.001);
+        assert!((raw.rt - 0.5).abs() < 0.01);
+        // ABS_HAT0X/Y drives left trackpad on Deck, NOT D-pad.
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x03, 0x10, -32767);
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x03, 0x11, 32767);
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x01, 0x126, 1);
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x01, 0x121, 1);
+        assert_eq!(raw.buttons, 0);
+        assert!(raw.touchpads[0].down && raw.touchpads[0].click);
+        assert!(raw.touchpads[0].x < 0.01 && raw.touchpads[0].y > 0.99);
+        // BTN_MISC maps QAM (`⋯`).
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x01, 0x100, 1);
+        assert!(raw.misc);
+
+        // Generic evdev controller still uses ABS_HAT0X/Y for D-pad and ABS_Z/RZ for LT/RT.
+        let mut generic = platform::RawLinuxState::default();
+        bounds.insert(0x02, (0, 255));
+        bounds.insert(0x05, (0, 255));
+        platform::apply_evdev_event(&bounds, &mut generic, false, 0x03, 0x10, -1);
+        platform::apply_evdev_event(&bounds, &mut generic, false, 0x03, 0x02, 255);
+        assert_eq!(generic.buttons & 0x0004, 0x0004);
+        assert!((generic.lt - 1.0).abs() < 0.001);
     }
 }

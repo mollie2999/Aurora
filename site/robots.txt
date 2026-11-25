@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://mollie2999.github.io/Aurora/sitemap.xml
+Sitemap: https://auroraclient.eu/sitemap.xml

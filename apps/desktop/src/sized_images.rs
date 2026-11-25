@@ -11,7 +11,7 @@
 use egui::ColorImage;
 use egui::load::{BytesPoll, ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 const UNCLAIMED_FOR: Duration = Duration::from_secs(10);
 const MAX_IMAGE_DIM: u32 = 8192;
 const MAX_IMAGE_ALLOC: u64 = 64 << 20;
+const MAX_QUEUED_JOBS: usize = 32;
 
 fn image_limits() -> image::Limits {
     let mut limits = image::Limits::default();
@@ -55,14 +56,14 @@ struct Job {
 
 pub struct SizedLoader {
     entries: Arc<Mutex<HashMap<String, Entry>>>,
-    jobs: Mutex<Sender<Job>>,
+    jobs: Mutex<SyncSender<Job>>,
     swept: Mutex<Instant>,
 }
 
 impl SizedLoader {
     pub fn install(ctx: &egui::Context) {
         let entries: Arc<Mutex<HashMap<String, Entry>>> = Default::default();
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(MAX_QUEUED_JOBS);
         let rx = Arc::new(Mutex::new(rx));
         // A few decoders: enough to keep up with scrolling, few enough that a
         // page of art doesn't hold dozens of full-size pictures at once.
@@ -89,6 +90,10 @@ fn worker(rx: &Mutex<Receiver<Job>>, entries: &Mutex<HashMap<String, Entry>>) {
     let mut resizer = fast_image_resize::Resizer::new();
     loop {
         let Ok(job) = rx.lock().unwrap().recv() else { return };
+        // Skip obsolete jobs whose entry was forgotten while waiting in the queue.
+        if !matches!(entries.lock().unwrap().get(&job.uri), Some(Entry::Pending)) {
+            continue;
+        }
         let result = decode_with(&job.bytes, job.cover, job.w, job.h, &mut resizer).map(|mut image| {
             if job.blur_bottom {
                 blur_bottom(&mut image);
@@ -198,16 +203,30 @@ impl ImageLoader for SizedLoader {
         }
         match ctx.try_load_bytes(url) {
             Ok(BytesPoll::Ready { bytes, .. }) => {
+                let is_anim_webp = bytes.get(8..12) == Some(b"WEBP")
+                    && image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&bytes[..]))
+                        .is_ok_and(|d| d.has_animation());
+                let job = Job { uri: uri.to_string(), bytes: bytes.clone(), cover, blur_bottom: plain.is_some(), w, h, ctx: ctx.clone() };
                 self.entries.lock().unwrap().insert(uri.to_string(), Entry::Pending);
-                // The decoder has its own copy now; the disk cache has the file.
-                if bytes.get(8..12) != Some(b"WEBP") {
-                    for loader in ctx.loaders().bytes.lock().iter() {
-                        loader.forget(url);
+                match self.jobs.lock().unwrap().try_send(job) {
+                    Ok(()) => {
+                        // The decoder has its own copy now; the disk cache has the file.
+                        // Keep raw bytes in the bytes loader only for animated WebP so the
+                        // fallback animated loader does not have to re-read from disk.
+                        if !is_anim_webp {
+                            for loader in ctx.loaders().bytes.lock().iter() {
+                                loader.forget(url);
+                            }
+                        }
                     }
-                }
-                let job = Job { uri: uri.to_string(), bytes, cover, blur_bottom: plain.is_some(), w, h, ctx: ctx.clone() };
-                if self.jobs.lock().unwrap().send(job).is_err() {
-                    self.entries.lock().unwrap().insert(uri.to_string(), Entry::Failed("no decoder".into()));
+                    Err(TrySendError::Full(_)) => {
+                        // Leave retryable on the next frame instead of piling up memory.
+                        self.entries.lock().unwrap().remove(uri);
+                        ctx.request_repaint_after(Duration::from_millis(33));
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        self.entries.lock().unwrap().insert(uri.to_string(), Entry::Failed("no decoder".into()));
+                    }
                 }
                 Ok(ImagePoll::Pending { size: None })
             }

@@ -38,6 +38,7 @@ mod jingle;
 mod lobby;
 pub mod overlay;
 mod p2p;
+mod recv_queue;
 mod pads;
 mod legacy;
 #[cfg(windows)]

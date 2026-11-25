@@ -170,7 +170,9 @@ impl PseudoTcp {
         }
         let n = self.rlen as usize;
         out.extend_from_slice(&self.rbuf[..n]);
-        self.rbuf.copy_within(n.., 0);
+        if !self.rlist.is_empty() {
+            self.rbuf.copy_within(n.., 0);
+        }
         self.rlen = 0;
         if (RBUF as u32 - self.rlen - self.rcv_wnd) >= (RBUF as u32 / 2).min(self.mss) {
             let was_closed = self.rcv_wnd == 0;

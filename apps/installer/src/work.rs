@@ -1,7 +1,7 @@
 //! The setup's file work: unpack the app, shortcuts, the "Apps & features"
 //! entry, updating in place and uninstalling. Per-user only (no admin).
 
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -372,50 +372,26 @@ fn data_dirs() -> Vec<PathBuf> {
 /// Write `data` to `path` safely without following or truncating pre-existing
 /// symlinks/reparse points, also when an old copy is in the way.
 fn replace_file(path: &Path, data: &[u8]) -> Result<(), String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let stage = tempfile::Builder::new().prefix(".aurora-update-").tempdir_in(parent).map_err(|e| e.to_string())?;
+    let tmp = stage.path().join("new");
+    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    install_staged_file(path, &tmp, stage)
+}
 
-    if let Ok(m) = std::fs::symlink_metadata(path) {
-        if is_symlink_or_reparse(&m) {
-            return Err(format!("refusing to overwrite symlink/reparse point: {}", path.display()));
-        }
+fn install_staged_file(path: &Path, tmp: &Path, stage: tempfile::TempDir) -> Result<(), String> {
+    let old = stage.path().join("previous.old");
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if is_symlink_or_reparse(&m) || !m.is_file() => return Err(format!("refusing to overwrite {}", path.display())),
+        Ok(_) => std::fs::rename(path, &old).map_err(|e| format!("{}: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return std::fs::rename(tmp, path).map_err(|e| e.to_string()),
+        Err(e) => return Err(e.to_string()),
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("aurora");
-    let pid = std::process::id();
-    let (tmp, mut file) = loop {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".{stem}.{pid}.{seq}.new"));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
-            Ok(f) => break (candidate, f),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("{}: {e}", candidate.display())),
+    if let Err(e) = std::fs::rename(tmp, path) {
+        if let Err(restore) = std::fs::rename(&old, path) {
+            let _ = stage.keep();
+            return Err(format!("{e}; restore failed: {restore}; backup at {}", old.display()));
         }
-    };
-    if let Err(e) = file.write_all(data) {
-        drop(file);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.to_string());
-    }
-    drop(file);
-    if let Ok(m) = std::fs::symlink_metadata(path) {
-        if is_symlink_or_reparse(&m) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("refusing to overwrite symlink/reparse point: {}", path.display()));
-        }
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let old = parent.join(format!(".{stem}.{pid}.{seq}.old"));
-        if std::fs::rename(path, &old).is_err() {
-            if let Err(e) = std::fs::remove_file(path) {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(format!("{}: {e}", path.display()));
-            }
-        } else {
-            let _ = std::fs::remove_file(&old);
-        }
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
         return Err(format!("{}: {e}", path.display()));
     }
     Ok(())
@@ -423,15 +399,18 @@ fn replace_file(path: &Path, data: &[u8]) -> Result<(), String> {
 
 /// Wait until `exe` isn't running (it can be renamed again).
 fn wait_unlocked(exe: &Path, wait: Duration) -> Result<(), String> {
-    if !exe.exists() {
+    wait_unlocked_with(exe, wait, |from, to| std::fs::rename(from, to))
+}
+
+fn wait_unlocked_with(exe: &Path, wait: Duration, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) -> Result<(), String> {
+    if !exe.try_exists().map_err(|e| e.to_string())? {
         return Ok(());
     }
     let probe = exe.with_extension("probe");
     let start = Instant::now();
     loop {
-        if std::fs::rename(exe, &probe).is_ok() {
-            let _ = std::fs::rename(&probe, exe);
-            return Ok(());
+        if rename(exe, &probe).is_ok() {
+            return rename(&probe, exe).map_err(|e| format!("could not restore {} from {}: {e}", exe.display(), probe.display()));
         }
         if start.elapsed() > wait {
             return Err(i18n::tr_dyn("Aurora is still running. Close it (also from the tray) and try again."));
@@ -943,6 +922,21 @@ mod win_shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_publish_restores_original_and_failed_probe_restore_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("app.exe");
+        std::fs::write(&exe, b"working").unwrap();
+        let stage = tempfile::tempdir_in(dir.path()).unwrap();
+        assert!(install_staged_file(&exe, &stage.path().join("missing"), stage).is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"working");
+        let result = wait_unlocked_with(&exe, Duration::ZERO, |from, to| {
+            if to == exe { Err(std::io::Error::other("restore failed")) } else { std::fs::rename(from, to) }
+        });
+        assert!(result.unwrap_err().contains("restore failed"));
+        assert_eq!(std::fs::read(exe.with_extension("probe")).unwrap(), b"working");
+    }
 
     #[test]
     fn safe_manifest_rel_rejects_traversal_roots_and_drives() {

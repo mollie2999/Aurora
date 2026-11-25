@@ -259,6 +259,8 @@ pub fn resize_handles(ctx: &egui::Context) {
         egui::Area::new(Id::unique(("resize-handle", i)))
             .order(egui::Order::Foreground)
             .fixed_pos(rect.min)
+            .default_size(rect.size())
+            .constrain(false)
             .show(ctx, |ui| {
                 let resp = ui.allocate_rect(Rect::from_min_size(rect.min, rect.size()), Sense::drag());
                 if resp.hovered() || resp.dragged() {

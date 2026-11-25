@@ -406,7 +406,7 @@ fn read_pads(frames: mpsc::Receiver<LauncherPadFrame>, tx: mpsc::Sender<PadEvent
 
 /// Which keys stand for which presses. `typing`: letters go to a text box,
 /// so only keys that aren't text count. Back is Esc only, like Steam's Big
-/// Picture: Backspace deletes in a text box (see [`backspace`]) and does
+/// Picture: Backspace deletes in a text box (see [`super::osk::edit_physical`]) and does
 /// nothing anywhere else, so deleting can never leave a page.
 pub fn key_map(typing: bool) -> Vec<(Key, Press)> {
     let mut map = vec![
@@ -442,20 +442,6 @@ pub fn key_map(typing: bool) -> Vec<(Key, Press)> {
     map
 }
 
-/// Backspace in a text box: delete the last character (with Ctrl, the last
-/// word). An empty box stays empty; it never means "back".
-pub fn backspace(field: &mut String, word: bool) {
-    if word {
-        let kept = field.trim_end().len();
-        field.truncate(kept);
-        let cut = field.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
-        field.truncate(cut);
-    } else {
-        field.pop();
-    }
-}
-
-/// This frame's keyboard presses (taken, so egui doesn't also act on them).
 pub fn keyboard(ctx: &egui::Context, typing: bool) -> Vec<Press> {
     let mut out = Vec::new();
     ctx.input_mut(|i| {
@@ -532,26 +518,6 @@ mod tests {
         for key in [Key::Space, Key::Q, Key::E, Key::X, Key::Y, Key::M, Key::W, Key::A, Key::S, Key::D] {
             assert!(!map.iter().any(|(k, _)| *k == key), "{key:?} must type, not act");
         }
-    }
-
-    #[test]
-    fn backspace_deletes_and_stops_at_empty() {
-        let mut s = String::from("hi");
-        backspace(&mut s, false);
-        assert_eq!(s, "h");
-        backspace(&mut s, false);
-        backspace(&mut s, false);
-        backspace(&mut s, false);
-        assert_eq!(s, "");
-        let mut s = String::from("see you tonight  ");
-        backspace(&mut s, true);
-        assert_eq!(s, "see you ");
-        backspace(&mut s, true);
-        assert_eq!(s, "see ");
-        backspace(&mut s, true);
-        assert_eq!(s, "");
-        backspace(&mut s, true);
-        assert_eq!(s, "");
     }
 
     #[test]

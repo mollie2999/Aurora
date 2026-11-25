@@ -1582,7 +1582,17 @@ impl eframe::App for SteamApp {
         };
         self.registry.tick(env);
         self.apply_actions(&ctx, actions);
-        crate::shell::toasts(self, &ctx);
+        let keyboard_open = big_picture && if signed_in {
+            !launch_dialog && self.bigpicture.osk_open()
+        } else {
+            self.login.bp_osk_open
+        };
+        let keyboard_inset = if keyboard_open {
+            self.bigpicture.keyboard_inset(&ctx, ui.max_rect(), self.prefs.bigpicture_scale)
+        } else {
+            0.0
+        };
+        crate::shell::toasts(self, &ctx, keyboard_inset);
         if !big_picture || self.bigpicture.is_windowed() {
             if signed_in || self.bigpicture.is_windowed() {
                 crate::chrome::resize_handles(&ctx);

@@ -232,6 +232,7 @@ pub struct BigPicture {
     query: String,
     query_changed: f64,
     submitted: String,
+    pub(crate) search_osk_open: bool,
     pub(crate) osk: osk::OskState,
     /// Chat: the message being typed, Enter pressed on a real keyboard, and
     /// conversations whose history was asked for.
@@ -307,6 +308,7 @@ impl BigPicture {
                 "search" => {
                     bp.tab = Tab::Store;
                     bp.stack.push(Page::Search);
+                    bp.search_osk_open = true;
                 }
                 "chat" => {
                     bp.tab = Tab::Friends;
@@ -342,6 +344,9 @@ impl BigPicture {
         self.quick_access = None;
         self.focus.current = None;
         self.chat_keys = false;
+        self.library_search_open = false;
+        self.search_osk_open = false;
+        self.osk.reset_focus();
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
@@ -473,6 +478,61 @@ impl BigPicture {
         self.stack.last().cloned().unwrap_or(Page::Tab(self.tab))
     }
 
+    pub(crate) fn osk_open(&self) -> bool {
+        let page = self.page();
+        (page == Page::Search && self.search_osk_open)
+            || (matches!(page, Page::Chat(_)) && self.chat_keys)
+            || (page == Page::Tab(Tab::Library) && self.library_search_open)
+            || self.profile.active_text_open(&page)
+    }
+
+    pub(crate) fn keyboard_inset(&self, ctx: &egui::Context, screen: Rect, scale: f32) -> f32 {
+        osk::overlay_height(screen, self.compute_scale(ctx, screen, scale), &self.osk)
+    }
+
+    pub(crate) fn close_osk(&mut self) -> bool {
+        let page = self.page();
+        if page == Page::Search && self.search_osk_open {
+            self.search_osk_open = false;
+            return true;
+        }
+        if matches!(page, Page::Chat(_)) && self.chat_keys {
+            self.chat_keys = false;
+            self.focus.current = Some(screens::chat_history_id());
+            return true;
+        }
+        if page == Page::Tab(Tab::Library) && self.library_search_open {
+            self.library_search_open = false;
+            return true;
+        }
+        self.profile.close_osk(&page)
+    }
+
+    pub(crate) fn toggle_osk(&mut self) -> bool {
+        if self.close_osk() {
+            return true;
+        }
+        let page = self.page();
+        match page {
+            Page::Search => {
+                self.search_osk_open = true;
+                self.osk.reset_focus();
+                true
+            }
+            Page::Chat(_) => {
+                self.chat_keys = true;
+                self.osk.reset_focus();
+                true
+            }
+            Page::Tab(Tab::Library) => {
+                self.library_search_open = true;
+                self.osk.reset_focus();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn remember(&mut self) {
         // Only page items: a top-bar item remembered for a page would jump back to the bar on return.
         if let Some(c) = self.focus.current.filter(|c| !is_bar_id(*c)) {
@@ -482,6 +542,9 @@ impl BigPicture {
 
     fn arrive(&mut self, now: f64, slide: f32) {
         self.chat_keys = false;
+        self.library_search_open = false;
+        self.search_osk_open = matches!(self.page(), Page::Search);
+        self.osk.reset_focus();
         self.focus.current = self.memory.get(&self.page().key()).copied();
         self.page_since = now;
         self.slide = slide;
@@ -591,7 +654,10 @@ pub fn poll(app: &mut SteamApp, ctx: &egui::Context, visible: bool) -> bool {
     for event in rx.try_iter() {
         match event {
             PadEvent::Connected(n) => bp.controllers_connected(n),
-            PadEvent::Touchpads(_) => {}
+            PadEvent::Touchpads(pads) => {
+                let open = if signed_in { bp.osk_open() } else { app.login.bp_osk_open };
+                bp.osk.update_touchpads(pads, focused && bp.active && open);
+            }
             PadEvent::Press(press) if signed_in || bp.active => {
                 show_window |= bp.handle_pad_press(ctx, press, focused, playing);
             }
@@ -761,6 +827,7 @@ impl BigPicture {
             self.leave(&ctx);
             return;
         }
+        self.osk.restore_function_key(&ctx);
         self.ensure_fullscreen(&ctx, now);
 
         // ---- input ----
@@ -768,48 +835,25 @@ impl BigPicture {
         let page = self.page();
         let chat = matches!(page, Page::Chat(_));
         let lib_typing = page == Page::Tab(Tab::Library) && self.library_search_open;
-        let prof_typing = self.profile.active_text_mut(&page).is_some();
+        let prof_typing = self.profile.active_text_open(&page);
         let typing = (page == Page::Search || chat || lib_typing || prof_typing) && !drawer_open && !self.launch_dialog;
+        let osk_active = self.osk_open() && !drawer_open && !self.launch_dialog;
         let mut submit = false;
-        // Backspace only ever deletes (held down too, and on an empty box);
-        // outside a text box it does nothing. Back is Esc / B.
-        let backspaces: Vec<bool> = if typing { ctx.input_mut(|i| {
-            let mut out = Vec::new();
-            i.events.retain(|e| match e {
-                egui::Event::Key { key: egui::Key::Backspace, pressed, modifiers, .. } => {
-                    if *pressed {
-                        out.push(modifiers.ctrl || modifiers.alt || modifiers.mac_cmd);
-                    }
-                    false
-                }
-                _ => true,
-            });
-            out
-        }) } else { Vec::new() };
-        if typing {
-            let text: String = ctx.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.clone()) } else { None }).collect());
-            let field: Option<&mut String> = if chat {
-                Some(&mut self.message)
-            } else if lib_typing {
-                Some(&mut self.library_query)
-            } else if prof_typing {
-                self.profile.active_text_mut(&page)
-            } else {
-                Some(&mut self.query)
-            };
-            if let Some(field) = field {
-                if !text.is_empty() {
-                    field.push_str(&text);
+
+        let field_focused = match page {
+            Page::Search => self.focus.current == Some(screens::search_input_id()),
+            Page::Chat(_) => self.focus.current == Some(screens::chat_input_id()),
+            _ => true,
+        };
+        if typing && let Some(id) = typing_target_id(self, &page)
+            && let Some((osk, field)) = split_osk_field(self, &page)
+        {
+            osk.sync_target(id, field);
+            if osk::edit_physical(osk, field, &ctx, osk_active || !field_focused, false, true) {
+                if page == Page::Search {
                     self.query_changed = now;
-                    self.device = Device::Keyboard;
                 }
-                for word in &backspaces {
-                    input::backspace(field, *word);
-                }
-                if !backspaces.is_empty() {
-                    self.query_changed = now;
-                    self.device = Device::Keyboard;
-                }
+                self.device = Device::Keyboard;
             }
         }
         let embedded_typing = matches!(page, Page::Embedded(..)) && !drawer_open && ctx.egui_wants_keyboard_input();
@@ -838,6 +882,7 @@ impl BigPicture {
         let mut press = false;
         let (mut x, mut y, mut lt, mut rt) = (false, false, false, false);
         let mut stick_scroll = 0.0f32;
+        let mut osk_input = osk::OskInput::default();
         if let Some(m) = &mut self.menu {
             if presses.iter().any(|(p, _)| *p == Press::QuickAccess) {
                 self.open_quick_access(&ctx, quick_access::Section::System, now);
@@ -852,12 +897,26 @@ impl BigPicture {
             } else {
                 qa.input(&presses, now);
             }
+        } else if osk_active {
+            for (p, from_keys) in presses {
+                match p {
+                    Press::Scroll(delta) => stick_scroll += delta as f32 * 110.0 * s,
+                    Press::Start | Press::Guide => {
+                        self.close_osk();
+                        self.open_menu(now);
+                    }
+                    Press::QuickAccess => {
+                        self.close_osk();
+                        self.open_quick_access(&ctx, quick_access::Section::System, now);
+                    }
+                    _ => osk_input.handle_press(p, from_keys),
+                }
+            }
         } else {
             for (p, from_keys) in presses {
                 match p {
                     Press::Move(d) => dir = Some(d),
-                    // Typing on a real keyboard: Enter searches what was typed
-                    // (and then selects, like everywhere else).
+                    // Typing on a real keyboard with OSK closed: Enter submits cleanly.
                     Press::A if typing && from_keys && chat && !self.message.trim().is_empty() => self.send_now = true,
                     Press::A if typing && from_keys && lib_typing => self.library_search_open = false,
                     Press::A if typing && from_keys && prof_typing => {
@@ -865,21 +924,18 @@ impl BigPicture {
                     }
                     Press::A if typing && from_keys && !chat && self.query.trim() != self.submitted => submit = true,
                     Press::A => press = true,
-                    // Library search OSK open: B closes it first.
-                    Press::B if lib_typing => self.library_search_open = false,
-                    // Profile OSK open: B closes it first.
-                    Press::B if self.profile.close_osk(&page) => {}
-                    // Chat with the keyboard up: B puts it away first.
-                    Press::B if chat && self.chat_keys => {
-                        self.chat_keys = false;
-                        self.focus.current = Some(screens::chat_history_id());
-                    }
                     Press::B => self.back(now),
                     Press::X => x = true,
                     Press::Y => y = true,
                     Press::Lt => lt = true,
                     Press::Rt => rt = true,
-                    Press::L3 | Press::R3 | Press::ToggleOsk => {}
+                    Press::ToggleOsk => {
+                        if !self.toggle_osk() && matches!(page, Page::Profile(_) | Page::ProfileGames(_) | Page::ProfileEdit) {
+                            // Profile fields use the focused control to select the edit target.
+                            x = true;
+                        }
+                    }
+                    Press::L3 | Press::R3 => {}
                     Press::Scroll(delta) => stick_scroll += delta as f32 * 110.0 * s,
                     Press::Lb => self.switch_tab(TABS[(self.tab.index() + TABS.len() - 1) % TABS.len()], now, true),
                     Press::Rb => self.switch_tab(TABS[(self.tab.index() + 1) % TABS.len()], now, true),
@@ -950,8 +1006,9 @@ impl BigPicture {
             dir = None;
         }
         let drawer_open = self.menu.is_some() || self.quick_access.is_some();
+        let overlay_blocks_bg = drawer_open || osk_active;
         let before = self.focus.current;
-        if drawer_open {
+        if overlay_blocks_bg {
             self.focus.pause_frame();
         } else {
             self.focus.begin(ui, dir, press);
@@ -977,7 +1034,7 @@ impl BigPicture {
             _ => pos,
         };
         let focus_in_bar = self.focus.current.is_some_and(is_bar_id);
-        let pointer_at_top = !drawer_open
+        let pointer_at_top = !overlay_blocks_bg
             && ui.input(|i| i.pointer.latest_pos().is_some_and(|p| p.y <= screen.top() + 32.0 * s));
         let target_hide = if focus_in_bar || pointer_at_top {
             0.0
@@ -997,18 +1054,27 @@ impl BigPicture {
         let e = since(ui, self.page_since, 0.32);
         let dx = (1.0 - e) * 80.0 * s * self.slide;
         let mut content = paint::faded(ui, screen, e.max(0.0));
-        if drawer_open {
+        if overlay_blocks_bg {
             content.disable();
         }
         let clip_top = screen.top() + (top_h - 28.0 * s).max(0.0) * (1.0 - self.bar_hide);
-        content.set_clip_rect(Rect::from_min_max(pos2(screen.left(), clip_top), pos2(screen.right(), view.bottom())));
-        let page_view = view.translate(vec2(dx, 0.0));
+        let mut page_view = view.translate(vec2(dx, 0.0));
+        if osk_active && matches!(page, Page::Profile(_) | Page::ProfileGames(_) | Page::ProfileEdit | Page::Tab(Tab::Library)) {
+            let visible_bottom = screen.bottom() - osk::overlay_height(screen, s, &self.osk);
+            page_view.max.y = page_view.bottom().min(visible_bottom).max(page_view.top());
+        }
+        content.set_clip_rect(Rect::from_min_max(
+            pos2(screen.left(), clip_top),
+            pos2(screen.right(), page_view.bottom()),
+        ));
+        let visible_h = page_view.height();
         let pad = side_pad(screen, s, self.deck_mode());
         let mut f = Frame { app, actions, t: t.clone(), s, view: page_view, pad, now, x, y, lt, rt, stick_scroll };
 
         self.background(ui, &f);
+        self.osk.field_rect = None;
         let height = screens::draw(self, &mut content, &mut f, pos);
-        // Scroll the page: follow the focus, right-stick, or mouse wheel (only while no drawer is open).
+        // Scroll the page: follow the focus, right-stick, or mouse wheel (only while no drawer/OSK blocks background).
         if !drawer_open {
             let page_has_own_scroll = matches!(self.page(), Page::Settings | Page::ProfileEdit);
             let wheel = ui.input(|i| i.smooth_scroll_delta.y);
@@ -1021,7 +1087,11 @@ impl BigPicture {
             if f.stick_scroll != 0.0 && !page_has_own_scroll {
                 sc.target += f.stick_scroll;
             }
-            if !page_has_own_scroll && let (true, Some((r, Place::Page))) = (moved, focused) {
+            if osk_active && !page_has_own_scroll && let Some(field) = self.osk.take_field_reveal() {
+                let top = field.top() - view.top() + pos;
+                sc.reveal(top, top + field.height(), visible_h, 16.0 * s);
+            }
+            if !osk_active && !page_has_own_scroll && let (true, Some((r, Place::Page))) = (moved, focused) {
                 let top = r.top() - (view.top() - sc.pos);
                 sc.reveal(top, top + r.height(), view.height(), view.height() * 0.2);
                 // Near the start: show the very top (the page title, the hero).
@@ -1029,13 +1099,13 @@ impl BigPicture {
                     sc.target = 0.0;
                 }
             }
-            sc.clamp(height, view.height());
+            sc.clamp(height, visible_h);
             sc.step(ui);
         }
 
         if self.bar_hide < 0.99 {
             let mut bar_ui = paint::faded(ui, screen, (1.0 - self.bar_hide).clamp(0.0, 1.0));
-            if drawer_open {
+            if overlay_blocks_bg {
                 bar_ui.disable();
             }
             self.top_bar(&mut bar_ui, &mut f, screen, top_h, -top_h * self.bar_hide);
@@ -1043,7 +1113,7 @@ impl BigPicture {
         if !self.active {
             return;
         }
-        if !drawer_open {
+        if !overlay_blocks_bg {
             let first: Vec<Id> = self.preferred.into_iter().collect();
             let assigned = self.focus.end(&first, tab_id(self.tab));
             if assigned
@@ -1065,8 +1135,29 @@ impl BigPicture {
         if self.quick_access.is_some() {
             quick_access::show(self, ui, &mut f, drawer_screen);
         }
-        let mut hint_ui = ui.new_child(egui::UiBuilder::new().max_rect(screen));
-        self.hint_bar(&mut hint_ui, &mut f, screen);
+        if !drawer_open && !self.launch_dialog && self.osk_open() {
+            let go_label = match self.page() {
+                Page::Search | Page::ProfileGames(_) => t!("Search"),
+                Page::Chat(_) => t!("Send"),
+                Page::Profile(_) => t!("Post comment"),
+                _ => t!("Done"),
+            };
+            for action in osk::draw_overlay(&mut self.osk, ui, &t, s, screen, now, go_label, osk_input) {
+                ctx.request_repaint();
+                self.osk.queue_function_key(action);
+                if let Some(outcome) = apply_field_overlay_action(self, &page, action, &ctx, f.app.state.steam_id, &f.app.client, visible_h) {
+                    if outcome.changed && page == Page::Search {
+                        self.query_changed = now;
+                    }
+                }
+                if !self.osk_open() || action == osk::OverlayAction::Submit {
+                    break;
+                }
+            }
+        } else {
+            let mut hint_ui = ui.new_child(egui::UiBuilder::new().max_rect(screen));
+            self.hint_bar(&mut hint_ui, &mut f, screen);
+        }
         if !self.active {
             return;
         }
@@ -1417,9 +1508,7 @@ impl BigPicture {
                 _ => String::new(),
             }
         };
-        let osk_open = (matches!(self.page(), Page::Chat(_)) && self.chat_keys)
-            || (self.page() == Page::Tab(Tab::Library) && self.library_search_open)
-            || self.profile.active_text_mut(&self.page()).is_some();
+        let osk_open = self.osk_open();
         let back = if let Some(menu) = &self.menu {
             menu.back_label()
         } else if drawer_open || osk_open {
@@ -1526,6 +1615,94 @@ impl BigPicture {
         w::logo(&mut c, t, size);
         p.text(screen.center() + vec2(0.0, size * 0.75 + 20.0 * s), Align2::CENTER_TOP, if self.deck_preview { t!("Deck preview") } else { t!("Big Picture") }, w::font_bold(30.0 * s), t.text.gamma_multiply(fade));
     }
+}
+
+fn typing_target_id(bp: &BigPicture, page: &Page) -> Option<Id> {
+    match page {
+        Page::Search => Some(Id::unique("bp-osk-search")),
+        Page::Chat(target) => Some(Id::unique(("bp-osk-chat", target))),
+        Page::Tab(Tab::Library) if bp.library_search_open => Some(Id::unique("bp-osk-lib")),
+        _ => bp.profile.active_target_id(page),
+    }
+}
+
+fn split_osk_field<'a>(bp: &'a mut BigPicture, page: &Page) -> Option<(&'a mut osk::OskState, &'a mut String)> {
+    let BigPicture { osk, query, message, library_query, profile, library_search_open, .. } = bp;
+    let field: &mut String = if matches!(page, Page::Chat(_)) {
+        message
+    } else if *page == Page::Tab(Tab::Library) && *library_search_open {
+        library_query
+    } else if let Some(s) = profile.active_text_mut(page) {
+        s
+    } else if *page == Page::Search {
+        query
+    } else {
+        return None;
+    };
+    Some((osk, field))
+}
+
+fn apply_field_overlay_action(
+    bp: &mut BigPicture,
+    page: &Page,
+    action: osk::OverlayAction,
+    ctx: &egui::Context,
+    my_id: SteamId,
+    client: &client::Client,
+    view_h: f32,
+) -> Option<osk::EditOutcome> {
+    let outcome = {
+        let (osk, field) = split_osk_field(bp, page)?;
+        let mut outcome = osk::apply_overlay_action(osk, field, action, None, false);
+        if outcome.copy {
+            ctx.copy_text(field.clone());
+        }
+        if outcome.cut {
+            outcome.changed = osk::delete_before_caret(osk, field, false);
+        }
+        outcome
+    };
+    if outcome.request_paste {
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+    }
+    if outcome.scroll_page != 0 {
+        if matches!(page, Page::Chat(_)) {
+            bp.chat_nudge += outcome.scroll_page as f32 * 2.5;
+        } else if *page == Page::ProfileEdit {
+            bp.profile.edit.body_scroll.target += outcome.scroll_page as f32 * view_h * 0.65;
+        } else {
+            bp.scroller("page").target += outcome.scroll_page as f32 * view_h * 0.65;
+        }
+    }
+    if outcome.submitted {
+        match page {
+            Page::Search => {
+                bp.submitted = bp.query.trim().to_string();
+                bp.search_osk_open = false;
+            }
+            Page::Tab(Tab::Library) => bp.library_search_open = false,
+            Page::Chat(_) => {
+                if !bp.message.trim().is_empty() {
+                    bp.send_now = true;
+                }
+            }
+            Page::Profile(raw_id) => {
+                let target = if *raw_id == 0 { my_id } else { *raw_id };
+                let trimmed = bp.profile.comment_draft.trim().to_string();
+                if !trimmed.is_empty() && trimmed.chars().count() <= 1000 {
+                    client.send(client::Command::PostComment { steam_id: target, text: trimmed });
+                }
+                bp.profile.comment_open = false;
+            }
+            Page::ProfileGames(_) => bp.profile.games_search_open = false,
+            Page::ProfileEdit => bp.profile.edit.active_field = None,
+            _ => {}
+        }
+    }
+    if outcome.hide {
+        bp.close_osk();
+    }
+    Some(outcome)
 }
 
 fn hint_bar_height(screen: Rect, s: f32) -> f32 {
@@ -1767,5 +1944,27 @@ mod layout_tests {
             assert!(bp.effective_pad_mode(ButtonHintMode::Controller));
         });
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn toggle_osk_and_b_close_overlay_before_page_back() {
+        let mut bp = BigPicture { active: true, ..Default::default() };
+        bp.open(Page::Search, 1.0);
+        assert!(bp.search_osk_open);
+        assert!(bp.osk_open());
+        assert!(bp.close_osk());
+        assert!(!bp.search_osk_open);
+        assert!(!bp.osk_open());
+        assert!(bp.toggle_osk());
+        assert!(bp.search_osk_open);
+        assert!(bp.toggle_osk());
+        assert!(!bp.search_osk_open);
+
+        bp.open(Page::Chat(ChatTarget::Friend(42)), 2.0);
+        assert!(!bp.chat_keys);
+        assert!(bp.toggle_osk());
+        assert!(bp.chat_keys && bp.osk_open());
+        assert!(bp.close_osk());
+        assert!(!bp.chat_keys && bp.page() == Page::Chat(ChatTarget::Friend(42)));
     }
 }

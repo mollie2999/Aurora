@@ -3,7 +3,8 @@
 //! Steam Guard verification, connection error / offline recovery, and signing-in splash.
 
 use super::focus::{Dir, Place};
-use super::input::{self, Press};
+use super::input::Press;
+use super::osk;
 pub(crate) use super::osk::{Key as OskKey, OskState, apply_key, draw_desktop};
 use super::paint::{self, Kind};
 use super::{BigPicture, Frame};
@@ -87,14 +88,6 @@ fn form_saved_btn_id() -> Id {
 fn form_qr_refresh_id() -> Id {
     Id::unique("bp-login-qr-refresh")
 }
-fn form_switch_account_id() -> Id {
-    Id::unique("bp-login-sw-acc")
-}
-fn form_switch_password_id() -> Id {
-    Id::unique("bp-login-sw-pass")
-}
-
-/// Draw the pre-login experience in Big Picture / Steam Deck Game Mode.
 pub fn show(app: &mut SteamApp, ui: &mut Ui) {
     let mut bp = std::mem::take(&mut app.bigpicture);
     show_inner(&mut bp, app, ui);
@@ -108,6 +101,7 @@ fn show_inner(bp: &mut BigPicture, app: &mut SteamApp, ui: &mut Ui) {
     let screen = ui.max_rect();
     let now = ctx.input(|i| i.time);
 
+    bp.osk.restore_function_key(&ctx);
     bp.ensure_fullscreen(&ctx, now);
     bp.sys_status = bp.system.snapshot(false, Some(&ctx));
     let s = bp.compute_scale(&ctx, screen, app.prefs.bigpicture_scale);
@@ -201,6 +195,9 @@ fn show_inner(bp: &mut BigPicture, app: &mut SteamApp, ui: &mut Ui) {
     }
 
     let guard_has_code = matches!(&phase, Phase::Guard(g) if g.iter().any(|x| x.needs_code()));
+    if screen_kind == LoginScreen::Guard && !guard_has_code {
+        app.login.bp_osk_open = false;
+    }
     let focused_on_field = match screen_kind {
         LoginScreen::Form => {
             app.login.bp_osk_open
@@ -224,38 +221,38 @@ fn show_inner(bp: &mut BigPicture, app: &mut SteamApp, ui: &mut Ui) {
             _ => false,
         };
 
-    // Physical keyboard Backspace and text input flow directly into the active field.
-    let backspaces: Vec<bool> = if typing {
-        ctx.input_mut(|i| {
-            let mut out = Vec::new();
-            i.events.retain(|e| match e {
-                egui::Event::Key { key: egui::Key::Backspace, pressed, modifiers, .. } => {
-                    if *pressed {
-                        out.push(modifiers.ctrl || modifiers.alt || modifiers.mac_cmd);
-                    }
-                    false
-                }
-                _ => true,
-            });
-            out
-        })
-    } else {
-        Vec::new()
+    let active_target = match screen_kind {
+        LoginScreen::Form => Some(if app.login.osk_field == Some(LoginField::Password) {
+            form_password_id()
+        } else {
+            form_account_id()
+        }),
+        LoginScreen::Guard if guard_has_code => Some(guard_code_id()),
+        _ => None,
     };
+    if let Some(tid) = active_target {
+        let cur = match screen_kind {
+            LoginScreen::Guard => &app.login.code,
+            LoginScreen::Form if app.login.osk_field == Some(LoginField::Password) => &app.login.password,
+            _ => &app.login.account,
+        };
+        bp.osk.sync_target(tid, cur);
+    }
+
     if typing {
-        let text: String = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| {
-                    if let egui::Event::Text(txt) = e {
-                        Some(txt.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        });
-        apply_physical_typing(&mut app.login, screen_kind, &text, &backspaces);
+        let guard_code = screen_kind == LoginScreen::Guard;
+        let password = app.login.osk_field == Some(LoginField::Password);
+        let copy_allowed = !password || app.login.show_password;
+        let field = if guard_code {
+            &mut app.login.code
+        } else if password {
+            &mut app.login.password
+        } else {
+            &mut app.login.account
+        };
+        osk::edit_physical(
+            &mut bp.osk, field, &ctx, app.login.bp_osk_open, guard_code, copy_allowed,
+        );
     }
 
     let presses = bp.drain_pad_and_keys(&ctx, typing);
@@ -263,64 +260,65 @@ fn show_inner(bp: &mut BigPicture, app: &mut SteamApp, ui: &mut Ui) {
     let mut press = false;
     let (mut x, mut y, mut lt, mut rt) = (false, false, false, false);
     let mut physical_enter = false;
+    let mut osk_input = super::osk::OskInput::default();
 
-    for (p, from_keys) in presses {
-        match p {
-            Press::Move(d) => dir = Some(d),
-            Press::A
-                if from_keys
-                    && !app.login.bp_osk_open
-                    && ((screen_kind == LoginScreen::Form
-                        && bp.focus.current == Some(form_password_id())
-                        && !app.login.account.trim().is_empty()
-                        && !app.login.password.is_empty())
-                        || (screen_kind == LoginScreen::Guard
-                            && bp.focus.current == Some(guard_code_id())
-                            && app.login.code.trim().len() == 5)) =>
-            {
-                physical_enter = true;
-            }
-            Press::A => press = true,
-            Press::B => {
-                if app.login.bp_osk_open {
-                    app.login.bp_osk_open = false;
-                    bp.focus.current = Some(match screen_kind {
-                        LoginScreen::Guard => guard_code_id(),
-                        _ if app.login.osk_field == Some(LoginField::Password) => {
-                            form_password_id()
+    if app.login.bp_osk_open {
+        for (p, from_keys) in presses {
+            osk_input.handle_press(p, from_keys);
+        }
+    } else {
+        for (p, from_keys) in presses {
+            match p {
+                Press::Move(d) => dir = Some(d),
+                Press::A
+                    if from_keys
+                        && ((screen_kind == LoginScreen::Form
+                            && bp.focus.current == Some(form_password_id())
+                            && !app.login.account.trim().is_empty()
+                            && !app.login.password.is_empty())
+                            || (screen_kind == LoginScreen::Guard
+                                && bp.focus.current == Some(guard_code_id())
+                                && app.login.code.trim().len() == 5)) =>
+                {
+                    physical_enter = true;
+                }
+                Press::A => press = true,
+                Press::ToggleOsk if matches!(screen_kind, LoginScreen::Form) || (screen_kind == LoginScreen::Guard && guard_has_code) => {
+                    app.login.bp_osk_open = true;
+                    bp.osk.reset_focus();
+                }
+                Press::B => {
+                    if app.login.bp_forget_confirm.is_some() {
+                        app.login.bp_forget_confirm = None;
+                    } else {
+                        match screen_kind {
+                            LoginScreen::Guard => {
+                                app.client.send(Command::CancelLogin);
+                                app.login.submitted = false;
+                            }
+                            LoginScreen::Splash => {
+                                app.client.send(Command::CancelLogin);
+                                app.login.submitted = false;
+                                app.login.signing_in = None;
+                            }
+                            LoginScreen::ConnectionError => {
+                                app.login.connection_error = None;
+                                app.state.last_error = None;
+                            }
+                            LoginScreen::Form if !app.saved.is_empty() => {
+                                app.login.adding = false;
+                                app.state.last_error = None;
+                            }
+                            _ => {}
                         }
-                        _ => form_account_id(),
-                    });
-                } else if app.login.bp_forget_confirm.is_some() {
-                    app.login.bp_forget_confirm = None;
-                } else {
-                    match screen_kind {
-                        LoginScreen::Guard => {
-                            app.client.send(Command::CancelLogin);
-                            app.login.submitted = false;
-                        }
-                        LoginScreen::Splash => {
-                            app.client.send(Command::CancelLogin);
-                            app.login.submitted = false;
-                            app.login.signing_in = None;
-                        }
-                        LoginScreen::ConnectionError => {
-                            app.login.connection_error = None;
-                            app.state.last_error = None;
-                        }
-                        LoginScreen::Form if !app.saved.is_empty() => {
-                            app.login.adding = false;
-                            app.state.last_error = None;
-                        }
-                        _ => {}
                     }
                 }
+                Press::X => x = true,
+                Press::Y => y = true,
+                Press::Lt => lt = true,
+                Press::Rt => rt = true,
+                _ => {}
             }
-            Press::X => x = true,
-            Press::Y => y = true,
-            Press::Lt => lt = true,
-            Press::Rt => rt = true,
-            _ => {}
         }
     }
 
@@ -359,7 +357,11 @@ fn show_inner(bp: &mut BigPicture, app: &mut SteamApp, ui: &mut Ui) {
         pos2(screen.right(), screen.bottom() - hint_h),
     );
 
-    bp.focus.begin(ui, dir, press);
+    if app.login.bp_osk_open {
+        bp.focus.pause_frame();
+    } else {
+        bp.focus.begin(ui, dir, press);
+    }
 
     // Top bar: logo + brand on left; controller + battery + clock + Exit Big Picture on right.
     let bar = Rect::from_min_size(screen.min, vec2(screen.width(), top_h));
@@ -400,14 +402,90 @@ fn show_inner(bp: &mut BigPicture, app: &mut SteamApp, ui: &mut Ui) {
         LoginScreen::Form => draw_form(bp, ui, &mut f, &phase),
     };
 
-    let first: Vec<Id> = preferred.into_iter().collect();
-    bp.focus.end(&first, exit_bp_id());
-    bp.focus.paint_ring(ui, &t, s, 12.0 * s, view);
+    if !f.app.login.bp_osk_open {
+        let first: Vec<Id> = preferred.into_iter().collect();
+        bp.focus.end(&first, exit_bp_id());
+        bp.focus.paint_ring(ui, &t, s, 12.0 * s, view);
 
-    // Bottom contextual hint bar.
-    let hints = build_hints(screen_kind, &f, guard_has_code);
-    let left_note = t!("Not affiliated with Valve.");
-    bp.draw_hint_bar_items(ui, &t, s, screen, pad, pad_mode, now, left_note, &hints);
+        let hints = build_hints(screen_kind, &f);
+        let left_note = t!("Not affiliated with Valve.");
+        bp.draw_hint_bar_items(ui, &t, s, screen, pad, pad_mode, now, left_note, &hints);
+    } else {
+        let go_label = if screen_kind == LoginScreen::Form
+            && f.app.login.osk_field == Some(LoginField::Password)
+        {
+            t!("Sign in")
+        } else {
+            t!("Continue")
+        };
+        for action in osk::draw_overlay(&mut bp.osk, ui, &t, s, screen, now, go_label, osk_input) {
+            ctx.request_repaint();
+            bp.osk.queue_function_key(action);
+            let max_chars = (screen_kind == LoginScreen::Guard).then_some(5);
+            let uppercase = screen_kind == LoginScreen::Guard;
+            let copy_allowed = !(screen_kind == LoginScreen::Form
+                && f.app.login.osk_field == Some(LoginField::Password)
+                && !f.app.login.show_password);
+            let outcome = {
+                let target = match screen_kind {
+                    LoginScreen::Guard => &mut f.app.login.code,
+                    _ if f.app.login.osk_field == Some(LoginField::Password) => &mut f.app.login.password,
+                    _ => &mut f.app.login.account,
+                };
+                let out = super::osk::apply_overlay_action(&mut bp.osk, target, action, max_chars, uppercase);
+                if out.copy && copy_allowed {
+                    ctx.copy_text(target.clone());
+                }
+                if out.cut && copy_allowed {
+                    osk::delete_before_caret(&mut bp.osk, target, false);
+                }
+                out
+            };
+            if outcome.request_paste {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            }
+            if outcome.tab && screen_kind == LoginScreen::Form {
+                if f.app.login.osk_field == Some(LoginField::Password) {
+                    f.app.login.osk_field = Some(LoginField::Account);
+                    bp.osk.sync_target(form_account_id(), &f.app.login.account);
+                } else {
+                    f.app.login.osk_field = Some(LoginField::Password);
+                    bp.osk.sync_target(form_password_id(), &f.app.login.password);
+                }
+            }
+            if outcome.submitted {
+                let busy = f.app.login.submitted && phase == Phase::Connecting;
+                match screen_kind {
+                    LoginScreen::Form => {
+                        if let Some(cmd) = crate::login::apply_form_osk_key(&mut f.app.login, super::osk::Key::Go, busy) {
+                            f.app.client.send(cmd);
+                            f.app.login.bp_osk_open = false;
+                        } else if f.app.login.osk_field == Some(LoginField::Password) {
+                            bp.osk.sync_target(form_password_id(), &f.app.login.password);
+                        }
+                    }
+                    LoginScreen::Guard => {
+                        if let Some(cmd) = crate::login::apply_guard_osk_key(&mut f.app.login, super::osk::Key::Go) {
+                            f.app.client.send(cmd);
+                            f.app.login.bp_osk_open = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if outcome.hide {
+                f.app.login.bp_osk_open = false;
+                bp.focus.current = Some(match screen_kind {
+                    LoginScreen::Guard => guard_code_id(),
+                    _ if f.app.login.osk_field == Some(LoginField::Password) => form_password_id(),
+                    _ => form_account_id(),
+                });
+            }
+            if !f.app.login.bp_osk_open {
+                break;
+            }
+        }
+    }
 
     // Battery-friendly repaint scheduling (never unconditional idle loop).
     if typing {
@@ -420,38 +498,6 @@ fn show_inner(bp: &mut BigPicture, app: &mut SteamApp, ui: &mut Ui) {
     ctx.request_repaint_after(Duration::from_secs(
         bp.sys_status.secs_until_next_minute.clamp(1, 60),
     ));
-}
-
-fn apply_physical_typing(
-    form: &mut crate::login::LoginForm,
-    screen: LoginScreen,
-    text: &str,
-    backspaces: &[bool],
-) {
-    let (target, max_chars, uppercase): (&mut String, Option<usize>, bool) = match screen {
-        LoginScreen::Form => match form.osk_field {
-            Some(LoginField::Password) => (&mut form.password, None, false),
-            _ => (&mut form.account, None, false),
-        },
-        LoginScreen::Guard => (&mut form.code, Some(5), true),
-        _ => return,
-    };
-    if !text.is_empty() {
-        for ch in text.chars() {
-            if ch.is_control() {
-                continue;
-            }
-            crate::bigpicture::osk::apply_key(
-                target,
-                super::osk::Key::Char(ch),
-                max_chars,
-                uppercase,
-            );
-        }
-    }
-    for word in backspaces {
-        input::backspace(target, *word);
-    }
 }
 
 fn header_bar(bp: &mut BigPicture, ui: &mut Ui, t: &Theme, s: f32, bar: Rect, pad: f32) -> bool {
@@ -549,25 +595,9 @@ fn header_bar(bp: &mut BigPicture, ui: &mut Ui, t: &Theme, s: f32, bar: Rect, pa
     exit_hit.activated
 }
 
-fn build_hints(screen: LoginScreen, f: &Frame, guard_has_code: bool) -> Vec<(Press, String)> {
+fn build_hints(screen: LoginScreen, f: &Frame) -> Vec<(Press, String)> {
     let mut hints = vec![(Press::A, t!("Select").into())];
     match screen {
-        LoginScreen::Form | LoginScreen::Guard if f.app.login.bp_osk_open => {
-            hints.push((Press::B, t!("Close").into()));
-            hints.push((Press::X, t!("Delete").into()));
-            if screen == LoginScreen::Form {
-                hints.push((Press::Y, t!("Space").into()));
-            }
-            hints.push((Press::Lt, "Shift".into()));
-            let go = if screen == LoginScreen::Form
-                && f.app.login.osk_field == Some(LoginField::Password)
-            {
-                t!("Sign in")
-            } else {
-                t!("Continue")
-            };
-            hints.push((Press::Rt, go.into()));
-        }
         LoginScreen::Saved => {
             if f.app.login.bp_forget_confirm.is_some() {
                 hints.push((Press::B, t!("Cancel").into()));
@@ -576,11 +606,7 @@ fn build_hints(screen: LoginScreen, f: &Frame, guard_has_code: bool) -> Vec<(Pre
                 hints.push((Press::X, t!("Remove").into()));
             }
         }
-        LoginScreen::Guard => {
-            let _ = guard_has_code;
-            hints.push((Press::B, t!("Cancel").into()));
-        }
-        LoginScreen::Splash | LoginScreen::ConnectionError => {
+        LoginScreen::Guard | LoginScreen::Splash | LoginScreen::ConnectionError => {
             hints.push((Press::B, t!("Cancel").into()));
         }
         LoginScreen::Form if !f.app.saved.is_empty() => {
@@ -646,6 +672,7 @@ fn compact_btn(
     hit.activated
 }
 
+#[allow(clippy::too_many_arguments)]
 fn text_box(
     bp: &mut BigPicture,
     ui: &mut Ui,
@@ -656,7 +683,9 @@ fn text_box(
     placeholder: &str,
     masked: bool,
     active: bool,
-) -> bool {
+    caret: usize,
+    selected_all: bool,
+) -> (bool, bool) {
     let s = f.s;
     let p = ui.painter();
     let hit = bp.focus.item(ui, id, rect, f.view, Place::Page);
@@ -675,25 +704,12 @@ fn text_box(
     } else {
         value.to_string()
     };
-    let font = w::font_semibold(21.0 * s);
-    let tx = rect.left() + 18.0 * s;
-    let max_w = (rect.width() - 36.0 * s).max(24.0);
-    if shown_val.is_empty() {
-        paint::line(p, pos2(tx, rect.center().y), Align2::LEFT_CENTER, placeholder, w::font(19.0 * s), f.t.text_faint, max_w);
-    } else {
-        let drawn = paint::line(p, pos2(tx, rect.center().y), Align2::LEFT_CENTER, &shown_val, font, f.t.text, max_w);
-        if active && (f.now * 2.0).fract() < 0.55 {
-            let cx = (drawn.right() + 3.0 * s).min(rect.right() - 14.0 * s);
-            p.vline(cx, rect.top() + 12.0 * s..=rect.bottom() - 12.0 * s, Stroke::new(2.2 * s, f.t.accent));
-        }
-    }
-    if active && shown_val.is_empty() && (f.now * 2.0).fract() < 0.55 {
-        p.vline(tx, rect.top() + 12.0 * s..=rect.bottom() - 12.0 * s, Stroke::new(2.2 * s, f.t.accent));
-    }
+    let inner = rect.shrink2(vec2(18.0 * s, 10.0 * s));
+    super::osk::paint_single_line_field(p, inner, &shown_val, placeholder, w::font_semibold(21.0 * s), &f.t, f.now, active, caret, selected_all);
     if hit.focused {
         bp.focus.ring_around(rect, r);
     }
-    hit.activated
+    (hit.activated, hit.focused)
 }
 
 // ---------- 1. Language picker ----------
@@ -862,23 +878,35 @@ fn draw_guard(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, guards: &[Guard])
         );
         // 5-slot display.
         let chars: Vec<char> = f.app.login.code.chars().take(5).collect();
+        let editing = osk_open || hit.focused;
         let slot_w = (box_w - 32.0 * s) / 5.0;
+        let slot_start = code_r.left() + 16.0 * s;
         for idx in 0..5 {
-            let sx = code_r.left() + 16.0 * s + idx as f32 * slot_w + slot_w * 0.5;
+            let sx = slot_start + (idx as f32 + 0.5) * slot_w;
             let sy = code_r.center().y;
             if let Some(ch) = chars.get(idx) {
+                if editing && bp.osk.selected_all {
+                    let selected = Rect::from_center_size(pos2(sx, sy), vec2(slot_w, box_h - 12.0 * s));
+                    p.rect_filled(selected, 3.0, f.t.accent.gamma_multiply(0.30));
+                }
                 p.text(pos2(sx, sy), Align2::CENTER_CENTER, ch.to_string(), w::font_bold(30.0 * s), f.t.text);
             } else {
                 let underline = Rect::from_center_size(pos2(sx, sy + 14.0 * s), vec2(slot_w * 0.55, 2.5 * s));
-                let col = if idx == chars.len() && (f.now * 2.0).fract() < 0.55 { f.t.accent } else { f.t.text_faint };
-                p.rect_filled(underline, paint::radius(1.0), col);
+                p.rect_filled(underline, paint::radius(1.0), f.t.text_faint);
             }
+        }
+        if editing && !bp.osk.selected_all && (f.now * 2.0).fract() < 0.55 {
+            let x = slot_start + bp.osk.caret.min(chars.len()) as f32 * slot_w;
+            p.vline(x, (code_r.top() + 12.0 * s)..=(code_r.bottom() - 12.0 * s), Stroke::new(2.0 * s, f.t.accent));
         }
         if hit.focused {
             bp.focus.ring_around(code_r, 14.0 * s);
         }
-        if hit.activated {
+        if hit.activated || (!osk_open && hit.focused && f.x) {
             f.app.login.bp_osk_open = !f.app.login.bp_osk_open;
+            if f.app.login.bp_osk_open {
+                bp.osk.reset_focus();
+            }
         }
         y += box_h + 10.0 * s;
 
@@ -902,20 +930,6 @@ fn draw_guard(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, guards: &[Guard])
         if pill_btn(bp, ui, f, guard_cancel_id(), cancel_r, None, t!("Cancel"), Kind::Secondary) {
             f.app.client.send(Command::CancelLogin);
             f.app.login.submitted = false;
-        }
-        y += btn_h + 14.0 * s;
-
-        if osk_open {
-            if f.x {
-                crate::login::apply_guard_osk_key(&mut f.app.login, super::osk::Key::Del);
-            }
-            let osk_w = (f.view.width() - 2.0 * f.pad).min(860.0 * s);
-            let osk_left = f.view.center().x - osk_w * 0.5;
-            if let Some(key) = super::osk::draw(bp, ui, f, osk_left, osk_w, &mut y, t!("Continue")) {
-                if let Some(cmd) = crate::login::apply_guard_osk_key(&mut f.app.login, key) {
-                    f.app.client.send(cmd);
-                }
-            }
         }
         Some(guard_code_id())
     } else {
@@ -1269,106 +1283,9 @@ fn draw_form(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, phase: &Phase) -> 
     let p = ui.painter().clone();
     let busy = f.app.login.submitted && *phase == Phase::Connecting;
     let ready = !f.app.login.account.trim().is_empty() && !f.app.login.password.is_empty();
+    let osk_open = f.app.login.bp_osk_open;
 
-    if f.app.login.bp_osk_open {
-        // Compact top strip + OSK below so every key fits inside 1280×800 without clipping.
-        let max_w = (f.view.width() - 2.0 * f.pad).min(960.0 * s);
-        let left = f.view.center().x - max_w * 0.5;
-        let mut y = f.view.top() + 8.0 * s;
-
-        let active = match f.app.login.osk_field {
-            Some(LoginField::Password) => LoginField::Password,
-            _ => LoginField::Account,
-        };
-
-        // Row 1: Field switcher + Eye toggle + Sign in + Hide Keyboard.
-        let strip_h = 42.0 * s;
-        let gap = 10.0 * s;
-        let acc_w = (paint::text_width(&p, t!("Account"), w::font_semibold(17.0 * s)) + 34.0 * s).max(116.0 * s);
-        let pass_w = (paint::text_width(&p, t!("Password"), w::font_semibold(17.0 * s)) + 34.0 * s).max(124.0 * s);
-        let eye_w = 46.0 * s;
-        let hide_lbl = format!("{}  {}", icons::X, t!("Hide"));
-        let hide_w = (paint::text_width(&p, &hide_lbl, w::font_semibold(17.0 * s)) + 30.0 * s).max(100.0 * s);
-        let go_w = (paint::text_width(&p, t!("Sign in"), w::font_semibold(17.0 * s)) + 36.0 * s).max(124.0 * s);
-
-        let mut x = left;
-        if compact_btn(bp, ui, f, form_switch_account_id(), Rect::from_min_size(pos2(x, y), vec2(acc_w, strip_h)), None, t!("Account"), active == LoginField::Account) {
-            f.app.login.osk_field = Some(LoginField::Account);
-        }
-        x += acc_w + gap;
-        if compact_btn(bp, ui, f, form_switch_password_id(), Rect::from_min_size(pos2(x, y), vec2(pass_w, strip_h)), None, t!("Password"), active == LoginField::Password) {
-            f.app.login.osk_field = Some(LoginField::Password);
-        }
-        x += pass_w + gap;
-        let eye_icon = if f.app.login.show_password { icons::EYE_SLASH } else { icons::EYE };
-        if compact_btn(bp, ui, f, form_eye_id(), Rect::from_min_size(pos2(x, y), vec2(eye_w, strip_h)), Some(eye_icon), "", f.app.login.show_password) {
-            f.app.login.show_password = !f.app.login.show_password;
-        }
-
-        // Right-aligned Sign in & Hide keyboard.
-        let hide_r = Rect::from_min_size(pos2(left + max_w - hide_w, y), vec2(hide_w, strip_h));
-        let go_r = Rect::from_min_size(pos2(hide_r.left() - gap - go_w, y), vec2(go_w, strip_h));
-        if compact_btn(bp, ui, f, form_signin_id(), go_r, None, t!("Sign in"), ready && !busy) && ready && !busy {
-            f.app.login.submitted = true;
-            f.app.login.show_password = false;
-            f.app.client.send(Command::LoginPassword {
-                account: f.app.login.account.trim().to_string(),
-                password: std::mem::take(&mut f.app.login.password),
-            });
-        }
-        if compact_btn(bp, ui, f, form_osk_btn_id(), hide_r, Some(icons::X), t!("Hide"), false) {
-            f.app.login.bp_osk_open = false;
-        }
-        y += strip_h + 12.0 * s;
-
-        // Row 2: Active text box + optional compact QR thumbnail on the right.
-        let qr_thumb = if matches!(phase, Phase::Qr(_)) { 84.0 * s } else { 0.0 };
-        let field_w = if qr_thumb > 0.0 { max_w - qr_thumb - 16.0 * s } else { max_w };
-        let box_h = 56.0 * s;
-        let (lbl, val_str, masked): (&str, String, bool) = match active {
-            LoginField::Account => (t!("Sign in with account name"), f.app.login.account.clone(), false),
-            _ if f.app.login.show_password => (t!("Password"), f.app.login.password.clone(), false),
-            _ => (t!("Password"), "•".repeat(f.app.login.password.chars().count()), false),
-        };
-        paint::line(&p, pos2(left, y), Align2::LEFT_TOP, lbl, w::font_medium(15.0 * s), f.t.text_dim, field_w);
-        let box_r = Rect::from_min_size(pos2(left, y + 22.0 * s), vec2(field_w, box_h));
-        let box_id = if active == LoginField::Account { form_account_id() } else { form_password_id() };
-        if text_box(bp, ui, f, box_id, box_r, &val_str, lbl, masked, true) {
-            f.app.login.osk_field = Some(if active == LoginField::Account { LoginField::Password } else { LoginField::Account });
-        }
-        if let Phase::Qr(url) = phase {
-            let qr_r = Rect::from_min_size(pos2(left + max_w - qr_thumb, y - 2.0 * s), vec2(qr_thumb, qr_thumb));
-            crate::login::draw_qr(ui, &mut f.app.login.qr_cache, url, qr_r);
-        }
-        y = box_r.bottom() + 10.0 * s;
-
-        if f.app.login.password_error
-            && let Some(e) = &f.app.state.last_error
-        {
-            paint::line(&p, pos2(left, y), Align2::LEFT_TOP, &format!("{}  {}", icons::WARNING, i18n::tr_dyn(e)), w::font(15.0 * s), f.t.danger, max_w);
-            y += 24.0 * s;
-        } else {
-            y += 6.0 * s;
-        }
-
-        // Controller shortcuts X = Delete, Y = Space while OSK is open.
-        if f.x {
-            let _ = crate::login::apply_form_osk_key(&mut f.app.login, super::osk::Key::Del, busy);
-        }
-        if f.y {
-            let _ = crate::login::apply_form_osk_key(&mut f.app.login, super::osk::Key::Char(' '), busy);
-        }
-
-        let go_label = if active == LoginField::Account { t!("Continue") } else { t!("Sign in") };
-        if let Some(key) = super::osk::draw(bp, ui, f, left, max_w, &mut y, go_label) {
-            if let Some(cmd) = crate::login::apply_form_osk_key(&mut f.app.login, key, busy) {
-                f.app.client.send(cmd);
-            }
-        }
-        return Some(box_id);
-    }
-
-    // Side-by-side form + QR layout (OSK closed).
+    // Unified side-by-side form + QR layout (stays visible in the upper half while overlay OSK docks at bottom).
     let avail_w = f.view.width() - 2.0 * f.pad;
     let total_w = avail_w.min(1000.0 * s);
     let qr_col_w = 320.0 * s;
@@ -1377,7 +1294,11 @@ fn draw_form(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, phase: &Phase) -> 
     let left = f.view.center().x - total_w * 0.5;
     let right_x = left + form_w + col_gap;
     let content_h = 430.0 * s;
-    let top_y = (f.view.center().y - content_h * 0.5).max(f.view.top() + 20.0 * s);
+    let top_y = if osk_open {
+        f.view.top() + 14.0 * s
+    } else {
+        (f.view.center().y - content_h * 0.5).max(f.view.top() + 20.0 * s)
+    };
 
     // Left column: account, password, sign in, keyboard toggle, saved accounts.
     let mut y = top_y;
@@ -1387,11 +1308,15 @@ fn draw_form(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, phase: &Phase) -> 
     paint::line(&p, pos2(left, y), Align2::LEFT_TOP, t!("Sign in with account name"), w::font_medium(17.0 * s), f.t.text_dim, form_w);
     y += 24.0 * s;
     let acc_r = Rect::from_min_size(pos2(left, y), vec2(form_w, 54.0 * s));
-    let acc_focused = bp.focus.current == Some(form_account_id());
+    let acc_active = f.app.login.osk_field != Some(LoginField::Password)
+        && (osk_open || bp.focus.current == Some(form_account_id()));
     let acc_val = f.app.login.account.clone();
-    if text_box(bp, ui, f, form_account_id(), acc_r, &acc_val, t!("Account"), false, acc_focused) {
+    let acc_caret = if acc_active { bp.osk.caret } else { acc_val.chars().count() };
+    let (acc_act, acc_foc) = text_box(bp, ui, f, form_account_id(), acc_r, &acc_val, t!("Account"), false, acc_active, acc_caret, acc_active && bp.osk.selected_all);
+    if acc_act || (!osk_open && acc_foc && f.x) {
         f.app.login.osk_field = Some(LoginField::Account);
         f.app.login.bp_osk_open = true;
+        bp.osk.reset_focus();
     }
     y += 54.0 * s + 18.0 * s;
 
@@ -1400,16 +1325,16 @@ fn draw_form(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, phase: &Phase) -> 
     let eye_w = 54.0 * s;
     let pass_r = Rect::from_min_size(pos2(left, y), vec2(form_w - eye_w - 10.0 * s, 54.0 * s));
     let eye_r = Rect::from_min_size(pos2(pass_r.right() + 10.0 * s, y), vec2(eye_w, 54.0 * s));
-    let pass_focused = bp.focus.current == Some(form_password_id());
+    let pass_active = f.app.login.osk_field == Some(LoginField::Password)
+        && (osk_open || bp.focus.current == Some(form_password_id()));
     let show_pw = f.app.login.show_password;
-    let pass_shown = if show_pw {
-        f.app.login.password.clone()
-    } else {
-        "•".repeat(f.app.login.password.chars().count())
-    };
-    if text_box(bp, ui, f, form_password_id(), pass_r, &pass_shown, t!("Password"), false, pass_focused) {
+    let pass_val = f.app.login.password.clone();
+    let pass_caret = if pass_active { bp.osk.caret } else { pass_val.chars().count() };
+    let (pass_act, pass_foc) = text_box(bp, ui, f, form_password_id(), pass_r, &pass_val, t!("Password"), !show_pw, pass_active, pass_caret, pass_active && bp.osk.selected_all);
+    if pass_act || (!osk_open && pass_foc && f.x) {
         f.app.login.osk_field = Some(LoginField::Password);
         f.app.login.bp_osk_open = true;
+        bp.osk.reset_focus();
     }
     let eye_icon = if show_pw { icons::EYE_SLASH } else { icons::EYE };
     if compact_btn(bp, ui, f, form_eye_id(), eye_r, Some(eye_icon), "", show_pw) {
@@ -1442,8 +1367,11 @@ fn draw_form(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, phase: &Phase) -> 
     // Secondary action row: Keyboard toggle + Saved accounts.
     let kbd_w = (paint::text_width(&p, t!("Keyboard"), w::font_semibold(17.0 * s)) + 38.0 * s).max(140.0 * s);
     let kbd_r = Rect::from_min_size(pos2(left, y), vec2(kbd_w, 44.0 * s));
-    if compact_btn(bp, ui, f, form_osk_btn_id(), kbd_r, None, t!("Keyboard"), false) {
-        f.app.login.bp_osk_open = true;
+    if compact_btn(bp, ui, f, form_osk_btn_id(), kbd_r, None, t!("Keyboard"), osk_open) {
+        f.app.login.bp_osk_open = !f.app.login.bp_osk_open;
+        if f.app.login.bp_osk_open {
+            bp.osk.reset_focus();
+        }
     }
     if !f.app.saved.is_empty() {
         let saved_w = (paint::text_width(&p, t!("Saved accounts"), w::font_semibold(17.0 * s)) + 44.0 * s).max(180.0 * s);
@@ -1495,30 +1423,4 @@ fn draw_form(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, phase: &Phase) -> 
     } else {
         form_password_id()
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn physical_typing_updates_active_form_and_guard_fields() {
-        let mut form = crate::login::LoginForm {
-            osk_field: Some(LoginField::Account),
-            ..Default::default()
-        };
-        apply_physical_typing(&mut form, LoginScreen::Form, "user\n", &[]);
-        assert_eq!(form.account, "user");
-        apply_physical_typing(&mut form, LoginScreen::Form, "", &[false]);
-        assert_eq!(form.account, "use");
-
-        form.osk_field = Some(LoginField::Password);
-        apply_physical_typing(&mut form, LoginScreen::Form, "Pass!1", &[]);
-        assert_eq!(form.password, "Pass!1");
-
-        apply_physical_typing(&mut form, LoginScreen::Guard, "ab12cd", &[]);
-        assert_eq!(form.code, "AB12C");
-        apply_physical_typing(&mut form, LoginScreen::Guard, "", &[false]);
-        assert_eq!(form.code, "AB12");
-    }
 }

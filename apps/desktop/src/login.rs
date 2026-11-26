@@ -365,7 +365,8 @@ fn form_and_qr(app: &mut SteamApp, ui: &mut Ui, t: &Theme, phase: &Phase) {
                 });
                 w::autofocus(
                     &name,
-                    app.login.account.is_empty()
+                    !osk_open
+                        && app.login.account.is_empty()
                         && !pass_focus
                         && app.login.osk_field != Some(LoginField::Password),
                 );

@@ -185,6 +185,28 @@ impl ProfileState {
         }
     }
 
+    pub(crate) fn cycle_edit_field(&mut self, dir: i8) -> bool {
+        if dir == 0 || self.edit.draft.is_none() {
+            return false;
+        }
+        const GENERAL_FIELDS: [EditField; 4] = [
+            EditField::PersonaName,
+            EditField::RealName,
+            EditField::CustomUrl,
+            EditField::Summary,
+        ];
+        let Some(cur) = self.edit.active_field else {
+            return false;
+        };
+        let Some(idx) = GENERAL_FIELDS.iter().position(|f| *f == cur) else {
+            return false;
+        };
+        let len = GENERAL_FIELDS.len();
+        let next = if dir > 0 { (idx + 1) % len } else { (idx + len - 1) % len };
+        self.edit.active_field = Some(GENERAL_FIELDS[next]);
+        true
+    }
+
     pub(crate) fn close_osk(&mut self, page: &Page) -> bool {
         match page {
             Page::Profile(_) if self.comment_open => {

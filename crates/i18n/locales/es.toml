@@ -2623,3 +2623,5 @@
 "Smooth scrolling" = "Desplazamiento suave"
 "Glide each mouse wheel step over a few frames. Off: the page jumps the whole step at once." = "Desliza cada paso de la rueda del ratón durante unos fotogramas. Desactivado: la página salta el paso completo de una vez."
 "Sort by recent activity" = "Ordenar por actividad reciente"
+"Keyboard touchpad haptics" = "Vibración táctil de los paneles en el teclado"
+"Subtle vibration when moving across on-screen keyboard keys with touchpads." = "Vibración sutil al desplazarse por las teclas del teclado en pantalla con los paneles táctiles."

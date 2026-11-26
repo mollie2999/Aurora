@@ -68,6 +68,8 @@ pub enum PadEvent {
     Press(Press),
     /// Live touchpad contacts (`[left, right]` on dual-pad devices such as Steam Deck).
     Touchpads([client::TouchpadFinger; 2]),
+    /// Whether the confirm button (A, or B when swapped) is currently held down.
+    ConfirmDown(bool),
     /// How many controllers are connected now.
     Connected(usize),
 }
@@ -340,6 +342,7 @@ fn read_pads(frames: mpsc::Receiver<LauncherPadFrame>, tx: mpsc::Sender<PadEvent
     let mut held = HashMap::<u32, HeldDirections>::new();
     let mut connected: Option<usize> = None;
     let mut last_touchpads = [client::TouchpadFinger::default(); 2];
+    let mut last_confirm_down = false;
     let mut presses = Vec::new();
     loop {
         let wait = next_poll_timeout(&held, Instant::now());
@@ -374,6 +377,14 @@ fn read_pads(frames: mpsc::Receiver<LauncherPadFrame>, tx: mpsc::Sender<PadEvent
                     if touchpads != last_touchpads {
                         last_touchpads = touchpads;
                         if !send(PadEvent::Touchpads(touchpads)) {
+                            return;
+                        }
+                    }
+                    let confirm_bit = if SWAP_AB.load(Ordering::Relaxed) { BTN_B } else { BTN_A };
+                    let confirm_down = frame.pads.iter().any(|p| p.buttons & confirm_bit != 0 && p.buttons & BTN_GUIDE == 0);
+                    if confirm_down != last_confirm_down {
+                        last_confirm_down = confirm_down;
+                        if !send(PadEvent::ConfirmDown(confirm_down)) {
                             return;
                         }
                     }

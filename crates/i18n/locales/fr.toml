@@ -2623,3 +2623,5 @@
 "Smooth scrolling" = "Défilement fluide"
 "Glide each mouse wheel step over a few frames. Off: the page jumps the whole step at once." = "Fait glisser chaque cran de la molette sur quelques images. Désactivé : la page saute tout le cran d'un coup."
 "Sort by recent activity" = "Trier par activité récente"
+"Keyboard touchpad haptics" = "Retour haptique des pavés tactiles du clavier"
+"Subtle vibration when moving across on-screen keyboard keys with touchpads." = "Légère vibration lors du passage sur les touches du clavier virtuel avec les pavés tactiles."

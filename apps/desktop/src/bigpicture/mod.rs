@@ -658,6 +658,9 @@ pub fn poll(app: &mut SteamApp, ctx: &egui::Context, visible: bool) -> bool {
                 let open = if signed_in { bp.osk_open() } else { app.login.bp_osk_open };
                 bp.osk.update_touchpads(pads, focused && bp.active && open);
             }
+            PadEvent::ConfirmDown(down) => {
+                bp.osk.set_confirm_down(down);
+            }
             PadEvent::Press(press) if signed_in || bp.active => {
                 show_window |= bp.handle_pad_press(ctx, press, focused, playing);
             }
@@ -828,6 +831,7 @@ impl BigPicture {
             return;
         }
         self.osk.restore_function_key(&ctx);
+        self.osk.hover_haptics = app.prefs.osk_touchpad_haptics;
         self.ensure_fullscreen(&ctx, now);
 
         // ---- input ----
@@ -854,6 +858,17 @@ impl BigPicture {
                     self.query_changed = now;
                 }
                 self.device = Device::Keyboard;
+            }
+            if page == Page::ProfileEdit {
+                let tab_dir = osk::take_physical_tab(&ctx);
+                if tab_dir != 0 && self.profile.cycle_edit_field(tab_dir) {
+                    if let Some(new_id) = typing_target_id(self, &page)
+                        && let Some((osk, new_field)) = split_osk_field(self, &page)
+                    {
+                        osk.sync_target(new_id, new_field);
+                    }
+                    self.device = Device::Keyboard;
+                }
             }
         }
         let embedded_typing = matches!(page, Page::Embedded(..)) && !drawer_open && ctx.egui_wants_keyboard_input();
@@ -1664,6 +1679,15 @@ fn apply_field_overlay_action(
     };
     if outcome.request_paste {
         ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+    }
+    if outcome.tab_dir != 0 && *page == Page::ProfileEdit {
+        if bp.profile.cycle_edit_field(outcome.tab_dir) {
+            if let Some(new_id) = typing_target_id(bp, page)
+                && let Some((osk, new_field)) = split_osk_field(bp, page)
+            {
+                osk.sync_target(new_id, new_field);
+            }
+        }
     }
     if outcome.scroll_page != 0 {
         if matches!(page, Page::Chat(_)) {

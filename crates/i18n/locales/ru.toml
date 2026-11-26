@@ -2732,3 +2732,5 @@
 "Smooth scrolling" = "Плавная прокрутка"
 "Glide each mouse wheel step over a few frames. Off: the page jumps the whole step at once." = "Растягивает каждый шаг колеса мыши на несколько кадров. Выкл.: страница сразу прыгает на весь шаг."
 "Sort by recent activity" = "Сортировать по недавней активности"
+"Keyboard touchpad haptics" = "Тактильный отклик трекпадов на клавиатуре"
+"Subtle vibration when moving across on-screen keyboard keys with touchpads." = "Лёгкая вибрация при перемещении по клавишам экранной клавиатуры с помощью трекпадов."

@@ -964,6 +964,100 @@ pub fn refresh_ui() {
     platform::ensure_ui_reader();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HapticSide {
+    Left,
+    Right,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchpadHaptic {
+    /// Light tick when a finger crosses into a new OSK key (optional setting).
+    KeyCross,
+    /// Firm click feedback when a touchpad is pressed to activate a key (always on).
+    PressClick,
+    /// Distinct pulse when a long-press triggers a secondary symbol.
+    LongPress,
+}
+
+impl TouchpadHaptic {
+    fn pulse(self, side: HapticSide) -> (u16, u16, u32) {
+        let (strength, ms) = match self {
+            Self::KeyCross => (0x3000, 14),
+            Self::PressClick => (0x8500, 28),
+            Self::LongPress => (0xB000, 42),
+        };
+        match side {
+            HapticSide::Left => (strength, 0, ms),
+            HapticSide::Right => (0, strength, ms),
+            HapticSide::Both => (strength, strength, ms),
+        }
+    }
+}
+
+#[derive(Default)]
+struct HapticQueue {
+    pending: std::collections::VecDeque<(HapticSide, TouchpadHaptic)>,
+    last_cross: [Option<std::time::Instant>; 2],
+}
+
+impl HapticQueue {
+    fn push(&mut self, mut side: HapticSide, kind: TouchpadHaptic, now: std::time::Instant) {
+        if kind == TouchpadHaptic::KeyCross {
+            let ready = |i: usize| self.last_cross[i].is_none_or(|last| now.duration_since(last).as_millis() >= 28);
+            side = match (side != HapticSide::Right && ready(0), side != HapticSide::Left && ready(1)) {
+                (true, true) => HapticSide::Both,
+                (true, false) => HapticSide::Left,
+                (false, true) => HapticSide::Right,
+                (false, false) => return,
+            };
+            if self.pending.len() == 16 || self.pending.contains(&(side, kind)) {
+                return;
+            }
+            if side != HapticSide::Right { self.last_cross[0] = Some(now); }
+            if side != HapticSide::Left { self.last_cross[1] = Some(now); }
+        } else if self.pending.len() == 16 {
+            let oldest_cross = self.pending.iter().position(|(_, k)| *k == TouchpadHaptic::KeyCross);
+            self.pending.remove(oldest_cross.unwrap_or(0));
+        }
+        self.pending.push_back((side, kind));
+    }
+}
+
+static HAPTICS: std::sync::LazyLock<Mutex<HapticQueue>> = std::sync::LazyLock::new(Default::default);
+
+/// Queue feedback for the controller reader. Device I/O stays on its polling thread.
+pub fn trigger_touchpad_haptic(side: HapticSide, kind: TouchpadHaptic) {
+    HAPTICS.lock().unwrap_or_else(|e| e.into_inner()).push(side, kind, std::time::Instant::now());
+    UI_LAST_POLL_MS.store(shm::now_ms(), std::sync::atomic::Ordering::Relaxed);
+    platform::ensure_ui_reader();
+}
+
+fn next_haptic() -> Option<(HapticSide, TouchpadHaptic)> {
+    HAPTICS.lock().unwrap_or_else(|e| e.into_inner()).pending.pop_front()
+}
+
+fn dispatch_sdl_haptic(sdl: &sdl_dyn::Sdl, pads: impl Iterator<Item = (sdl_dyn::Gp, u16)> + Clone) {
+    let Some((side, kind)) = next_haptic() else { return };
+    let preferred = |(gp, vendor): &(sdl_dyn::Gp, u16)| {
+        *vendor == 0x28de || sdl.num_touchpads.is_some_and(|count| unsafe { count(*gp) > 0 })
+    };
+    let has_preferred = pads.clone().any(|pad| preferred(&pad));
+    let (low, high, ms) = kind.pulse(side);
+    let mut delivered = false;
+    let mut deck_failed = false;
+    for (gp, vendor) in pads.filter(|pad| !has_preferred || preferred(pad)) {
+        let ok = unsafe { (sdl.rumble)(gp, low, high, ms) };
+        delivered |= ok;
+        deck_failed |= vendor == 0x28de && !ok;
+    }
+    if deck_failed || !delivered {
+        #[cfg(target_os = "linux")]
+        platform::hidraw_haptic(side, kind);
+    }
+}
+
 pub fn trigger_test_rumble(controller_id: &str) {
     *rumble_lock().lock().unwrap_or_else(|e| e.into_inner()) = Some(controller_id.to_string());
 }
@@ -1428,6 +1522,7 @@ mod platform {
                 true
             });
 
+            super::dispatch_sdl_haptic(sdl, pads.iter().map(|pad| (pad.gp, pad.vendor)));
             publish_summary(summary);
             emit_launcher_frame(&mut last_launcher, LauncherPadFrame { connected: launcher_pads.len(), pads: launcher_pads });
 
@@ -1995,6 +2090,7 @@ mod platform {
                 }
                 true
             });
+            super::dispatch_sdl_haptic(sdl, pads.iter().map(|pad| (pad.gp, pad.vendor)));
             publish_summary(summary);
             emit_launcher_frame(&mut last_launcher, LauncherPadFrame { connected: launcher_pads.len(), pads: launcher_pads });
             if ui_active() {
@@ -2354,6 +2450,41 @@ mod platform {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn hidraw_haptic(side: super::HapticSide, kind: super::TouchpadHaptic) {
+        use super::{HapticSide, TouchpadHaptic};
+
+        // hid-steam's 0x8f feature report uses swapped pad indices, a pulse
+        // period in microseconds, repeat count and signed gain in dB.
+        let mut report = [0u8; 65];
+        report[1..4].copy_from_slice(&[0x8f, 8, match side {
+            HapticSide::Left => 1, HapticSide::Right => 0, HapticSide::Both => 2,
+        }]);
+        report[4..6].copy_from_slice(&500u16.to_le_bytes());
+        report[6..8].copy_from_slice(&500u16.to_le_bytes());
+        report[8..10].copy_from_slice(&(kind.pulse(side).2 as u16).to_le_bytes());
+        report[10] = match kind {
+            TouchpadHaptic::KeyCross => (-12i8) as u8,
+            TouchpadHaptic::PressClick => 0,
+            TouchpadHaptic::LongPress => 4,
+        };
+        let Ok(nodes) = std::fs::read_dir("/sys/class/hidraw") else { return };
+        for node in nodes.flatten() {
+            let Ok(info) = std::fs::read_to_string(node.path().join("device/uevent")) else { continue };
+            if !info.lines().filter_map(|line| line.strip_prefix("HID_ID=")).any(|id| {
+                matches!(id.split_once(':').map(|(_, ids)| ids), Some("000028DE:00001205" | "000028DE:00001206"))
+            }) {
+                continue;
+            }
+            let Ok(fd) = File::options().read(true).write(true).custom_flags(libc::O_NONBLOCK)
+                .open(Path::new("/dev").join(node.file_name())) else { continue };
+            let request = libc::_IOWR::<[u8; 65]>(u32::from(b'H'), 6);
+            if unsafe { libc::ioctl(fd.as_raw_fd(), request, report.as_mut_ptr()) } >= 0 {
+                return;
+            }
+        }
+    }
+
     fn run_native_linux() {
         let mut nodes: Vec<(SysfsPad, OpenNode)> = Vec::new();
         let mut scanned: Option<Instant> = None;
@@ -2475,6 +2606,10 @@ mod platform {
                     });
                 }
             }
+            #[cfg(target_os = "linux")]
+            if let Some((side, kind)) = super::next_haptic() {
+                hidraw_haptic(side, kind);
+            }
             publish_summary(summary);
             emit_launcher_frame(&mut last_launcher, LauncherPadFrame { connected: launcher_pads.len(), pads: launcher_pads });
             if ui_active() {
@@ -2499,6 +2634,41 @@ mod platform {
 mod tests {
     use super::*;
     use shm::FAMILY_ALL;
+
+    #[test]
+    fn touchpad_pulse_routes_each_strength_to_requested_motors() {
+        for (kind, strength, ms) in [
+            (TouchpadHaptic::KeyCross, 0x3000, 14),
+            (TouchpadHaptic::PressClick, 0x8500, 28),
+            (TouchpadHaptic::LongPress, 0xB000, 42),
+        ] {
+            assert_eq!(kind.pulse(HapticSide::Left), (strength, 0, ms));
+            assert_eq!(kind.pulse(HapticSide::Right), (0, strength, ms));
+            assert_eq!(kind.pulse(HapticSide::Both), (strength, strength, ms));
+        }
+    }
+
+    #[test]
+    fn haptic_queue_coalesces_crossings_and_prioritizes_clicks() {
+        use HapticSide::*;
+        use TouchpadHaptic::*;
+        let mut q = HapticQueue::default();
+        let now = std::time::Instant::now();
+        q.push(Left, KeyCross, now);
+        q.push(Both, KeyCross, now);
+        q.push(Both, KeyCross, now);
+        q.push(Left, KeyCross, now + std::time::Duration::from_millis(28));
+        assert_eq!(q.pending.len(), 2);
+        assert_eq!(q.pending.pop_front(), Some((Left, KeyCross)));
+        assert_eq!(q.pending.pop_front(), Some((Right, KeyCross)));
+        q.push(Both, KeyCross, now + std::time::Duration::from_millis(29));
+        assert_eq!(q.pending.front(), Some(&(Both, KeyCross)));
+        for _ in 0..15 { q.push(Left, PressClick, now); }
+        q.push(Right, LongPress, now);
+        assert_eq!(q.pending.len(), 16);
+        assert_eq!(q.pending.front(), Some(&(Left, PressClick)));
+        assert_eq!(q.pending.back(), Some(&(Right, LongPress)));
+    }
 
     #[test]
     fn family_classification_handles_sdl_vendor_and_name() {

@@ -17,8 +17,18 @@ const KEYS_RU: [&str; 4] = ["1234567890-", "йцукенгшщзх", "фывап
 const KEYS_RU_SHIFT: [&str; 4] = ["!\"№;%:?*()_", "ЙЦУКЕНГШЩЗХ", "ФЫВАПРОЛДЖЭ", "ЯЧСМИТЬБЮЪЁ"];
 const KEYS_SYM: [&str; 4] = ["!@#$%^&*()", "-_=+[]{};:", "/?,.<>'\"~`", "|\\€£¥°•·+*"];
 
+const LONG_PRESS_SECS: f64 = 0.38;
+
+#[derive(Clone, Copy)]
+struct HoldState {
+    id: Id,
+    primary: KeyOp,
+    secondary: KeyOp,
+    started_at: f64,
+    long_fired: bool,
+}
+
 /// Keyboard mode, caret, focus, and touchpad state shared across Big Picture screens.
-#[derive(Default)]
 pub struct OskState {
     pub cyrillic: bool,
     pub shift: bool,
@@ -28,17 +38,56 @@ pub struct OskState {
     pub alt: bool,
     pub master_bar: bool,
     pub fn_keys_page: bool,
+    /// Enable light touchpad haptic ticks when crossing OSK keys (touch click feedback is always on).
+    pub hover_haptics: bool,
     pub caret: usize,
     pub selected_all: bool,
     active_target: Option<Id>,
     pub focus: Focus,
     touchpads: [client::TouchpadFinger; 2],
     pad_clicks: Vec<(usize, client::TouchpadFinger)>,
+    last_hovered_key: [Option<Id>; 2],
+    pad_holds: [Option<HoldState>; 2],
+    pointer_hold: Option<HoldState>,
+    confirm_hold: Option<HoldState>,
+    confirm_down: bool,
     opened_at: Option<f64>,
     reveal_pending: bool,
     pub field_rect: Option<Rect>,
     function_key: Option<egui::Key>,
     key_pop: Option<(Id, f64)>,
+}
+
+impl Default for OskState {
+    fn default() -> Self {
+        Self {
+            cyrillic: false,
+            shift: false,
+            caps: false,
+            symbols: false,
+            ctrl: false,
+            alt: false,
+            master_bar: false,
+            fn_keys_page: false,
+            hover_haptics: true,
+            caret: 0,
+            selected_all: false,
+            active_target: None,
+            focus: Focus::default(),
+            touchpads: [client::TouchpadFinger::default(); 2],
+            pad_clicks: Vec::new(),
+            last_hovered_key: [None; 2],
+            pad_holds: [None; 2],
+            pointer_hold: None,
+            confirm_hold: None,
+            confirm_down: false,
+            opened_at: None,
+            reveal_pending: false,
+            field_rect: None,
+            function_key: None,
+            key_pop: None,
+        }
+    }
 }
 
 impl OskState {
@@ -67,6 +116,7 @@ impl OskState {
             self.selected_all = false;
             self.ctrl = false;
             self.alt = false;
+            self.reveal_pending = true;
         } else {
             self.caret = self.caret.min(len);
         }
@@ -100,12 +150,24 @@ impl OskState {
             for (index, &finger) in pads.iter().enumerate() {
                 if finger.click && !self.touchpads[index].click {
                     self.pad_clicks.push((index, finger));
+                    let side = if index == 0 {
+                        client::HapticSide::Left
+                    } else {
+                        client::HapticSide::Right
+                    };
+                    client::trigger_touchpad_haptic(side, client::TouchpadHaptic::PressClick);
                 }
             }
         } else {
             self.pad_clicks.clear();
+            self.pad_holds = [None; 2];
+            self.last_hovered_key = [None; 2];
         }
         self.touchpads = pads;
+    }
+
+    pub fn set_confirm_down(&mut self, down: bool) {
+        self.confirm_down = down;
     }
 
     pub fn take_field_reveal(&mut self) -> Option<Rect> {
@@ -117,6 +179,10 @@ impl OskState {
     pub fn reset_focus(&mut self) {
         self.focus.current = None;
         self.pad_clicks.clear();
+        self.last_hovered_key = [None; 2];
+        self.pad_holds = [None; 2];
+        self.pointer_hold = None;
+        self.confirm_hold = None;
         self.opened_at = None;
         self.reveal_pending = true;
     }
@@ -163,6 +229,7 @@ pub fn apply_key(target: &mut String, key: Key, max_chars: Option<usize>, upperc
 pub enum OverlayAction {
     Char(char),
     Tab,
+    BackTab,
     Backspace,
     ForwardDelete,
     CaretLeft,
@@ -222,11 +289,32 @@ pub struct EditOutcome {
     pub changed: bool,
     pub submitted: bool,
     pub hide: bool,
-    pub tab: bool,
+    /// `1` for Tab (next field), `-1` for Shift+Tab (previous field), `0` for none.
+    pub tab_dir: i8,
     pub copy: bool,
     pub cut: bool,
     pub request_paste: bool,
     pub scroll_page: i8,
+}
+
+/// Consume a physical `Tab` (`+1`) or `Shift+Tab` (`-1`) keypress if present.
+pub fn take_physical_tab(ctx: &egui::Context) -> i8 {
+    let mut dir = 0i8;
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            if let egui::Event::Key { key: egui::Key::Tab, pressed: true, modifiers, .. } = event
+                && !modifiers.ctrl
+                && !modifiers.alt
+                && !modifiers.mac_cmd
+            {
+                dir = if modifiers.shift { -1 } else { 1 };
+                false
+            } else {
+                true
+            }
+        });
+    });
+    dir
 }
 
 enum PhysicalEdit {
@@ -449,7 +537,14 @@ pub fn apply_overlay_action(
             state.shift = false;
             state.alt = false;
         }
-        OverlayAction::Tab => out.tab = true,
+        OverlayAction::Tab => {
+            out.tab_dir = if state.shift { -1 } else { 1 };
+            state.shift = false;
+        }
+        OverlayAction::BackTab => {
+            out.tab_dir = -1;
+            state.shift = false;
+        }
         OverlayAction::Backspace => {
             let word = state.ctrl || state.alt;
             state.ctrl = false;
@@ -701,6 +796,8 @@ struct RenderedCap {
     id: Id,
     rect: Rect,
     op: KeyOp,
+    secondary_op: Option<KeyOp>,
+    secondary_label: Option<String>,
 }
 
 
@@ -870,6 +967,7 @@ fn draw_panel(
 
     let mut caps: Vec<RenderedCap> = Vec::with_capacity(80);
     let mut op_triggered: Option<(Id, KeyOp)> = None;
+    let mut pointer_down_cap: Option<Id> = None;
     let mut y = keys_top;
 
     // Optional Master-Keyboard utility / F1..F12 bar.
@@ -895,11 +993,21 @@ fn draw_panel(
     let OskState { cyrillic, caps: caps_lock, shift, master_bar, .. } = *state;
 
     // Helper closure-style state via method for crisp 5-row layout.
-    let mut push_cap = |id: Id, rect: Rect, primary: &str, secondary: Option<&str>, badge: Option<&str>, style: CapStyle, op: KeyOp| {
-        if paint_key_cap(state, &panel_ui, t, s, panel, id, rect, primary, secondary, badge, style, now) {
+    let mut push_cap = |id: Id, rect: Rect, primary: &str, secondary: Option<&str>, badge: Option<&str>, style: CapStyle, op: KeyOp, secondary_op: Option<KeyOp>, secondary_label: Option<&str>| {
+        let (activated, ptr_down) = paint_key_cap(state, &panel_ui, t, s, panel, id, rect, primary, secondary, badge, style, now);
+        if activated {
             op_triggered = Some((id, op));
         }
-        caps.push(RenderedCap { id, rect, op });
+        if ptr_down {
+            pointer_down_cap = Some(id);
+        }
+        caps.push(RenderedCap {
+            id,
+            rect,
+            op,
+            secondary_op,
+            secondary_label: secondary_label.map(str::to_string),
+        });
     };
 
     // Row 0: 13 dual-legend number/symbol keys + X Backspace (weight 2.2)
@@ -909,7 +1017,8 @@ fn draw_panel(
     for (ci, (lo, hi)) in r0.iter().enumerate() {
         let (prim, sec) = key_legends(lo, hi, shift, caps_lock);
         let op = KeyOp::Action(OverlayAction::Char(first_char(prim)));
-        push_cap(Id::unique(("bp-osk-k", 0usize, ci)), x0[ci], prim, Some(sec), None, CapStyle::Char, op);
+        let sec_op = (first_char(sec) != first_char(prim)).then(|| KeyOp::Action(OverlayAction::Char(first_char(sec))));
+        push_cap(Id::unique(("bp-osk-k", 0usize, ci)), x0[ci], prim, Some(sec), None, CapStyle::Char, op, sec_op, Some(sec));
     }
     push_cap(
         Id::unique(("bp-osk-k", 0usize, 13usize)),
@@ -919,6 +1028,8 @@ fn draw_panel(
         Some("X"),
         CapStyle::Modifier,
         KeyOp::Action(OverlayAction::Backspace),
+        None,
+        None,
     );
     y += key_h + gap;
 
@@ -931,17 +1042,20 @@ fn draw_panel(
     push_cap(
         Id::unique(("bp-osk-k", 1usize, 0usize)),
         x1[0],
-        "Tab",
+        if shift { "⇧ Tab" } else { "Tab" },
         None,
         None,
-        CapStyle::Modifier,
+        if shift { CapStyle::ActiveModifier } else { CapStyle::Modifier },
         KeyOp::Action(OverlayAction::Tab),
+        Some(KeyOp::Action(OverlayAction::BackTab)),
+        Some("⇧ Tab"),
     );
     for (ci, (lo, hi, _)) in r1.iter().enumerate() {
         let (prim, sec) = key_legends(lo, hi, shift, caps_lock);
         let show_sec = lo.chars().next().is_some_and(|c| !c.is_alphabetic());
         let op = KeyOp::Action(OverlayAction::Char(first_char(prim)));
-        push_cap(Id::unique(("bp-osk-k", 1usize, ci + 1)), x1[ci + 1], prim, show_sec.then_some(sec), None, CapStyle::Char, op);
+        let sec_op = (first_char(sec) != first_char(prim)).then(|| KeyOp::Action(OverlayAction::Char(first_char(sec))));
+        push_cap(Id::unique(("bp-osk-k", 1usize, ci + 1)), x1[ci + 1], prim, show_sec.then_some(sec), None, CapStyle::Char, op, sec_op, Some(sec));
     }
     y += key_h + gap;
 
@@ -961,12 +1075,15 @@ fn draw_panel(
         Some("L3"),
         if caps_lock { CapStyle::ActiveModifier } else { CapStyle::Modifier },
         KeyOp::ToggleCaps,
+        None,
+        None,
     );
     for (ci, (lo, hi)) in r2.iter().enumerate() {
         let (prim, sec) = key_legends(lo, hi, shift, caps_lock);
         let show_sec = lo.chars().next().is_some_and(|c| !c.is_alphabetic());
         let op = KeyOp::Action(OverlayAction::Char(first_char(prim)));
-        push_cap(Id::unique(("bp-osk-k", 2usize, ci + 1)), x2[ci + 1], prim, show_sec.then_some(sec), None, CapStyle::Char, op);
+        let sec_op = (first_char(sec) != first_char(prim)).then(|| KeyOp::Action(OverlayAction::Char(first_char(sec))));
+        push_cap(Id::unique(("bp-osk-k", 2usize, ci + 1)), x2[ci + 1], prim, show_sec.then_some(sec), None, CapStyle::Char, op, sec_op, Some(sec));
     }
     push_cap(
         Id::unique(("bp-osk-k", 2usize, 12usize)),
@@ -976,6 +1093,8 @@ fn draw_panel(
         Some("R2"),
         CapStyle::Accent,
         KeyOp::Action(OverlayAction::Submit),
+        None,
+        None,
     );
     y += key_h + gap;
 
@@ -987,14 +1106,15 @@ fn draw_panel(
     w3.push(2.6);
     let x3 = row_rects(grid_left, y, grid_w, key_h, gap, &w3);
     let shift_style = if shift { CapStyle::ActiveModifier } else { CapStyle::Modifier };
-    push_cap(Id::unique(("bp-osk-k", 3usize, 0usize)), x3[0], "Shift", None, Some("L2"), shift_style, KeyOp::ToggleShift);
+    push_cap(Id::unique(("bp-osk-k", 3usize, 0usize)), x3[0], "Shift", None, Some("L2"), shift_style, KeyOp::ToggleShift, None, None);
     for (ci, (lo, hi)) in r3.iter().enumerate() {
         let (prim, sec) = key_legends(lo, hi, shift, caps_lock);
         let show_sec = lo.chars().next().is_some_and(|c| !c.is_alphabetic());
         let op = KeyOp::Action(OverlayAction::Char(first_char(prim)));
-        push_cap(Id::unique(("bp-osk-k", 3usize, ci + 1)), x3[ci + 1], prim, show_sec.then_some(sec), None, CapStyle::Char, op);
+        let sec_op = (first_char(sec) != first_char(prim)).then(|| KeyOp::Action(OverlayAction::Char(first_char(sec))));
+        push_cap(Id::unique(("bp-osk-k", 3usize, ci + 1)), x3[ci + 1], prim, show_sec.then_some(sec), None, CapStyle::Char, op, sec_op, Some(sec));
     }
-    push_cap(Id::unique(("bp-osk-k", 3usize, 11usize)), x3[11], "Shift", None, Some("L2"), shift_style, KeyOp::ToggleShift);
+    push_cap(Id::unique(("bp-osk-k", 3usize, 11usize)), x3[11], "Shift", None, Some("L2"), shift_style, KeyOp::ToggleShift, None, None);
     y += key_h + gap;
 
     // Row 4: Fn (1.2) + EN/RU (1.2) + Space (6.0, Y) + Left (1.1, LB) + Right (1.1, RB) + Paste (2.2) + Hide (2.4, B)
@@ -1008,6 +1128,8 @@ fn draw_panel(
         None,
         if master_bar { CapStyle::ActiveModifier } else { CapStyle::Utility },
         KeyOp::ToggleMasterBar,
+        None,
+        None,
     );
     push_cap(
         Id::unique(("bp-osk-k", 4usize, 1usize)),
@@ -1017,6 +1139,8 @@ fn draw_panel(
         None,
         if cyrillic { CapStyle::ActiveModifier } else { CapStyle::Modifier },
         KeyOp::ToggleLang,
+        None,
+        None,
     );
     push_cap(
         Id::unique(("bp-osk-k", 4usize, 2usize)),
@@ -1026,6 +1150,8 @@ fn draw_panel(
         Some("Y"),
         CapStyle::Char,
         KeyOp::Action(OverlayAction::Char(' ')),
+        None,
+        None,
     );
     push_cap(
         Id::unique(("bp-osk-k", 4usize, 3usize)),
@@ -1035,6 +1161,8 @@ fn draw_panel(
         Some("LB"),
         CapStyle::Modifier,
         KeyOp::Action(OverlayAction::CaretLeft),
+        None,
+        None,
     );
     push_cap(
         Id::unique(("bp-osk-k", 4usize, 4usize)),
@@ -1044,6 +1172,8 @@ fn draw_panel(
         Some("RB"),
         CapStyle::Modifier,
         KeyOp::Action(OverlayAction::CaretRight),
+        None,
+        None,
     );
     push_cap(
         Id::unique(("bp-osk-k", 4usize, 5usize)),
@@ -1053,6 +1183,8 @@ fn draw_panel(
         None,
         CapStyle::Modifier,
         KeyOp::Action(OverlayAction::Paste),
+        None,
+        None,
     );
     push_cap(
         Id::unique(("bp-osk-k", 4usize, 6usize)),
@@ -1062,15 +1194,29 @@ fn draw_panel(
         Some("B"),
         CapStyle::Modifier,
         KeyOp::Action(OverlayAction::Hide),
+        None,
+        None,
     );
 
-    // Dual-trackpad projection: project touching fingers onto keys, paint hover & L/R reticles, fire on rising click edge.
+    // Dual-trackpad projection: project touching fingers onto keys, trigger hover haptics on key transitions, paint hover & L/R reticles.
     let tp_paint = panel_ui.painter();
     for idx in 0..2usize {
         let finger = state.touchpads[idx];
         if finger.down || finger.click {
             let pos = project_trackpad_pos(keys_rect, idx, finger.x, finger.y);
             let hovered = find_key_at(&caps, pos);
+            let hovered_id = hovered.map(|c| c.id);
+            if hovered_id != state.last_hovered_key[idx] {
+                if hovered_id.is_some() && state.hover_haptics {
+                    let side = if idx == 0 {
+                        client::HapticSide::Left
+                    } else {
+                        client::HapticSide::Right
+                    };
+                    client::trigger_touchpad_haptic(side, client::TouchpadHaptic::KeyCross);
+                }
+                state.last_hovered_key[idx] = hovered_id;
+            }
             if let Some(cap) = hovered {
                 tp_paint.rect_stroke(
                     cap.rect.expand(1.5),
@@ -1090,17 +1236,172 @@ fn draw_panel(
                 w::font_bold((11.0 * s).clamp(9.0, 14.0)),
                 Color32::WHITE,
             );
+        } else {
+            state.last_hovered_key[idx] = None;
         }
     }
 
-    let mut operations: Vec<_> = op_triggered.into_iter().collect();
+    let mut operations: Vec<(Id, KeyOp)> = Vec::new();
+
+    // Pointer / touch long-press state machine.
+    let mut suppress_pointer_click = false;
+    if let Some(down_id) = pointer_down_cap {
+        let same = state.pointer_hold.as_ref().is_some_and(|h| h.id == down_id);
+        if !same {
+            state.pointer_hold = caps
+                .iter()
+                .find(|c| c.id == down_id)
+                .and_then(|c| c.secondary_op.map(|sec| HoldState {
+                    id: c.id,
+                    primary: c.op,
+                    secondary: sec,
+                    started_at: now,
+                    long_fired: false,
+                }));
+        }
+        if let Some(hold) = state.pointer_hold.as_mut() {
+            let elapsed = now - hold.started_at;
+            if !hold.long_fired && elapsed >= LONG_PRESS_SECS {
+                hold.long_fired = true;
+                operations.push((hold.id, hold.secondary));
+                client::trigger_touchpad_haptic(client::HapticSide::Both, client::TouchpadHaptic::LongPress);
+            } else if !hold.long_fired {
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((LONG_PRESS_SECS - elapsed).max(0.016)));
+            }
+        }
+    } else if let Some(hold) = state.pointer_hold.take() {
+        if hold.long_fired {
+            suppress_pointer_click = true;
+        }
+    }
+
+    // Controller A / pointer click activation.
+    if let Some((id, op)) = op_triggered {
+        if input.confirm && state.confirm_down {
+            if let Some(sec) = caps.iter().find(|c| c.id == id).and_then(|c| c.secondary_op) {
+                state.confirm_hold = Some(HoldState {
+                    id,
+                    primary: op,
+                    secondary: sec,
+                    started_at: now,
+                    long_fired: false,
+                });
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(LONG_PRESS_SECS));
+            } else {
+                operations.push((id, op));
+            }
+        } else if !suppress_pointer_click {
+            operations.push((id, op));
+        }
+    }
+
+    // Controller A long-press progression / release.
+    if let Some(mut hold) = state.confirm_hold {
+        if state.confirm_down {
+            let elapsed = now - hold.started_at;
+            if !hold.long_fired && elapsed >= LONG_PRESS_SECS {
+                hold.long_fired = true;
+                operations.push((hold.id, hold.secondary));
+                client::trigger_touchpad_haptic(client::HapticSide::Both, client::TouchpadHaptic::LongPress);
+            } else if !hold.long_fired {
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((LONG_PRESS_SECS - elapsed).max(0.016)));
+            }
+            state.confirm_hold = Some(hold);
+        } else {
+            state.confirm_hold = None;
+            if !hold.long_fired {
+                operations.push((hold.id, hold.primary));
+            }
+        }
+    }
+
+    // Dual-trackpad rising clicks & long-press holds.
     for (index, finger) in state.pad_clicks.drain(..) {
         let pos = project_trackpad_pos(keys_rect, index, finger.x, finger.y);
         if screen.contains(pos) && let Some(cap) = find_key_at(&caps, pos) {
-            operations.push((cap.id, cap.op));
             state.focus.current = Some(cap.id);
+            if let Some(sec) = cap.secondary_op && state.touchpads[index].click {
+                // If an earlier hold was still pending, commit its primary before starting the new hold.
+                if let Some(prev) = state.pad_holds[index].take() && !prev.long_fired {
+                    operations.push((prev.id, prev.primary));
+                }
+                state.pad_holds[index] = Some(HoldState {
+                    id: cap.id,
+                    primary: cap.op,
+                    secondary: sec,
+                    started_at: now,
+                    long_fired: false,
+                });
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(LONG_PRESS_SECS));
+            } else {
+                operations.push((cap.id, cap.op));
+            }
         }
     }
+    for idx in 0..2usize {
+        if let Some(mut hold) = state.pad_holds[idx] {
+            if state.touchpads[idx].click {
+                let elapsed = now - hold.started_at;
+                if !hold.long_fired && elapsed >= LONG_PRESS_SECS {
+                    hold.long_fired = true;
+                    operations.push((hold.id, hold.secondary));
+                    let side = if idx == 0 {
+                        client::HapticSide::Left
+                    } else {
+                        client::HapticSide::Right
+                    };
+                    client::trigger_touchpad_haptic(side, client::TouchpadHaptic::LongPress);
+                } else if !hold.long_fired {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((LONG_PRESS_SECS - elapsed).max(0.016)));
+                }
+                state.pad_holds[idx] = Some(hold);
+            } else {
+                state.pad_holds[idx] = None;
+                if !hold.long_fired {
+                    operations.push((hold.id, hold.primary));
+                }
+            }
+        }
+    }
+
+    // Paint floating secondary-symbol preview pill above any key currently being long-pressed.
+    let active_holds = [state.pad_holds[0], state.pad_holds[1], state.pointer_hold, state.confirm_hold];
+    for hold in active_holds.into_iter().flatten() {
+        if let Some(cap) = caps.iter().find(|c| c.id == hold.id)
+            && let Some(sec_label) = cap.secondary_label.as_deref()
+        {
+            let progress = ((now - hold.started_at) / LONG_PRESS_SECS).clamp(0.0, 1.0) as f32;
+            let pill_w = (cap.rect.width().max(38.0 * s)).min(74.0 * s);
+            let pill_h = (34.0 * s).clamp(24.0, 44.0);
+            let pill = Rect::from_center_size(
+                pos2(cap.rect.center().x, (cap.rect.top() - pill_h * 0.65).max(screen.top() + pill_h * 0.55)),
+                vec2(pill_w, pill_h),
+            );
+            let pill_fill = if hold.long_fired {
+                t.accent
+            } else {
+                w::mix(t.raised, t.accent, 0.22 + 0.35 * progress)
+            };
+            let pill_text = if hold.long_fired { t.on_accent } else { Color32::WHITE };
+            p.rect_filled(pill, paint::radius(8.0 * s), pill_fill);
+            p.rect_stroke(pill, paint::radius(8.0 * s), Stroke::new(1.5, t.accent), StrokeKind::Inside);
+            if !hold.long_fired {
+                let bar = Rect::from_min_size(
+                    pos2(pill.left() + 4.0 * s, pill.bottom() - 4.0 * s),
+                    vec2((pill.width() - 8.0 * s).max(0.0) * progress, (2.5 * s).max(2.0)),
+                );
+                p.rect_filled(bar, paint::radius(2.0), t.accent);
+            }
+            p.text(
+                pill.center(),
+                Align2::CENTER_CENTER,
+                sec_label,
+                w::font_bold((18.0 * s).clamp(13.0, 24.0)),
+                pill_text,
+            );
+        }
+    }
+
     state.focus.end(&[home_id], home_id);
     state.focus.paint_ring(&panel_ui, t, s, (9.0 * s).clamp(6.0, 12.0), panel);
 
@@ -1159,10 +1460,10 @@ fn paint_master_row(
         let rects = row_rects(left, y, width, h, gap, &weights);
         for (i, (label, style, op)) in items.into_iter().enumerate() {
             let id = Id::unique(("bp-osk-m", 0usize, i));
-            if paint_key_cap(state, ui, t, s, panel, id, rects[i], label, None, None, style, now) {
+            if paint_key_cap(state, ui, t, s, panel, id, rects[i], label, None, None, style, now).0 {
                 *op_triggered = Some((id, op));
             }
-            caps.push(RenderedCap { id, rect: rects[i], op });
+            caps.push(RenderedCap { id, rect: rects[i], op, secondary_op: None, secondary_label: None });
         }
     } else {
         let weights = [1.0; 14];
@@ -1173,10 +1474,10 @@ fn paint_master_row(
             .collect();
         for (i, (label, style, op)) in items.into_iter().enumerate() {
             let id = Id::unique(("bp-osk-m", 1usize, i));
-            if paint_key_cap(state, ui, t, s, panel, id, rects[i], &label, None, None, style, now) {
+            if paint_key_cap(state, ui, t, s, panel, id, rects[i], &label, None, None, style, now).0 {
                 *op_triggered = Some((id, op));
             }
-            caps.push(RenderedCap { id, rect: rects[i], op });
+            caps.push(RenderedCap { id, rect: rects[i], op, secondary_op: None, secondary_label: None });
         }
     }
 }
@@ -1217,8 +1518,9 @@ fn paint_key_cap(
     badge: Option<&str>,
     style: CapStyle,
     now: f64,
-) -> bool {
+) -> (bool, bool) {
     let hit = state.focus.item(ui, id, rect, clip.intersect(ui.clip_rect()), Place::Page);
+    let ptr_down = ui.ctx().read_response(id).is_some_and(|r| r.is_pointer_button_down_on());
     if hit.activated {
         state.key_pop = Some((id, now));
     }
@@ -1306,7 +1608,7 @@ fn paint_key_cap(
     if hit.focused {
         state.focus.ring_around_clipped(shown, radius, clip);
     }
-    hit.activated
+    (hit.activated, ptr_down)
 }
 
 #[cfg(test)]
@@ -1541,5 +1843,73 @@ mod tests {
             );
             assert!(actions.is_empty());
         }).textures_delta.clear();
+    }
+
+    #[test]
+    fn trackpad_long_press_emits_secondary_symbol_once() {
+        let ctx = egui::Context::default();
+        let theme = Theme::default();
+        let screen = Rect::from_min_max(pos2(0.0, 0.0), pos2(1280.0, 800.0));
+        let mut state = OskState::default();
+
+        // Open the overlay first so the slide-in animation settles before pad clicks arrive.
+        ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+            assert!(draw_overlay(&mut state, ui, &theme, 0.72, screen, 1.0, "Search", OskInput::default()).is_empty());
+        }).textures_delta.clear();
+
+        // Touch and hold left pad near top-left ('1' / '!' key in Row 0).
+        let contact = client::TouchpadFinger { down: true, x: 0.16, y: 0.08, click: false };
+        let clicked = client::TouchpadFinger { click: true, ..contact };
+        state.update_touchpads([contact, Default::default()], true);
+        state.update_touchpads([clicked, Default::default()], true);
+
+        // Initial press frame starts the hold without firing immediately.
+        ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+            let actions = draw_overlay(&mut state, ui, &theme, 0.72, screen, 1.2, "Search", OskInput::default());
+            assert!(actions.is_empty());
+        }).textures_delta.clear();
+
+        // Holding past LONG_PRESS_SECS fires the secondary symbol ('!').
+        let mut long_actions = Vec::new();
+        ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+            long_actions = draw_overlay(&mut state, ui, &theme, 0.72, screen, 1.2 + LONG_PRESS_SECS + 0.05, "Search", OskInput::default());
+        }).textures_delta.clear();
+        assert_eq!(long_actions, [OverlayAction::Char('!')]);
+
+        // Releasing after long press does NOT fire the primary character.
+        state.update_touchpads([contact, Default::default()], true);
+        ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+            let actions = draw_overlay(&mut state, ui, &theme, 0.72, screen, 1.8, "Search", OskInput::default());
+            assert!(actions.is_empty());
+        }).textures_delta.clear();
+    }
+
+    #[test]
+    fn tab_and_shift_tab_emit_signed_direction_and_clear_shift() {
+        let mut state = OskState::default();
+        let mut text = String::from("abc");
+        let fwd = apply_overlay_action(&mut state, &mut text, OverlayAction::Tab, None, false);
+        assert_eq!(fwd.tab_dir, 1);
+
+        state.shift = true;
+        let back = apply_overlay_action(&mut state, &mut text, OverlayAction::Tab, None, false);
+        assert_eq!(back.tab_dir, -1);
+        assert!(!state.shift);
+
+        let explicit_back = apply_overlay_action(&mut state, &mut text, OverlayAction::BackTab, None, false);
+        assert_eq!(explicit_back.tab_dir, -1);
+
+        let ctx = egui::Context::default();
+        ctx.input_mut(|i| {
+            i.events.push(egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            });
+        });
+        assert_eq!(take_physical_tab(&ctx), -1);
+        assert!(ctx.input(|i| i.events.is_empty()));
     }
 }

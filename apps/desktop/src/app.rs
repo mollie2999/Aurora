@@ -128,6 +128,9 @@ pub struct Prefs {
     /// Which button glyphs Big Picture shows in its hint bar (Auto / Controller / Keyboard).
     #[serde(default)]
     pub bigpicture_hints: crate::bigpicture::ButtonHintMode,
+    /// Subtle haptic ticks on Steam Deck touchpads when crossing OSK keys (click feedback is always on).
+    #[serde(default = "yes")]
+    pub osk_touchpad_haptics: bool,
 }
 
 fn yes() -> bool {
@@ -183,6 +186,7 @@ impl Default for Prefs {
             bigpicture_repeat: 1,
             bigpicture_stick: 1,
             bigpicture_hints: crate::bigpicture::ButtonHintMode::Auto,
+            osk_touchpad_haptics: true,
         }
     }
 }
@@ -250,6 +254,8 @@ pub struct SteamApp {
     pending_size: Option<([f32; 2], bool, u32)>,
     /// True once the current window mode has been clamped against `monitor_size`.
     monitor_clamped: bool,
+    /// Last `ViewportCommand::IMEAllowed` state sent to suppress OS virtual keyboards while Aurora's OSK is active.
+    last_ime_allowed: Option<bool>,
     pub tray: crate::tray::Tray,
     taskbar: crate::taskbar::Taskbar,
     flags: crate::builtin::settings::SharedFlags,
@@ -458,6 +464,7 @@ impl SteamApp {
             center_window: None,
             pending_size: None,
             monitor_clamped: false,
+            last_ime_allowed: None,
             tray: crate::tray::Tray::new(cc),
             taskbar: crate::taskbar::Taskbar::new(cc),
             flags,
@@ -1653,6 +1660,12 @@ impl eframe::App for SteamApp {
         } else {
             self.login.bp_osk_open
         };
+        let desktop_osk_open = !signed_in && !big_picture && crate::login::desktop_osk_visible(self);
+        let want_ime = !(keyboard_open || desktop_osk_open);
+        if self.last_ime_allowed != Some(want_ime) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(want_ime));
+            self.last_ime_allowed = Some(want_ime);
+        }
         let keyboard_inset = if keyboard_open {
             self.bigpicture.keyboard_inset(&ctx, ui.max_rect(), self.prefs.bigpicture_scale)
         } else {

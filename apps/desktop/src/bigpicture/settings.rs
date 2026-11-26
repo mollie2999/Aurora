@@ -780,6 +780,13 @@ fn rows(bp: &mut BigPicture, f: &mut Frame, ctx: &egui::Context) -> Vec<Row> {
                 controller_toggle("ctrl-fam-switch", t!("Enable Steam Input for Switch Pro controllers"), cfg.families.switch_pro, |c| &mut c.families.switch_pro),
                 controller_toggle("ctrl-fam-generic", t!("Enable Steam Input for generic controllers"), cfg.families.generic, |c| &mut c.families.generic),
                 controller_toggle("ctrl-rumble", t!("Controller vibration (rumble)"), cal.rumble_enabled, |c| &mut c.calibration.rumble_enabled),
+                toggle(
+                    "ctrl-osk-haptics",
+                    t!("Keyboard touchpad haptics"),
+                    t!("Subtle vibration when moving across on-screen keyboard keys with touchpads."),
+                    f.app.prefs.osk_touchpad_haptics,
+                    act(|_, f, _| f.app.prefs.osk_touchpad_haptics = !f.app.prefs.osk_touchpad_haptics),
+                ),
                 controller_toggle("ctrl-gyro", t!("Enable gyroscope & motion sensors"), cal.gyro_enabled, |c| &mut c.calibration.gyro_enabled),
             ];
             if cal.gyro_enabled {

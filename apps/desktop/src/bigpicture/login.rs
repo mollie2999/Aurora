@@ -253,6 +253,20 @@ fn show_inner(bp: &mut BigPicture, app: &mut SteamApp, ui: &mut Ui) {
         osk::edit_physical(
             &mut bp.osk, field, &ctx, app.login.bp_osk_open, guard_code, copy_allowed,
         );
+        if screen_kind == LoginScreen::Form {
+            let tab_dir = osk::take_physical_tab(&ctx);
+            if tab_dir != 0 {
+                if app.login.osk_field == Some(LoginField::Password) {
+                    app.login.osk_field = Some(LoginField::Account);
+                    bp.focus.current = Some(form_account_id());
+                    bp.osk.sync_target(form_account_id(), &app.login.account);
+                } else {
+                    app.login.osk_field = Some(LoginField::Password);
+                    bp.focus.current = Some(form_password_id());
+                    bp.osk.sync_target(form_password_id(), &app.login.password);
+                }
+            }
+        }
     }
 
     let presses = bp.drain_pad_and_keys(&ctx, typing);
@@ -418,6 +432,7 @@ fn show_inner(bp: &mut BigPicture, app: &mut SteamApp, ui: &mut Ui) {
         } else {
             t!("Continue")
         };
+        bp.osk.hover_haptics = f.app.prefs.osk_touchpad_haptics;
         for action in osk::draw_overlay(&mut bp.osk, ui, &t, s, screen, now, go_label, osk_input) {
             ctx.request_repaint();
             bp.osk.queue_function_key(action);
@@ -444,12 +459,14 @@ fn show_inner(bp: &mut BigPicture, app: &mut SteamApp, ui: &mut Ui) {
             if outcome.request_paste {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
-            if outcome.tab && screen_kind == LoginScreen::Form {
+            if outcome.tab_dir != 0 && screen_kind == LoginScreen::Form {
                 if f.app.login.osk_field == Some(LoginField::Password) {
                     f.app.login.osk_field = Some(LoginField::Account);
+                    bp.focus.current = Some(form_account_id());
                     bp.osk.sync_target(form_account_id(), &f.app.login.account);
                 } else {
                     f.app.login.osk_field = Some(LoginField::Password);
+                    bp.focus.current = Some(form_password_id());
                     bp.osk.sync_target(form_password_id(), &f.app.login.password);
                 }
             }

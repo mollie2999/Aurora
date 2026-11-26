@@ -141,6 +141,12 @@ pub fn own_root() -> Option<PathBuf> {
     Some(root)
 }
 
+/// Aurora's own Steam-shaped folder if it already exists on disk (read-only).
+pub fn existing_own_root() -> Option<PathBuf> {
+    let root = dirs()?.data_local_dir().join("Steam");
+    root.is_dir().then_some(root)
+}
+
 fn libraries_file() -> Option<PathBuf> {
     Some(dirs()?.config_dir().join("libraries.txt"))
 }

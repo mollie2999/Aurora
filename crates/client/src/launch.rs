@@ -543,7 +543,13 @@ pub fn spawn_non_steam(exe: &str, args: &str) -> Result<Option<Child>, String> {
     {
         let mut cmd = linux::non_steam(&exe, &opts.args)?;
         cmd.current_dir(&dir);
-        return opts.wrap(cmd).spawn().map(Some).map_err(|e| format!("couldn't start {}: {e}", exe.display()));
+        #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
+        let mut cmd = opts.wrap(cmd);
+        #[cfg(target_os = "freebsd")]
+        if opts.env.iter().any(|(k, _)| k == "LD_LIBRARY_PATH") && linux::is_linux_elf(&exe) {
+            apply_freebsd_runtime_env(&mut cmd, &dir);
+        }
+        return cmd.spawn().map(Some).map_err(|e| format!("couldn't start {}: {e}", exe.display()));
     }
     #[cfg(windows)]
     {
@@ -570,12 +576,19 @@ pub fn spawn_non_steam(exe: &str, args: &str) -> Result<Option<Child>, String> {
 /// the private mount that lets it start (see `colon`), which must come last:
 /// rebuilding the command for a wrapper would drop it.
 fn finish(app: &OwnedApp, install_dir: &Path, opts: &UserOptions, cmd: Command) -> Command {
-    let cmd = opts.wrap(cmd);
+    #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
+    let mut cmd = opts.wrap(cmd);
+    #[cfg(target_os = "freebsd")]
+    if opts.env.iter().any(|(k, _)| k == "LD_LIBRARY_PATH")
+        && linux::plan(app, install_dir).is_ok_and(|p| !p.uses_proton())
+    {
+        apply_freebsd_runtime_env(&mut cmd, install_dir);
+    }
     #[cfg(target_os = "linux")]
     if colon::colon_folder(install_dir).is_some() && linux::plan(app, install_dir).is_ok_and(|p| !p.uses_proton()) {
         return colon::redirect(cmd, install_dir);
     }
-    let _ = app;
+    let _ = (app, install_dir);
     cmd
 }
 
@@ -1853,7 +1866,7 @@ fn write_vk_layer_manifest(lib_path: &Path) -> Option<PathBuf> {
     write_vk_layer_manifest_in(&fallback, lib_path)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd", all(test, unix)))]
 fn existing_cmd_env(cmd: &Command, key: &str) -> Option<String> {
     if let Some((_, val)) = cmd.get_envs().find(|(k, _)| *k == std::ffi::OsStr::new(key)) {
         return val.map(|v| v.to_string_lossy().into_owned());
@@ -1861,7 +1874,7 @@ fn existing_cmd_env(cmd: &Command, key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd", all(test, unix)))]
 fn append_colon_paths(existing: Option<&str>, add: &[&Path]) -> String {
     let mut entries: Vec<String> = Vec::new();
     let mut push_unique = |s: &str| {
@@ -1878,6 +1891,27 @@ fn append_colon_paths(existing: Option<&str>, add: &[&Path]) -> String {
         push_unique(&path.to_string_lossy());
     }
     entries.join(":")
+}
+
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn apply_freebsd_runtime_env_with(cmd: &mut Command, runtime_dirs: &[PathBuf]) {
+    if runtime_dirs.is_empty() {
+        return;
+    }
+    let refs: Vec<&Path> = runtime_dirs.iter().map(PathBuf::as_path).collect();
+    let ld = append_colon_paths(existing_cmd_env(cmd, "LD_LIBRARY_PATH").as_deref(), &refs);
+    if !ld.is_empty() {
+        cmd.env("LD_LIBRARY_PATH", ld);
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn apply_freebsd_runtime_env(cmd: &mut Command, install_dir: &Path) {
+    let dirs = local::compat::linux_runtime_library_paths(Some(install_dir));
+    if !dirs.is_empty() {
+        tracing::debug!(count = dirs.len(), "augmenting LD_LIBRARY_PATH with Steam Linux Runtime paths for FreeBSD Linuxulator");
+    }
+    apply_freebsd_runtime_env_with(cmd, &dirs);
 }
 
 #[cfg(target_os = "linux")]
@@ -2716,6 +2750,15 @@ mod linux {
         std::fs::File::open(exe).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_ok() && &head == b"MZ"
     }
 
+    #[cfg(any(target_os = "freebsd", all(test, unix)))]
+    pub(super) fn is_linux_elf(exe: &Path) -> bool {
+        let mut head = [0u8; 8];
+        if std::fs::File::open(exe).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_err() {
+            return false;
+        }
+        &head[..4] == b"\x7fELF" && matches!(head[4], 1 | 2) && matches!(head[7], 0 | 3)
+    }
+
     /// The command for a non-Steam game (see `super::spawn_non_steam`).
     pub fn non_steam(exe: &Path, args: &[String]) -> Result<Command, String> {
         use std::os::unix::process::CommandExt;
@@ -2743,6 +2786,10 @@ mod linux {
             tracing::info!("launching non-Steam game {}", exe.display());
             let mut c = Command::new(exe);
             c.args(args);
+            #[cfg(target_os = "freebsd")]
+            if is_linux_elf(exe) {
+                super::apply_freebsd_runtime_env(&mut c, exe.parent().unwrap_or(exe));
+            }
             c
         };
         cmd.process_group(0);
@@ -2927,6 +2974,8 @@ mod linux {
                     make_executable(&exe);
                     let mut c = Command::new(&exe);
                     c.args(split_args(&o.arguments));
+                    #[cfg(target_os = "freebsd")]
+                    super::apply_freebsd_runtime_env(&mut c, install_dir);
                     c
                 }
                 Some(tool) => self.proton(tool, app, install_dir, &exe),
@@ -4051,6 +4100,74 @@ mod tests {
         let second = HostCount::acquire().expect("stopping host should hand off once dropped");
         releaser.join().unwrap();
         drop(second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn freebsd_runtime_ld_library_path_appends_after_game_paths() {
+        let rt1 = PathBuf::from("/steam/ubuntu12_32/steam-runtime/lib/x86_64-linux-gnu");
+        let rt2 = PathBuf::from("/steam/steamapps/common/SteamLinuxRuntime_sniper/sniper/files/lib/x86_64-linux-gnu");
+        let runtime_dirs = vec![rt1.clone(), rt2.clone()];
+
+        // Existing game-provided LD_LIBRARY_PATH stays first; duplicates are skipped.
+        let mut with_game = Command::new("/bin/true");
+        with_game.env("LD_LIBRARY_PATH", format!("/game/lib:/game/plugins:{}", rt1.display()));
+        apply_freebsd_runtime_env_with(&mut with_game, &runtime_dirs);
+        let ld = with_game
+            .get_envs()
+            .find(|(k, _)| *k == "LD_LIBRARY_PATH")
+            .and_then(|(_, v)| v)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(ld, format!("/game/lib:/game/plugins:{}:{}", rt1.display(), rt2.display()));
+
+        // When unset, runtime directories are applied in order.
+        let mut without_game = Command::new("/bin/true");
+        without_game.env_remove("LD_LIBRARY_PATH");
+        apply_freebsd_runtime_env_with(&mut without_game, &runtime_dirs);
+        let ld_clean = without_game
+            .get_envs()
+            .find(|(k, _)| *k == "LD_LIBRARY_PATH")
+            .and_then(|(_, v)| v)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(ld_clean, format!("{}:{}", rt1.display(), rt2.display()));
+
+        // Empty runtime list leaves LD_LIBRARY_PATH untouched.
+        let mut untouched = Command::new("/bin/true");
+        untouched.env("LD_LIBRARY_PATH", "/game/lib");
+        apply_freebsd_runtime_env_with(&mut untouched, &[]);
+        let ld_untouched = untouched
+            .get_envs()
+            .find(|(k, _)| *k == "LD_LIBRARY_PATH")
+            .and_then(|(_, v)| v)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(ld_untouched, "/game/lib");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_linux_elf_separately_from_freebsd_and_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysv = dir.path().join("game_sysv");
+        let linux_abi = dir.path().join("game_linux");
+        let freebsd_abi = dir.path().join("game_freebsd");
+        let script = dir.path().join("launch.sh");
+
+        std::fs::write(&sysv, [0x7f, b'E', b'L', b'F', 2, 1, 1, 0]).unwrap();
+        std::fs::write(&linux_abi, [0x7f, b'E', b'L', b'F', 1, 1, 1, 3]).unwrap();
+        std::fs::write(&freebsd_abi, [0x7f, b'E', b'L', b'F', 2, 1, 1, 9]).unwrap();
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+
+        assert!(super::linux::is_linux_elf(&sysv));
+        assert!(super::linux::is_linux_elf(&linux_abi));
+        assert!(!super::linux::is_linux_elf(&freebsd_abi));
+        assert!(!super::linux::is_linux_elf(&script));
+        assert!(!super::linux::is_linux_elf(&dir.path().join("missing")));
     }
 }
 

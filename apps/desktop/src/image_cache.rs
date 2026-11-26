@@ -75,6 +75,7 @@ pub struct ImageCache {
     dir: PathBuf,
     rt: tokio::runtime::Handle,
     http: reqwest::Client,
+    trusted_http: reqwest::Client,
     slots: Arc<tokio::sync::Semaphore>,
     entries: Arc<Mutex<HashMap<String, Entry>>>,
 }
@@ -102,14 +103,23 @@ impl ImageCache {
         let dir = dir();
         let _ = std::fs::create_dir_all(&dir);
         static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(build_http_client);
+        static TRUSTED_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(build_trusted_https_client);
         static TRIMMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         let http = HTTP.clone();
+        let trusted_http = TRUSTED_HTTP.clone();
         // A second egui context shares the disk cache and the connection pool.
         TRIMMED.get_or_init(|| {
             let trim_dir = dir.clone();
             rt.spawn_blocking(move || trim(&trim_dir));
         });
-        ctx.add_bytes_loader(Arc::new(Self { dir, rt, http, slots: Arc::new(tokio::sync::Semaphore::new(PARALLEL)), entries: Default::default() }));
+        ctx.add_bytes_loader(Arc::new(Self {
+            dir,
+            rt,
+            http,
+            trusted_http,
+            slots: Arc::new(tokio::sync::Semaphore::new(PARALLEL)),
+            entries: Default::default(),
+        }));
         // Once a picture is a texture, drop its downloaded and decoded copies
         // (the disk cache has it), and unload textures that are off screen.
         ctx.options_mut(|o| o.reduce_texture_memory = true);
@@ -148,7 +158,7 @@ impl BytesLoader for ImageCache {
         if !(uri.starts_with("https://") || uri.starts_with("http://")) {
             return Err(LoadError::NotSupported);
         }
-        {
+        let trusted_cdn = {
             let mut map = self.entries.lock().unwrap();
             if let Some(e) = map.get(uri) {
                 match e {
@@ -167,15 +177,22 @@ impl BytesLoader for ImageCache {
                     }
                 }
             }
-            if let Err(err) = validate_image_url(uri) {
-                return Err(LoadError::Loading(err));
-            }
+            let parsed = match validate_image_url(uri) {
+                Ok(u) => u,
+                Err(err) => {
+                    tracing::warn!("image_cache: blocked image URL {uri}: {err}");
+                    map.insert(uri.to_string(), Entry::Failed { err: err.clone(), at: std::time::Instant::now(), disk_cached: false });
+                    return Err(LoadError::Loading(err));
+                }
+            };
             map.insert(uri.to_string(), Entry::Pending);
-        }
+            is_trusted_https_steam_cdn_url(&parsed)
+        };
         let (uri, ctx) = (uri.to_string(), ctx.clone());
         let cache_dir = self.dir.clone();
         let path = self.dir.join(Self::key(&uri));
-        let (http, slots, entries, rt_handle) = (self.http.clone(), self.slots.clone(), self.entries.clone(), self.rt.clone());
+        let http = if trusted_cdn { self.trusted_http.clone() } else { self.http.clone() };
+        let (slots, entries, rt_handle) = (self.slots.clone(), self.entries.clone(), self.rt.clone());
         self.rt.spawn(async move {
             let done = |e: Entry| {
                 let mut map = entries.lock().unwrap();
@@ -286,7 +303,10 @@ impl BytesLoader for ImageCache {
                 }
             }
             match req.send().await {
-                Ok(resp) if resp.remote_addr().is_some_and(|a| !is_public_ip(a.ip())) => {
+                Ok(resp) if !is_trusted_https_steam_cdn_url(resp.url()) && resp.remote_addr().is_some_and(|a| !is_public_ip(a.ip())) => {
+                    if let Some(addr) = resp.remote_addr() {
+                        tracing::warn!("image_cache: blocked response from non-public IP {addr} for {uri}");
+                    }
                     if !has_saved {
                         done(Entry::Failed { err: "blocked non-public image host".into(), at: std::time::Instant::now(), disk_cached: false });
                     }
@@ -558,10 +578,27 @@ fn resolve_public_addrs(host: &str) -> Result<Vec<std::net::SocketAddr>, String>
     let mut out = Vec::new();
     for addr in (host, 0).to_socket_addrs().map_err(|e| e.to_string())? {
         if !is_public_ip(addr.ip()) {
+            tracing::warn!("image_cache: blocked non-public DNS resolution for {host} -> {}", addr.ip());
             return Err("blocked non-public DNS resolution".into());
         }
         out.push(addr);
     }
+    if out.is_empty() {
+        return Err("DNS returned no addresses".into());
+    }
+    Ok(out)
+}
+
+/// Resolver for trusted HTTPS Steam CDN hosts: allows non-public IPs such as
+/// TUN `fake-ip` pools (`198.18.0.0/15`, `fc00::/18`) because TLS certificate
+/// validation binds the connection to the Steam CDN hostname. Non-trusted
+/// hosts still go through `resolve_public_addrs` as defense in depth.
+fn resolve_trusted_cdn_addrs(host: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    if !is_trusted_steam_cdn_host(host) {
+        return resolve_public_addrs(host);
+    }
+    use std::net::ToSocketAddrs;
+    let out: Vec<std::net::SocketAddr> = (host, 0).to_socket_addrs().map_err(|e| e.to_string())?.collect();
     if out.is_empty() {
         return Err("DNS returned no addresses".into());
     }
@@ -584,36 +621,64 @@ impl reqwest::dns::Resolve for PublicDnsResolver {
     }
 }
 
+struct TrustedSteamCdnDnsResolver;
+
+impl reqwest::dns::Resolve for TrustedSteamCdnDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = tokio::task::spawn_blocking(move || resolve_trusted_cdn_addrs(&host))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(iter)
+        })
+    }
+}
+
 fn is_trusted_steam_cdn_host(host: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if h.is_empty() || h.starts_with('.') {
+        return false;
+    }
     matches!(
         h.as_str(),
         "steamusercontent-a.akamaihd.net"
             | "steamuserimages-a.akamaihd.net"
             | "steamcdn-a.akamaihd.net"
+            | "steamvideo-a.akamaihd.net"
             | "media.steampowered.com"
-            | "avatars.akamai.steamstatic.com"
-            | "avatars.fastly.steamstatic.com"
-            | "avatars.steamstatic.com"
+            | "cdn.steampowered.com"
+            | "video.steampowered.com"
+            | "steamcommunity.com"
     ) || h.ends_with(".steamusercontent.com")
         || h.ends_with(".steamstatic.com")
+}
+
+fn is_trusted_https_steam_cdn_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https" && url.host_str().is_some_and(is_trusted_steam_cdn_host)
 }
 
 fn build_http_client() -> reqwest::Client {
     let redirect = reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= 5 {
+            tracing::warn!("image_cache: blocked redirect (too many redirects) to {}", attempt.url());
             return attempt.error("too many redirects");
         }
         if let Err(err) = validate_parsed_image_url(attempt.url()) {
+            tracing::warn!("image_cache: blocked redirect to {}: {err}", attempt.url());
             return attempt.error(err);
         }
         if let Some(origin) = attempt.previous().first() {
             if origin.scheme() == "https" && attempt.url().scheme() != "https" {
+                tracing::warn!("image_cache: blocked HTTPS-to-HTTP redirect from {origin} to {}", attempt.url());
                 return attempt.error("refusing HTTPS-to-HTTP image redirect");
             }
             if origin.host_str().is_some_and(is_trusted_steam_cdn_host)
                 && !attempt.url().host_str().is_some_and(is_trusted_steam_cdn_host)
             {
+                tracing::warn!("image_cache: blocked redirect off Steam CDN from {origin} to {}", attempt.url());
                 return attempt.error("refusing redirect off Steam CDN");
             }
         }
@@ -624,6 +689,32 @@ fn build_http_client() -> reqwest::Client {
         .timeout(Duration::from_secs(30))
         .redirect(redirect)
         .dns_resolver(Arc::new(PublicDnsResolver))
+        .build()
+        .unwrap_or_default()
+}
+
+fn build_trusted_https_client() -> reqwest::Client {
+    let redirect = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            tracing::warn!("image_cache: blocked Steam CDN redirect (too many redirects) to {}", attempt.url());
+            return attempt.error("too many redirects");
+        }
+        if let Err(err) = validate_parsed_image_url(attempt.url()) {
+            tracing::warn!("image_cache: blocked Steam CDN redirect to {}: {err}", attempt.url());
+            return attempt.error(err);
+        }
+        if !is_trusted_https_steam_cdn_url(attempt.url()) {
+            tracing::warn!("image_cache: blocked redirect off trusted HTTPS Steam CDN to {}", attempt.url());
+            return attempt.error("refusing redirect off trusted HTTPS Steam CDN");
+        }
+        attempt.follow()
+    });
+    reqwest::Client::builder()
+        .user_agent(concat!("Aurora/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .https_only(true)
+        .redirect(redirect)
+        .dns_resolver(Arc::new(TrustedSteamCdnDnsResolver))
         .build()
         .unwrap_or_default()
 }
@@ -745,5 +836,37 @@ mod tests {
         assert!(validate_image_url("http://0177.0.0.1/a.png").is_err());
         assert!(resolve_public_addrs("127.0.0.1").is_err());
         assert!(resolve_public_addrs("169.254.169.254").is_err());
+        assert!(resolve_public_addrs("198.18.0.1").is_err());
+        assert!(resolve_trusted_cdn_addrs("127.0.0.1").is_err());
+        assert!(resolve_trusted_cdn_addrs("198.18.0.1").is_err());
+    }
+
+    #[test]
+    fn trusted_https_steam_cdn_classification() {
+        for trusted in [
+            "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/440/header.jpg",
+            "https://avatars.fastly.steamstatic.com/abc_medium.jpg",
+            "https://images.steamusercontent.com/ugc/1/shot.png",
+            "https://steamuserimages-a.akamaihd.net/ugc/1/shot.png",
+            "https://steamcdn-a.akamaihd.net/steam/apps/440/header.jpg",
+            "https://media.steampowered.com/steamcommunity/public/images/apps/440/a.jpg",
+            "https://video.akamai.steamstatic.com/store_trailers/1/hls_master.m3u8",
+        ] {
+            let url = reqwest::Url::parse(trusted).unwrap();
+            assert!(is_trusted_https_steam_cdn_url(&url), "expected trusted HTTPS Steam CDN: {trusted}");
+        }
+        for untrusted in [
+            "http://shared.fastly.steamstatic.com/header.jpg",
+            "https://evil-steamstatic.com/header.jpg",
+            "https://steamstatic.com.evil.com/header.jpg",
+            "https://example.com/header.jpg",
+            "https://198.18.0.1/header.jpg",
+            "https://127.0.0.1/header.jpg",
+        ] {
+            let url = reqwest::Url::parse(untrusted).unwrap();
+            assert!(!is_trusted_https_steam_cdn_url(&url), "must not treat as trusted HTTPS Steam CDN: {untrusted}");
+        }
+        assert!(!is_trusted_steam_cdn_host(".steamstatic.com"));
+        assert!(!is_trusted_steam_cdn_host(""));
     }
 }

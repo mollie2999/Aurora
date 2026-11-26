@@ -662,32 +662,163 @@ fn validate_media_url(url: &reqwest::Url) -> Result<(), String> {
     Ok(())
 }
 
+fn is_trusted_steam_cdn_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if h.is_empty() || h.starts_with('.') {
+        return false;
+    }
+    matches!(
+        h.as_str(),
+        "steamusercontent-a.akamaihd.net"
+            | "steamuserimages-a.akamaihd.net"
+            | "steamcdn-a.akamaihd.net"
+            | "steamvideo-a.akamaihd.net"
+            | "media.steampowered.com"
+            | "cdn.steampowered.com"
+            | "video.steampowered.com"
+            | "steamcommunity.com"
+    ) || h.ends_with(".steamusercontent.com")
+        || h.ends_with(".steamstatic.com")
+}
+
+fn is_trusted_https_steam_cdn_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https" && url.host_str().is_some_and(is_trusted_steam_cdn_host)
+}
+
+fn resolve_public_addrs(host: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    use std::net::ToSocketAddrs;
+    let mut out = Vec::new();
+    for addr in (host, 0).to_socket_addrs().map_err(|e| e.to_string())? {
+        if !is_public_ip(addr.ip()) {
+            tracing::warn!("video: blocked non-public DNS resolution for {host} -> {}", addr.ip());
+            return Err("blocked non-public media DNS resolution".into());
+        }
+        out.push(addr);
+    }
+    if out.is_empty() {
+        return Err("DNS returned no addresses".into());
+    }
+    Ok(out)
+}
+
+/// Resolver for trusted HTTPS Steam CDN hosts: allows non-public IPs such as
+/// TUN `fake-ip` pools (`198.18.0.0/15`, `fc00::/18`) because TLS certificate
+/// validation binds the connection to the Steam CDN hostname. Non-trusted
+/// hosts still go through `resolve_public_addrs` as defense in depth.
+fn resolve_trusted_cdn_addrs(host: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    if !is_trusted_steam_cdn_host(host) {
+        return resolve_public_addrs(host);
+    }
+    use std::net::ToSocketAddrs;
+    let out: Vec<std::net::SocketAddr> = (host, 0).to_socket_addrs().map_err(|e| e.to_string())?.collect();
+    if out.is_empty() {
+        return Err("DNS returned no addresses".into());
+    }
+    Ok(out)
+}
+
 struct PublicDnsResolver;
 
 impl reqwest::dns::Resolve for PublicDnsResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let addrs = tokio::task::spawn_blocking(move || -> Result<Vec<std::net::SocketAddr>, String> {
-                use std::net::ToSocketAddrs;
-                let mut out = Vec::new();
-                for addr in (host.as_str(), 0).to_socket_addrs().map_err(|e| e.to_string())? {
-                    if !is_public_ip(addr.ip()) {
-                        return Err("blocked non-public media DNS resolution".into());
-                    }
-                    out.push(addr);
-                }
-                if out.is_empty() {
-                    return Err("DNS returned no addresses".into());
-                }
-                Ok(out)
-            })
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            let addrs = tokio::task::spawn_blocking(move || resolve_public_addrs(&host))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)) as Box<dyn std::error::Error + Send + Sync>)?;
             let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
             Ok(iter)
         })
+    }
+}
+
+struct TrustedSteamCdnDnsResolver;
+
+impl reqwest::dns::Resolve for TrustedSteamCdnDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = tokio::task::spawn_blocking(move || resolve_trusted_cdn_addrs(&host))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(iter)
+        })
+    }
+}
+
+#[derive(Clone)]
+struct HttpClients {
+    public: reqwest::Client,
+    trusted_https: reqwest::Client,
+}
+
+impl HttpClients {
+    fn build() -> Self {
+        let public_redirect = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                tracing::warn!("video: blocked redirect (too many redirects) to {}", attempt.url());
+                return attempt.error("too many redirects");
+            }
+            if let Err(err) = validate_media_url(attempt.url()) {
+                tracing::warn!("video: blocked redirect to {}: {err}", attempt.url());
+                return attempt.error(err);
+            }
+            if let Some(origin) = attempt.previous().first() {
+                if origin.scheme() == "https" && attempt.url().scheme() != "https" {
+                    tracing::warn!("video: blocked HTTPS-to-HTTP redirect from {origin} to {}", attempt.url());
+                    return attempt.error("refusing HTTPS-to-HTTP media redirect");
+                }
+                if origin.host_str().is_some_and(is_trusted_steam_cdn_host)
+                    && !attempt.url().host_str().is_some_and(is_trusted_steam_cdn_host)
+                {
+                    tracing::warn!("video: blocked redirect off Steam CDN from {origin} to {}", attempt.url());
+                    return attempt.error("refusing redirect off Steam CDN");
+                }
+            }
+            attempt.follow()
+        });
+        let trusted_redirect = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                tracing::warn!("video: blocked Steam CDN redirect (too many redirects) to {}", attempt.url());
+                return attempt.error("too many redirects");
+            }
+            if let Err(err) = validate_media_url(attempt.url()) {
+                tracing::warn!("video: blocked Steam CDN redirect to {}: {err}", attempt.url());
+                return attempt.error(err);
+            }
+            if !is_trusted_https_steam_cdn_url(attempt.url()) {
+                tracing::warn!("video: blocked redirect off trusted HTTPS Steam CDN to {}", attempt.url());
+                return attempt.error("refusing redirect off trusted HTTPS Steam CDN");
+            }
+            attempt.follow()
+        });
+        let public = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(15))
+            .redirect(public_redirect)
+            .dns_resolver(Arc::new(PublicDnsResolver))
+            .build()
+            .unwrap_or_default();
+        let trusted_https = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(15))
+            .https_only(true)
+            .redirect(trusted_redirect)
+            .dns_resolver(Arc::new(TrustedSteamCdnDnsResolver))
+            .build()
+            .unwrap_or_default();
+        Self { public, trusted_https }
+    }
+
+    fn for_url(&self, url: &reqwest::Url) -> &reqwest::Client {
+        if is_trusted_https_steam_cdn_url(url) {
+            &self.trusted_https
+        } else {
+            &self.public
+        }
     }
 }
 
@@ -703,7 +834,7 @@ fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
 /// One request (optionally a byte range), retried. Returns the body and the
 /// full size when the server answered with a range.
 async fn fetch(
-    http: &reqwest::Client,
+    http: &HttpClients,
     sh: &Shared,
     url: &str,
     range: Option<(u64, u64)>,
@@ -712,8 +843,12 @@ async fn fetch(
 ) -> Result<(Vec<u8>, Option<u64>), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
     if enforce_public_ip {
-        validate_media_url(&parsed)?;
+        if let Err(err) = validate_media_url(&parsed) {
+            tracing::warn!("video: blocked media URL {url}: {err}");
+            return Err(err);
+        }
     }
+    let client = http.for_url(&parsed);
     let mut last = String::new();
     for attempt in 0..4u32 {
         if sh.stopped() {
@@ -722,13 +857,19 @@ async fn fetch(
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(400 << attempt)).await;
         }
-        let mut req = http.get(parsed.clone());
+        let mut req = client.get(parsed.clone());
         if let Some((a, b)) = range {
             req = req.header(reqwest::header::RANGE, format!("bytes={a}-{b}"));
         }
         match req.send().await.and_then(|r| r.error_for_status()) {
             Ok(mut r) => {
-                if enforce_public_ip && r.remote_addr().is_some_and(|a| !is_public_ip(a.ip())) {
+                if enforce_public_ip
+                    && !is_trusted_https_steam_cdn_url(r.url())
+                    && r.remote_addr().is_some_and(|a| !is_public_ip(a.ip()))
+                {
+                    if let Some(addr) = r.remote_addr() {
+                        tracing::warn!("video: blocked response from non-public IP {addr} for {url}");
+                    }
                     return Err("blocked non-public media host".into());
                 }
                 let is_partial = r.status() == reqwest::StatusCode::PARTIAL_CONTENT;
@@ -788,11 +929,11 @@ async fn fetch(
 }
 
 /// A whole file: the first part tells the size, the rest come in parallel.
-async fn get(http: reqwest::Client, sh: Arc<Shared>, url: String) -> Result<Vec<u8>, String> {
+async fn get(http: HttpClients, sh: Arc<Shared>, url: String) -> Result<Vec<u8>, String> {
     get_with_policy(http, sh, url, true).await
 }
 
-async fn get_with_policy(http: reqwest::Client, sh: Arc<Shared>, url: String, enforce_public_ip: bool) -> Result<Vec<u8>, String> {
+async fn get_with_policy(http: HttpClients, sh: Arc<Shared>, url: String, enforce_public_ip: bool) -> Result<Vec<u8>, String> {
     let started = Instant::now();
     let (mut body, total) = fetch(&http, &sh, &url, Some((0, PART - 1)), false, enforce_public_ip).await?;
     if let Some(total) = total.filter(|t| *t > PART) {
@@ -836,43 +977,19 @@ async fn get_with_policy(http: reqwest::Client, sh: Arc<Shared>, url: String, en
     Ok(body)
 }
 
-async fn text(http: &reqwest::Client, sh: &Arc<Shared>, url: &str) -> Result<String, String> {
+async fn text(http: &HttpClients, sh: &Arc<Shared>, url: &str) -> Result<String, String> {
     get(http.clone(), sh.clone(), url.to_string()).await.map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
-async fn media_plan(http: &reqwest::Client, sh: &Arc<Shared>, url: &str) -> Result<Plan, String> {
+async fn media_plan(http: &HttpClients, sh: &Arc<Shared>, url: &str) -> Result<Plan, String> {
     Ok(Plan::from_media(hls::parse_media(&text(http, sh, url).await?, url)))
 }
 
 /// Load the playlists, then keep the next stretch of segments downloaded.
 async fn download(sh: Arc<Shared>, source: Source) {
-    // One client for all players: later trailers reuse warm connections.
-    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let http = HTTP
-        .get_or_init(|| {
-            let redirect = reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 5 {
-                    return attempt.error("too many redirects");
-                }
-                if let Err(err) = validate_media_url(attempt.url()) {
-                    return attempt.error(err);
-                }
-                if let Some(origin) = attempt.previous().first() {
-                    if origin.scheme() == "https" && attempt.url().scheme() != "https" {
-                        return attempt.error("refusing HTTPS-to-HTTP media redirect");
-                    }
-                }
-                attempt.follow()
-            });
-            reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .read_timeout(Duration::from_secs(15))
-                .redirect(redirect)
-                .dns_resolver(Arc::new(PublicDnsResolver))
-                .build()
-                .unwrap_or_default()
-        })
-        .clone();
+    // One client pair for all players: later trailers reuse warm connections.
+    static HTTP: std::sync::OnceLock<HttpClients> = std::sync::OnceLock::new();
+    let http = HTTP.get_or_init(HttpClients::build).clone();
     if let Err(e) = load(&http, &sh, &source).await {
         if !sh.stopped() {
             sh.fail(e);
@@ -988,7 +1105,7 @@ async fn download(sh: Arc<Shared>, source: Source) {
     }
 }
 
-async fn load(http: &reqwest::Client, sh: &Arc<Shared>, source: &Source) -> Result<(), String> {
+async fn load(http: &HttpClients, sh: &Arc<Shared>, source: &Source) -> Result<(), String> {
     let (video, audio, variants, variant) = match source {
         Source::Mp4(url) => {
             let plan = Arc::new(Plan { init: None, segs: vec![Seg { url: url.clone(), start: 0.0, dur: 0.0 }], single: true });
@@ -1113,7 +1230,8 @@ mod tests {
             }
         });
 
-        let http = reqwest::Client::new();
+        let raw = reqwest::Client::new();
+        let http = HttpClients { public: raw.clone(), trusted_https: raw };
         let sh = test_shared();
         // Production get() must reject loopback URLs (SSRF).
         let ssrf = get(http.clone(), sh.clone(), format!("http://{addr}/ok")).await;
@@ -1131,5 +1249,31 @@ mod tests {
         let huge = get_with_policy(http, sh, format!("http://{addr}/huge"), false).await;
         assert!(huge.is_err(), "Content-Range total > 256 MiB must be rejected");
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn trusted_https_steam_cdn_media_policy() {
+        for trusted in [
+            "https://video.fastly.steamstatic.com/store_trailers/1/hls_master.m3u8",
+            "https://video.akamai.steamstatic.com/store_trailers/1/hls_master.m3u8",
+            "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/440/movie.mp4",
+            "https://steamvideo-a.akamaihd.net/store_trailers/1/movie.mp4",
+            "https://media.steampowered.com/apps/440/movie.mp4",
+        ] {
+            let url = reqwest::Url::parse(trusted).unwrap();
+            assert!(is_trusted_https_steam_cdn_url(&url), "expected trusted HTTPS Steam CDN: {trusted}");
+        }
+        for untrusted in [
+            "http://video.fastly.steamstatic.com/store_trailers/1/hls_master.m3u8",
+            "https://evil-steamstatic.com/movie.mp4",
+            "https://198.18.0.1/movie.mp4",
+            "https://127.0.0.1/movie.mp4",
+        ] {
+            let url = reqwest::Url::parse(untrusted).unwrap();
+            assert!(!is_trusted_https_steam_cdn_url(&url), "must not treat as trusted HTTPS Steam CDN: {untrusted}");
+        }
+        assert!(resolve_public_addrs("198.18.0.1").is_err());
+        assert!(resolve_trusted_cdn_addrs("198.18.0.1").is_err());
+        assert!(resolve_trusted_cdn_addrs("127.0.0.1").is_err());
     }
 }

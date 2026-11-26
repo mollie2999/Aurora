@@ -54,20 +54,23 @@ pub(crate) fn mode_with_host(app: &OwnedApp, install_dir: &Path, controller: u8,
     }
     let steam_drm = steam_drm_marked(app.app_id) || executable.is_some_and(|exe| has_steam_drm(&exe));
     if use_host {
-        // Demand-driven hybrid routing (without OfficialSteam):
-        // Keep HeadlessHost as default when no controller translation/custom
-        // layout is needed, or whenever Steam DRM or anti-cheat requires Valve's
-        // engine (those launches use our external OS virtual gamepad instead).
-        // For non-DRM, non-anti-cheat Windows/Proton games that actively need
-        // Steam Input translation or custom bindings, route to Aurora's
-        // steamclient so ISteamInput + layouts + XInput SHM run natively.
-        if !steam_drm && ac.is_none() && needs_aurora_input_route(app.app_id, controller) {
+        if !steam_drm && ac.is_none() {
             #[cfg(windows)]
-            if windows_mode(app, install_dir) == LaunchMode::Aurora {
-                return LaunchMode::Aurora;
+            {
+                // HeadlessHost uses Valve's DLLs and cannot serve Aurora's
+                // Steam Input or game-side XInput bridge. Native Xbox pads can
+                // still need Steam Input, and any pad can arrive after launch.
+                let input = crate::pads::effective_controller_override(app.app_id, controller);
+                let families = crate::pads::settings().families;
+                if crate::pads::resolve_steam_input(input, &families).enabled
+                    && windows_mode(app, install_dir) == LaunchMode::Aurora
+                {
+                    return LaunchMode::Aurora;
+                }
             }
             #[cfg(not(windows))]
-            if let Ok(p) = linux::plan(app, install_dir)
+            if needs_aurora_input_route(app.app_id, controller)
+                && let Ok(p) = linux::plan(app, install_dir)
                 && linux::client_dll(&p, install_dir).is_some()
             {
                 return LaunchMode::Aurora;
@@ -93,8 +96,8 @@ pub(crate) fn mode_with_host(app: &OwnedApp, install_dir: &Path, controller: u8,
     return windows_mode(app, install_dir);
 }
 
-/// Whether this launch actively needs controller translation / Steam Input
-/// (non-Xbox enabled pad connected, custom layout chosen, or per-game Enable).
+/// Whether the Linux launch route or virtual gamepad fallback needs to handle
+/// translation now (non-Xbox pad connected, custom layout, or per-game Enable).
 pub(crate) fn needs_aurora_input_route(app_id: AppId, controller: u8) -> bool {
     let eff = crate::pads::effective_controller_override(app_id, controller);
     let families = crate::pads::settings().families;
@@ -3355,6 +3358,54 @@ mod tests {
             f.extend_from_slice(&s);
         }
         f
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_steam_input_is_ready_before_a_pad_connects() {
+        const FIXTURE: &str = "AURORA_TEST_STEAM_INPUT_CLIENT";
+        let Some(dll) = std::env::var_os(FIXTURE).map(PathBuf::from) else {
+            // Run in isolation so the fixture DLL and empty controller inventory
+            // don't affect (or depend on) other tests.
+            let dir = tempfile::tempdir().unwrap();
+            let dll = dir.path().join("steamclient64.dll");
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "launch::tests::windows_steam_input_is_ready_before_a_pad_connects"])
+                .env(FIXTURE, &dll)
+                .env("STEAMINRUST_STEAMCLIENT64", &dll)
+                .output().unwrap();
+            assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        };
+        let dir = dll.parent().unwrap();
+        let exe = dir.join("game.exe");
+        std::fs::write(&dll, pe_with_sections(&[".text"])).unwrap();
+        std::fs::write(&exe, pe_with_sections(&[".text"])).unwrap();
+        let mut app = OwnedApp {
+            app_id: 4_000_000_223,
+            launch: vec![model::LaunchOption {
+                executable: "game.exe".into(),
+                os_list: "windows".into(),
+                arguments: String::new(),
+                working_dir: String::new(),
+                description: String::new(),
+            }],
+            ..Default::default()
+        };
+        let host = LaunchMode::HeadlessHost { steam_drm: false };
+        assert_eq!(crate::pads::connected_summary().total, 0);
+        assert_eq!(mode_with_host(&app, dir, 0, true), LaunchMode::Aurora);
+        assert_eq!(mode_with_host(&app, dir, 2, true), host);
+
+        app.categories.push(CATEGORY_VAC);
+        assert_eq!(mode_with_host(&app, dir, 1, true), host);
+        app.categories.clear();
+        std::fs::write(&exe, pe_with_sections(&[".text", ".bind"])).unwrap();
+        assert_eq!(mode_with_host(&app, dir, 1, true), LaunchMode::HeadlessHost { steam_drm: true });
+
+        std::fs::write(&exe, pe_with_sections(&[".text"])).unwrap();
+        std::fs::remove_file(&dll).unwrap();
+        assert_eq!(mode_with_host(&app, dir, 1, true), host);
     }
 
     #[test]

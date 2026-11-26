@@ -1526,7 +1526,7 @@ mod platform {
                             ry: ry_f,
                             lt: lt_f,
                             rt: rt_f,
-                            touchpads: [TouchpadFinger::default(); 2],
+                            touchpads: Default::default(),
                         });
                         let id = format!("xinput-{i}");
                         if rumble_target.as_deref() == Some(id.as_str()) && cal.rumble_enabled
@@ -2711,7 +2711,7 @@ mod tests {
             non_xbox_enabled: 0,
             ..Default::default()
         };
-        // Native Xbox pad + default Auto layout stays on HeadlessHost (no translation needed).
+        // A native Xbox pad with the default Auto layout needs no translation.
         assert!(!xbox_only.needs_translation(0, &all, false));
         // Custom layout or explicit per-game Enable triggers translation.
         assert!(xbox_only.needs_translation(0, &all, true));

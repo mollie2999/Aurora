@@ -299,6 +299,12 @@ pub async fn names(conn: &Connection, ids: &[AppId]) -> Result<Vec<(AppId, Strin
     Ok(apps.into_iter().filter(|a| a.name != "Unknown").map(|a| (a.app_id, a.name)).collect())
 }
 
+/// `(dlc, parent game, name)` for the DLC among `ids`, from their public info.
+pub async fn dlc_parents(conn: &Connection, ids: &[AppId]) -> Result<Vec<(AppId, AppId, String)>> {
+    let apps = app_info(conn, ids, &HashMap::new()).await?;
+    Ok(apps.into_iter().filter_map(|a| a.parent.map(|p| (a.app_id, p, a.name))).collect())
+}
+
 const MAX_PICS_COMPRESSED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PICS_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 

@@ -6,6 +6,7 @@ Two complete packages are bundled with Aurora and automatically installed on lau
 
 - [Aurora Desktop (Steam replica)](examples/steam-replica/README.md): Steam-style chrome and library shelves, with Modern, Classic Blue and VGUI Olive palettes.
 - [Adwaita](examples/adwaita/README.md): compact AdwSteamGtk-inspired chrome around Aurora's default library, with optional native GTK4/libadwaita styling on Linux.
+- [Metro](examples/metro/README.md): port of the MetroSteam skin, with a single flat black title bar, square corners and solid-accent selection, plus Variation and Accent Color options.
 
 Open **Settings → Appearance** to activate either theme right away. If you uninstall a bundled theme and later want it back, click **Restore Built-in Themes** in **Settings → Appearance**.
 
@@ -273,7 +274,7 @@ Every node accepts an optional `style = { ... }` table with any subset of these 
 | --- | --- | --- |
 | `"library_search"` | `placeholder` (`string?`), `show_filter_button` (`false`), `style` | Library search box with optional filter button. |
 | `"library_filters"` | `variant` (`"default"` \| `"dropdown_icons"`), `style` | Category / Installed / Ready-to-Play filter controls. |
-| `"library_list"` | `group_by` (`"installed"` or `"last_played"`, defaults to `"installed"`), `row_height` (`26.0`), `icon_size` (`18.0`), `group_headers` (`true`), `show_counts` (`true`), `style` | Scrollable sidebar list with icons and collapsible group headers/counts. Last-played mode shows Recent, calendar months, and Never played. |
+| `"library_list"` | `group_by` (`"installed"` or `"last_played"`, defaults to `"installed"`), `row_height` (`26.0`), `icon_size` (`18.0`), `group_headers` (`true`), `show_counts` (`true`), `style` | Scrollable sidebar list with icons and collapsible group headers/counts. Last-played mode shows Recent, calendar months, and Never played. Optional row styling: `style.active_bg` / `style.active_color` (selected row fill and text, default a faint accent tint), `style.hover_bg` and `style.radius` (default `2`). |
 | `"whats_new_shelf"` | `title` (`string?`), `card_width` (`240.0`), `card_height` (`135.0`), `card_radius` (`0`), `date_above` (`false`), `max_items` (`5`), `gap` (`12.0`), `style` | Horizontal shelf of recent game news/updates. |
 | `"recent_games_shelf"` | `title` (`string?`), `featured_first` (`false`), `featured_width` (`360.0`), `capsule_width` (`156.0`), `capsule_height` (`234.0`), `card_radius` (`0`), `gap` (`12.0`), `style` | Recently played games shelf. When `featured_first = true`, the first game renders as a wide 16:9 hero tile followed by vertical capsules. |
 | `"all_games_grid"` | `title` (`string?`), `show_count` (`true`), `show_sort` (`true`), `card_aspect` (`"2:3"` \| `"capsule"` \| `"banner"` \| `"16:9"`), `card_width` (`156.0`), `card_height` (`234.0`), `card_radius` (`0`), `gap` (`12.0`), `style` | Responsive full-width game grid with optional count badge and sort dropdown. |

@@ -1,0 +1,199 @@
+[meta]
+id = "metro"
+name = "Metro"
+version = "1.0.2"
+author = "Aurora (after MetroSteam by RoseTheFlower)"
+description = "Port of the MetroSteam skin: one flat 38px black title bar, square corners, Segoe-style type and solid accent selection."
+
+[fonts]
+# Selawik is Microsoft's open-source, metric-compatible stand-in for Segoe UI
+# (Segoe UI itself cannot be redistributed). Semibold doubles as Metro's bold.
+regular = "assets/fonts/Selawik-Regular.ttf"
+bold = "assets/fonts/Selawik-Semibold.ttf"
+
+[theme]
+base = "OLED"
+dark = true
+
+# MetroSteam CSS variables, flattened onto pure black:
+#   --clientBG / --header_dark / --bgGameList / --frameBorder = 0,0,0
+#   white05 / white12 / white24 overlays on black -> raised / surface / hover
+bg = "#000000"
+chrome = "#000000"
+surface = "#1F1F1F"
+surface_hover = "#3D3D3D"
+raised = "#0D0D0D"
+border = "#000000"
+
+text = "#FFFFFF"     # --white
+text_dim = "#808080" # --white50
+text_faint = "#737373" # --white45
+
+accent = "#6624E2"   # --focus (Metro default purple)
+accent_2 = "#7028F9" # --focus at brightness(1.1), Metro's hover
+on_accent = "#FFFFFF"
+
+play = "#6624E2"     # Metro paints the Play button with --focus
+online = "#5DB2FF"
+in_game = "#82BA00"
+away = "#FFD24C"     # yellow, so Away reads apart from Online
+danger = "#E81223"   # Windows 10 close-button red
+discount = "#4C6B22"
+
+radius = 0
+weight_preset = "balanced"
+font_scale = 1.0
+
+# ---------------------------------------------------------------------------
+# Options mirroring MetroSteam's Millennium settings
+# ---------------------------------------------------------------------------
+
+[options.variation]
+kind = "select"
+label = "Variation"
+description = "MetroSteam's colour variations."
+default = "standard"
+
+[[options.variation.choices]]
+value = "standard"
+label = "Standard"
+
+[[options.variation.choices]]
+value = "dark"
+label = "Dark"
+[options.variation.choices.overrides.theme]
+chrome = "#0C0C0C"
+border = "#404040"
+raised = "#181818"
+
+[[options.variation.choices]]
+value = "midnight"
+label = "Midnight"
+[options.variation.choices.overrides.theme]
+chrome = "#00162D"
+border = "#171366"
+raised = "#000E2D"
+
+[[options.variation.choices]]
+value = "white"
+label = "White"
+[options.variation.choices.overrides.theme]
+dark = false
+bg = "#E6E6E6"
+chrome = "#FFFFFF"
+surface = "#CACACA"
+surface_hover = "#AFAFAF"
+raised = "#DADADA"
+border = "#A0A0A0"
+text = "#000000"
+text_dim = "#737373"
+text_faint = "#8A8A8A"
+online = "#4268FF"
+in_game = "#5E960F"
+away = "#B88A00"
+
+[options.accent]
+kind = "select"
+label = "Accent Color"
+description = "MetroSteam's accent presets (--focus)."
+default = "default"
+
+[[options.accent.choices]]
+value = "default"
+label = "Default (Purple)"
+
+[[options.accent.choices]]
+value = "blue"
+label = "Blue"
+[options.accent.choices.overrides.theme]
+accent = "#0072C6"
+accent_2 = "#007DDA"
+play = "#0072C6"
+
+[[options.accent.choices]]
+value = "pink"
+label = "Pink"
+[options.accent.choices.overrides.theme]
+accent = "#DC4FAD"
+accent_2 = "#F257BE"
+play = "#DC4FAD"
+
+[[options.accent.choices]]
+value = "red"
+label = "Red"
+[options.accent.choices.overrides.theme]
+accent = "#AC193D"
+accent_2 = "#BD1C43"
+play = "#AC193D"
+
+[[options.accent.choices]]
+value = "orangered"
+label = "OrangeRed"
+[options.accent.choices.overrides.theme]
+accent = "#D24726"
+accent_2 = "#E74E2A"
+play = "#D24726"
+
+[[options.accent.choices]]
+value = "orange"
+label = "Orange"
+[options.accent.choices.overrides.theme]
+accent = "#FF8F32"
+accent_2 = "#FF9D37"
+play = "#FF8F32"
+
+[[options.accent.choices]]
+value = "lime"
+label = "Lime"
+[options.accent.choices.overrides.theme]
+accent = "#82BA00"
+accent_2 = "#8FCD00"
+play = "#82BA00"
+
+[[options.accent.choices]]
+value = "green"
+label = "Green"
+[options.accent.choices.overrides.theme]
+accent = "#008A17"
+accent_2 = "#009819"
+play = "#008A17"
+
+[[options.accent.choices]]
+value = "aqua"
+label = "Aqua"
+[options.accent.choices.overrides.theme]
+accent = "#03B3B2"
+accent_2 = "#03C5C4"
+play = "#03B3B2"
+
+[[options.accent.choices]]
+value = "dark_aqua"
+label = "Dark Aqua"
+[options.accent.choices.overrides.theme]
+accent = "#008298"
+accent_2 = "#008FA7"
+play = "#008298"
+
+[[options.accent.choices]]
+value = "sky_blue"
+label = "Sky Blue"
+[options.accent.choices.overrides.theme]
+accent = "#5DB2FF"
+accent_2 = "#66C4FF"
+play = "#5DB2FF"
+
+[[options.accent.choices]]
+value = "purple"
+label = "Purple"
+[options.accent.choices.overrides.theme]
+accent = "#4617B4"
+accent_2 = "#4D19C6"
+play = "#4617B4"
+
+[[options.accent.choices]]
+value = "magenta"
+label = "Magenta"
+[options.accent.choices.overrides.theme]
+accent = "#8C0095"
+accent_2 = "#9A00A4"
+play = "#8C0095"

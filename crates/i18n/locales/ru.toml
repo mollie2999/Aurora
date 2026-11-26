@@ -2650,6 +2650,19 @@
 "Not detected" = "Не обнаружен"
 "Switch section" = "Сменить раздел"
 "Touchscreen" = "Сенсорный экран"
+# Steam Family: shared copy and preferred copy
+"Steam Family details are unavailable." = "Сведения о семье Steam недоступны."
+"Some DLC details are unavailable." = "Сведения о некоторых дополнениях недоступны."
+"Shared from your Steam Family member" = "Предоставлено участником вашей семьи Steam"
+"Change preferred copy" = "Сменить предпочтительную копию"
+"Change Preferred Copy" = "Смена предпочтительной копии"
+"Select your preferred copy of this game." = "Выберите предпочитаемую копию этой игры."
+"PREFERRED COPY" = "ПРЕДПОЧТИТЕЛЬНАЯ КОПИЯ"
+"Base game only" = "Только основная игра"
+"+ {n} DLC in common to all copies in the Steam Family" = "+ {n} DLC, общих для всех копий в семье Steam"
+"Confirm" = "Подтвердить"
+"Preferred copy updated." = "Предпочтительная копия обновлена."
+"Using your own copy" = "Используется ваша копия"
 
 # View menu and desktop views
 "Large Mode" = "Большой режим"
@@ -2716,3 +2729,6 @@
 "IP:Port (e.g. 198.51.100.10:27015)" = "IP:порт (например, 198.51.100.10:27015)"
 "App ID (optional)" = "ID приложения (необязательно)"
 "Enter a valid IPv4 address and port (a.b.c.d:port)." = "Введите допустимый адрес IPv4 и порт (a.b.c.d:порт)."
+"Smooth scrolling" = "Плавная прокрутка"
+"Glide each mouse wheel step over a few frames. Off: the page jumps the whole step at once." = "Растягивает каждый шаг колеса мыши на несколько кадров. Выкл.: страница сразу прыгает на весь шаг."
+"Sort by recent activity" = "Сортировать по недавней активности"

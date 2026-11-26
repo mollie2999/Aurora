@@ -206,6 +206,10 @@ impl State {
                 *self = State { last_error: Some(msg.clone()), ..Default::default() };
             }
             Event::LoggedIn { steam_id, account } => {
+                if self.steam_id != *steam_id {
+                    self.family = None;
+                    self.family_action = None;
+                }
                 self.phase = Phase::LoggedIn;
                 self.steam_id = *steam_id;
                 self.account = account.clone();
@@ -355,7 +359,22 @@ impl State {
                 _ => self.purchases = Some(result.clone()),
             },
             Event::LicenseList(r) => self.licenses = Some(r.clone()),
-            Event::Family(r) => self.family = Some(r.clone()),
+            Event::Family { steam_id, result } => {
+                if self.phase == Phase::LoggedIn && self.steam_id == *steam_id {
+                    self.family = Some(result.clone());
+                }
+            }
+            Event::PreferredCopyChanged { steam_id, family_id, app_id, lender, result, .. } => {
+                if self.phase == Phase::LoggedIn
+                    && self.steam_id == *steam_id
+                    && result.is_ok()
+                    && let Some(Ok(status)) = self.family.as_mut()
+                    && let Some(family) = status.family.as_mut()
+                    && family.id == *family_id
+                {
+                    family.set_preferred_copy(*app_id, *lender);
+                }
+            }
             Event::FamilyAction(r) => {
                 let seq = self.family_action.as_ref().map_or(1, |(s, _)| s.saturating_add(1));
                 self.family_action = Some((seq, r.clone()));
@@ -412,11 +431,18 @@ impl State {
             Event::Personas(list) => {
                 for p in list {
                     let mut p = p.clone();
-                    // Steam's echoes of our own persona often leave the game
-                    // out; keep the game we know is running so our status
-                    // stays "In game" (green) instead of falling back to Online.
-                    if p.steam_id == self.steam_id && !p.in_game() {
-                        p.game_app_id = self.playing;
+                    if p.steam_id == self.steam_id {
+                        if p.state == model::PersonaState::Invisible {
+                            // Invisible: friends don't see our game, so we
+                            // don't show it on our own status either.
+                            hide_game(&mut p);
+                        } else if !p.in_game() {
+                            // Steam's echoes of our own persona often leave
+                            // the game out; keep the game we know is running
+                            // so our status stays "In game" (green) instead
+                            // of falling back to Online.
+                            p.game_app_id = self.playing;
+                        }
                     }
                     self.personas.insert(p.steam_id, p);
                 }
@@ -682,9 +708,13 @@ impl State {
                 self.playing = Some(*app_id);
                 self.game_lobby = None;
                 self.game_connect = None;
-                // Show it on our own status right away, like Steam.
+                // Show it on our own status right away, like Steam (unless
+                // we're invisible).
                 let me = self.steam_id;
-                self.personas.entry(me).or_insert_with(|| Persona { steam_id: me, ..Default::default() }).game_app_id = Some(*app_id);
+                let p = self.personas.entry(me).or_insert_with(|| Persona { steam_id: me, ..Default::default() });
+                if p.state != model::PersonaState::Invisible {
+                    p.game_app_id = Some(*app_id);
+                }
             }
             Event::GameStopped { app_id } => {
                 if self.launching == Some(*app_id) {
@@ -912,6 +942,16 @@ impl State {
     }
 }
 
+/// Drop everything that says what a persona is playing.
+fn hide_game(p: &mut Persona) {
+    p.game_app_id = None;
+    p.game_name = None;
+    p.rich_status = None;
+    p.server = None;
+    p.lobby = None;
+    p.connect = None;
+}
+
 fn same_group_msg(a: &GroupMessage, b: &GroupMessage) -> bool {
     if a.ordinal != 0 && b.ordinal != 0 {
         a.time == b.time && a.ordinal == b.ordinal
@@ -1003,6 +1043,54 @@ fn merge_group(dst: &mut ChatGroup, prev: &ChatGroup, summary_only: bool) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+    use model::{Family, FamilyStatus, SharedApp};
+
+    fn snapshot(steam_id: SteamId) -> Event {
+        let family = Family {
+            id: 5,
+            shared: vec![SharedApp { app_id: 10, name: "Game".into(), owners: vec![20, 30], excluded: false }],
+            shared_available: true,
+            ..Default::default()
+        };
+        Event::Family { steam_id, result: Ok(FamilyStatus { family: Some(family), ..Default::default() }) }
+    }
+
+    #[test]
+    fn account_switch_discards_late_family_snapshots() {
+        let mut state = State::default();
+        state.apply(&Event::LoggedIn { steam_id: 20, account: "first".into() });
+        state.apply(&snapshot(20));
+        assert!(state.family.is_some());
+
+        state.apply(&Event::LoggedIn { steam_id: 30, account: "second".into() });
+        state.apply(&snapshot(20));
+        assert!(state.family.is_none());
+        state.apply(&snapshot(30));
+        assert!(state.family.is_some());
+    }
+
+    #[test]
+    fn preferred_copy_changes_only_when_steam_accepts_for_this_family() {
+        let mut state = State::default();
+        state.apply(&Event::LoggedIn { steam_id: 20, account: "me".into() });
+        state.apply(&snapshot(20));
+        let reply = |steam_id, family_id, result| Event::PreferredCopyChanged {
+            request_id: 1, steam_id, family_id, app_id: 10, lender: 30, result,
+        };
+        let preferred = |state: &State| state.family.as_ref().unwrap().as_ref().unwrap().family.as_ref().unwrap().preferred_copy(10);
+
+        for event in [reply(20, 5, Err("rejected".into())), reply(30, 5, Ok(())), reply(20, 6, Ok(()))] {
+            state.apply(&event);
+            assert_eq!(preferred(&state), None);
+        }
+        state.apply(&reply(20, 5, Ok(())));
+        assert_eq!(preferred(&state), Some(30));
     }
 }
 
@@ -1123,6 +1211,33 @@ mod group_tests {
         // Once the game closes, a later echo shows plain Online again.
         s.apply(&Event::GameStopped { app_id: 730 });
         s.apply(&Event::Personas(vec![Persona { steam_id: 7, ..Default::default() }]));
+        assert!(!s.me().unwrap().in_game());
+    }
+
+    #[test]
+    fn own_persona_hides_game_while_invisible() {
+        use model::PersonaState::{Invisible, Online};
+        let mut s = State { steam_id: 7, ..Default::default() };
+        s.apply(&Event::Personas(vec![Persona { steam_id: 7, state: Invisible, ..Default::default() }]));
+        // Starting a game while invisible doesn't show it.
+        s.apply(&Event::GameStarted { app_id: 730 });
+        assert!(!s.me().unwrap().in_game());
+        // Nor does an echo that carries the game.
+        s.apply(&Event::Personas(vec![Persona {
+            steam_id: 7,
+            state: Invisible,
+            game_app_id: Some(730),
+            rich_status: Some("In a match".into()),
+            ..Default::default()
+        }]));
+        let me = s.me().unwrap();
+        assert!(!me.in_game());
+        assert!(me.rich_status.is_none());
+        // Going online again while still playing shows the game.
+        s.apply(&Event::Personas(vec![Persona { steam_id: 7, state: Online, ..Default::default() }]));
+        assert_eq!(s.me().unwrap().game_app_id, Some(730));
+        // Going invisible mid-game hides it again.
+        s.apply(&Event::Personas(vec![Persona { steam_id: 7, state: Invisible, game_app_id: Some(730), ..Default::default() }]));
         assert!(!s.me().unwrap().in_game());
     }
 

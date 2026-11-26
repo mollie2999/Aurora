@@ -746,11 +746,13 @@ fn render_nav_tabs(
         };
         let galley = ui.painter().layout_no_wrap(display, font.clone(), Color32::PLACEHOLDER);
         let icon_w = if icon.is_some() { 20.0 } else { 0.0 };
-        let pad_x = if indicator == IndicatorStyle::Pill { 12.0 } else { 4.0 };
+        // The theme's own left/right padding when it sets one (Metro's 8 px).
+        let default_pad = if indicator == IndicatorStyle::Pill { 12.0 } else { 4.0 };
+        let (pad_x, pad_right) = style.padding.map_or((default_pad, default_pad), |p| (p.left, p.right));
         let tab_w = if full_w {
             ui.available_width()
         } else {
-            galley.size().x + icon_w + pad_x * 2.0
+            galley.size().x + icon_w + pad_x + pad_right
         };
         let tab_h = match style.height {
             Some(SizeVal::Px(h)) => h,
@@ -763,7 +765,13 @@ fn render_nav_tabs(
         let p = ui.painter();
 
         match indicator {
-            IndicatorStyle::None => {}
+            IndicatorStyle::None => {
+                if let Some(hbg) = style.hover_bg.map(|c| c.resolve(&t)) {
+                    if hover > 0.01 {
+                        p.rect_filled(rect, radius, w::mix(Color32::TRANSPARENT, hbg, hover));
+                    }
+                }
+            }
             IndicatorStyle::Pill => {
                 let bg = style.active_bg.map(|c| c.resolve(&t)).unwrap_or_else(|| w::active_fill(&t));
                 let hbg = style.hover_bg.map(|c| c.resolve(&t)).unwrap_or(t.surface_hover);

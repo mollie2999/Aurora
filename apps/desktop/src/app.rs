@@ -68,6 +68,8 @@ pub struct Prefs {
     pub favorite_friends: Vec<u64>,
     /// Mouse wheel and touchpad scroll distance, as a multiple of egui's.
     pub scroll_speed: f32,
+    /// Glide mouse-wheel steps over a few frames (egui's smoothing).
+    pub smooth_scroll: bool,
     /// The player has seen the one-time notice for Steam-DRM games (how they
     /// start through a background Steam instance).
     #[serde(default)]
@@ -158,6 +160,7 @@ impl Default for Prefs {
             auto_offline: false,
             favorite_friends: Vec::new(),
             scroll_speed: 2.0,
+            smooth_scroll: true,
             drm_host_ack: false,
             proton_override: None,
             proton_per_app: Default::default(),
@@ -238,6 +241,8 @@ pub struct SteamApp {
     confirm_exit: bool,
     window_mode: Option<WindowMode>,
     pub(crate) bigpicture: crate::bigpicture::BigPicture,
+    /// Middle-click autoscroll, like a browser.
+    autoscroll: crate::autoscroll::AutoScroll,
     /// A window size waiting to be centered once the monitor size is known.
     center_window: Option<[f32; 2]>,
     /// A window size asked for but not reached yet: (size, resizable, frames
@@ -377,6 +382,7 @@ impl SteamApp {
             toast_messages: prefs.toast_messages,
             toast_notifications: prefs.toast_notifications,
             scroll_speed: prefs.scroll_speed,
+            smooth_scroll: prefs.smooth_scroll,
             drm_host_ack: prefs.drm_host_ack,
             overlay_enabled: prefs.overlay_enabled,
             fps_counter: prefs.fps_counter,
@@ -448,6 +454,7 @@ impl SteamApp {
             confirm_exit: false,
             window_mode: None,
             bigpicture,
+            autoscroll: Default::default(),
             center_window: None,
             pending_size: None,
             monitor_clamped: false,
@@ -1182,6 +1189,28 @@ fn finish_memory_trim(ctx: &egui::Context, pending: &mut u8) -> bool {
     *pending == 0
 }
 
+/// Smooth scrolling off: egui glides any wheel step of 8 points or more over
+/// a few frames, and applies smaller ones at once. So each mouse-wheel step
+/// becomes small point steps, all on the same frame: the page moves the
+/// whole step immediately. Zoom (Ctrl/Cmd + wheel) and trackpads are left alone.
+fn instant_wheel(raw_input: &mut egui::RawInput, line_points: f32) {
+    use egui::{Event, MouseWheelUnit, TouchPhase};
+    const STEP: f32 = 7.5;
+    let events = std::mem::take(&mut raw_input.events);
+    for event in events {
+        match event {
+            Event::MouseWheel { unit: unit @ (MouseWheelUnit::Line | MouseWheelUnit::Point), delta, phase: TouchPhase::Move, source, modifiers } if !modifiers.command && source != egui::MouseWheelSource::Trackpad => {
+                let points = if unit == MouseWheelUnit::Line { delta * line_points } else { delta };
+                let n = (points.length() / STEP).ceil().max(1.0) as usize;
+                for _ in 0..n.min(400) {
+                    raw_input.events.push(Event::MouseWheel { unit: MouseWheelUnit::Point, delta: points / n as f32, phase: TouchPhase::Move, source, modifiers });
+                }
+            }
+            other => raw_input.events.push(other),
+        }
+    }
+}
+
 impl eframe::App for SteamApp {
     /// Runs before every frame, and also while the window gets no frames
     /// (minimized or behind a fullscreen game on Wayland): the overlay drawn
@@ -1245,6 +1274,15 @@ impl eframe::App for SteamApp {
                 *delta *= speed;
             }
         }
+        // After the speed setting: autoscroll's speed follows the pointer.
+        if self.bigpicture.active {
+            self.autoscroll.stop();
+        } else {
+            self.autoscroll.feed(raw_input);
+        }
+        if !self.prefs.smooth_scroll {
+            instant_wheel(raw_input, _ctx.options(|o| o.input_options.line_scroll_speed));
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1256,6 +1294,7 @@ impl eframe::App for SteamApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.sync_theme_state(&ctx);
+        self.autoscroll.paint(&ctx, self.prefs.theme.accent);
         if self.applied_zoom != self.prefs.zoom {
             ctx.set_zoom_factor(self.prefs.zoom);
             self.applied_zoom = self.prefs.zoom;
@@ -1277,6 +1316,7 @@ impl eframe::App for SteamApp {
             self.prefs.toast_messages = f.toast_messages;
             self.prefs.toast_notifications = f.toast_notifications;
             self.prefs.scroll_speed = f.scroll_speed;
+            self.prefs.smooth_scroll = f.smooth_scroll;
             self.prefs.drm_host_ack = f.drm_host_ack;
             self.prefs.overlay_enabled = f.overlay_enabled;
             self.prefs.fps_counter = f.fps_counter;

@@ -2541,6 +2541,19 @@
 "Not detected" = "Non détecté"
 "Switch section" = "Changer de section"
 "Touchscreen" = "Écran tactile"
+# Steam Family: shared copy and preferred copy
+"Steam Family details are unavailable." = "Les détails de la famille Steam sont indisponibles."
+"Some DLC details are unavailable." = "Certains détails sur les DLC sont indisponibles."
+"Shared from your Steam Family member" = "Partagé par un membre de votre famille Steam"
+"Change preferred copy" = "Changer de copie préférée"
+"Change Preferred Copy" = "Changer de copie préférée"
+"Select your preferred copy of this game." = "Sélectionnez la copie de ce jeu que vous préférez."
+"PREFERRED COPY" = "COPIE PRÉFÉRÉE"
+"Base game only" = "Jeu de base uniquement"
+"+ {n} DLC in common to all copies in the Steam Family" = "+ {n} DLC communs à toutes les copies de la famille Steam"
+"Confirm" = "Confirmer"
+"Preferred copy updated." = "Copie préférée mise à jour."
+"Using your own copy" = "Vous utilisez votre propre copie"
 
 # View menu and desktop views
 "Large Mode" = "Mode étendu"
@@ -2607,3 +2620,6 @@
 "IP:Port (e.g. 198.51.100.10:27015)" = "IP:port (p. ex. 198.51.100.10:27015)"
 "App ID (optional)" = "ID de l’application (facultatif)"
 "Enter a valid IPv4 address and port (a.b.c.d:port)." = "Saisissez une adresse IPv4 et un port valides (a.b.c.d:port)."
+"Smooth scrolling" = "Défilement fluide"
+"Glide each mouse wheel step over a few frames. Off: the page jumps the whole step at once." = "Fait glisser chaque cran de la molette sur quelques images. Désactivé : la page saute tout le cran d'un coup."
+"Sort by recent activity" = "Trier par activité récente"

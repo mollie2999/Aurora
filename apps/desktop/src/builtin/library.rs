@@ -13,7 +13,7 @@ use egui::containers::menu::SubMenu;
 use egui::{Align, Align2, Color32, CornerRadius, Layout, Margin, Rect, Sense, Stroke, Ui, pos2, vec2};
 use extensions::{Ctx, Extension, Manifest, PageSpec};
 use local::manage::{Progress, VerifyReport};
-use model::{AppId, InstalledGame, art};
+use model::{AppId, InstalledGame, SteamId, art};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -160,6 +160,8 @@ struct Saved {
     hide_collections: bool,
     /// Collapsed sidebar group keys (collections and built-in sections).
     collapsed_groups: BTreeSet<String>,
+    /// Themed sidebar sorted by recent activity (Steam's clock button).
+    recent_order: bool,
     /// Collections as Steam last had them, for the account they belong to:
     /// the base of the three-way merge at sign-in.
     collections_base: Option<(u64, client::collections::Collections)>,
@@ -345,6 +347,14 @@ pub struct Library {
     shortcut_after_install: BTreeMap<AppId, std::path::PathBuf>,
     seen_finished: BTreeSet<AppId>,
     storage_dialog: Option<super::storage_ui::StorageDialog>,
+    /// "Change Preferred Copy" open for a family game, with the picked lender.
+    preferred_copy: Option<(AppId, Option<SteamId>)>,
+    pending_preferred_copy: Option<u64>,
+    preferred_copy_request_id: u64,
+    /// A Family load initiated by the game page is still pending.
+    family_loading: bool,
+    /// Sidebar grouped by recent activity instead of the theme's grouping.
+    recent_order: bool,
 }
 
 impl Extension for Library {
@@ -357,6 +367,7 @@ impl Extension for Library {
     }
 
     fn on_navigate(&mut self, _page: &str, arg: Option<&str>) {
+        self.preferred_copy = None;
         self.custom_selected = None;
         self.collections_view = None;
         self.dialog = None;
@@ -451,12 +462,35 @@ impl Extension for Library {
                 Err(e) => ctx.toast(i18n::tr_dyn(e)),
             },
             client::Event::LoggedIn { steam_id, .. } => {
+                self.family_loading = false;
+                self.preferred_copy = None;
+                self.pending_preferred_copy = None;
                 self.account = Some(*steam_id);
                 self.collections_loaded = false;
                 self.send_cloud_settings(ctx);
                 ctx.send(Command::LoadSteamCollections);
                 // Account-wide play history, for "Recent games".
                 ctx.send(Command::LoadPlayerGames { steam_id: *steam_id, language: i18n::language().steam_name().into() });
+            }
+            client::Event::LoggedOut { .. } => {
+                self.family_loading = false;
+                self.preferred_copy = None;
+                self.pending_preferred_copy = None;
+            }
+            client::Event::Family { steam_id, .. } if ctx.state.steam_id == *steam_id => {
+                self.family_loading = false;
+            }
+            client::Event::PreferredCopyChanged { request_id, steam_id, result, .. }
+                if ctx.state.steam_id == *steam_id && self.pending_preferred_copy == Some(*request_id) =>
+            {
+                self.pending_preferred_copy = None;
+                match result {
+                    Ok(()) => {
+                        self.preferred_copy = None;
+                        ctx.toast(t!("Preferred copy updated."));
+                    }
+                    Err(error) => ctx.toast(t!("Steam didn't accept that: {error}", error = error)),
+                }
             }
             client::Event::Apps(_) => {
                 self.send_cloud_settings(ctx);
@@ -647,6 +681,7 @@ impl Extension for Library {
             collections: self.collections.clone(),
             hide_collections: self.hide_collections,
             collapsed_groups: self.collapsed_groups.clone(),
+            recent_order: self.recent_order,
             collections_base: self.collections_base.clone(),
             through_steam: self.through_steam,
             pending_shortcuts: self.shortcut_after_install.clone(),
@@ -672,6 +707,7 @@ impl Extension for Library {
         self.collections = saved.collections;
         self.hide_collections = saved.hide_collections;
         self.collapsed_groups = saved.collapsed_groups;
+        self.recent_order = saved.recent_order;
         self.collections_base = saved.collections_base;
         self.through_steam = saved.through_steam;
         client::launch_through_steam(self.through_steam);
@@ -2637,6 +2673,7 @@ impl Library {
                 });
             });
             ui.add_space(10.0);
+            self.family_line(ui, t, ctx, id);
 
             // Link row (like Steam's under the play bar).
             egui::Frame::new().outer_margin(Margin::symmetric(24, 0)).show(ui, |ui| {
@@ -4267,6 +4304,257 @@ fn themed_shelf_scroll(ui: &Ui, salt: &str, delta: f32) -> egui::ScrollArea {
     scroll
 }
 
+impl Library {
+    /// Steam's "Shared from your Steam Family member" line under the play bar,
+    /// with "Change preferred copy" when more than one member owns the game.
+    /// Drawn from theme tokens only, so it fits every theme.
+    fn family_line(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, id: AppId) {
+        if !ctx.state.online() {
+            return;
+        }
+        let Some(status) = ctx.state.family.as_ref() else {
+            self.load_family(ctx);
+            return;
+        };
+        let family = match status {
+            Ok(status) => match status.family.as_ref() {
+                Some(family) if family.shared_available => family,
+                None => return,
+                _ => {
+                    self.family_retry(ui, t, ctx);
+                    return;
+                }
+            },
+            Err(_) => {
+                self.family_retry(ui, t, ctx);
+                return;
+            }
+        };
+        let me = ctx.state.steam_id;
+        let copy = family.active_copy(id);
+        let copies = family.copies(id, me).len();
+        if copies == 0 || (copy == Some(me) && copies == 1) {
+            return;
+        }
+        let mut open = false;
+        egui::Frame::new().outer_margin(Margin { left: 24, right: 24, top: 0, bottom: 10 }).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if let Some(copy) = copy {
+                    let p = ctx.state.persona(copy);
+                    let lead = if copy == me { t!("Using your own copy") } else { t!("Shared from your Steam Family member") };
+                    ui.label(w::text(lead, 14.0, t.text_dim));
+                    ui.add_space(4.0);
+                    // Avatar, name and status open the member's profile.
+                    let hover_id = ui.scope_id().with(("family-member", copy));
+                    let hovered = ui.ctx().data(|d| d.get_temp::<bool>(hover_id)).unwrap_or(false);
+                    let member = ui
+                        .scope(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                w::avatar(ui, t, &art::avatar(p.avatar_hash.as_deref()), 28.0, Some(crate::shell::status_color(t, &p)));
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    let name = if p.name.is_empty() { copy.to_string() } else { p.name.clone() };
+                                    let color = crate::shell::status_color(t, &p);
+                                    let name_color = if hovered { w::mix(color, t.text, 0.5) } else { color };
+                                    let mut job = egui::text::LayoutJob::simple_singleline(name, w::font(13.5), name_color);
+                                    if hovered {
+                                        job.sections[0].format.underline = Stroke::new(1.0, name_color);
+                                    }
+                                    ui.label(job);
+                                    ui.label(w::text(crate::shell::status_text(ctx.state, &p), 11.5, color));
+                                });
+                            });
+                        })
+                        .response
+                        .interact(Sense::click());
+                    ui.ctx().data_mut(|d| d.insert_temp(hover_id, member.hovered()));
+                    if member.on_hover_text(t!("View profile")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        ctx.navigate("profile", Some(copy.to_string()));
+                    }
+                } else {
+                    ui.label(w::text(t!("Steam Family"), 14.0, t.text_dim));
+                }
+                if copies > 1 && self.pending_preferred_copy.is_none() {
+                    ui.add_space(24.0);
+                    let r = ui.add(egui::Label::new(w::text(t!("Change preferred copy"), 13.5, t.accent)).sense(Sense::click()));
+                    if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        open = true;
+                    }
+                }
+            });
+        });
+        if open {
+            self.preferred_copy = Some((id, copy));
+        }
+        if self.preferred_copy.is_some_and(|(app_id, _)| app_id == id) {
+            self.preferred_copy_dialog(ui, t, ctx);
+        } else {
+            self.preferred_copy = None;
+        }
+    }
+
+    /// Steam's "Change Preferred Copy": every family copy of the game with its DLC.
+    fn preferred_copy_dialog(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+        let Some((app_id, mut pick)) = self.preferred_copy else { return };
+        let Some(family) = ctx.state.family.as_ref().and_then(|s| s.as_ref().ok()).and_then(|s| s.family.as_ref()) else {
+            self.preferred_copy = None;
+            return;
+        };
+        let me = ctx.state.steam_id;
+        let current = family.preferred_copy(app_id);
+        let owners = family.copies(app_id, me);
+        if owners.len() < 2 {
+            self.preferred_copy = None;
+            return;
+        }
+        pick = pick.filter(|owner| owners.contains(owner));
+        let pending = self.pending_preferred_copy.is_some();
+        // DLC every copy has, which doesn't decide anything.
+        let common = family.shared_dlc.iter().filter(|d| d.parent == app_id && owners.iter().all(|o| d.owners.contains(o))).count();
+        let (family_id, mut done) = (family.id, None::<bool>);
+        let mut profile: Option<SteamId> = None;
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            done = Some(false);
+        }
+        ui::widgets::modal(ui.ctx(), egui::Id::unique(("preferred-copy", app_id))).show(ui.ctx(), |ui| {
+            ui.set_width(600.0);
+            ui.horizontal(|ui| {
+                ui.label(w::text_bold(t!("Change Preferred Copy"), 20.0, t.text));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if w::icon_button(ui, t, icons::X, t!("Close"), false, 0).clicked() {
+                        done = Some(false);
+                    }
+                });
+            });
+            ui.add(egui::Label::new(w::text(t!("Select your preferred copy of this game."), 14.0, t.text_dim)).wrap());
+            ui.add_space(10.0);
+            egui::ScrollArea::vertical().max_height(460.0).auto_shrink([false, true]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for &owner in &owners {
+                    let p = ctx.state.persona(owner);
+                    let dlc = family.dlc_of(app_id, owner);
+                    let selected = pick == Some(owner);
+                    let frame = egui::Frame::new()
+                        .fill(if selected { t.surface_hover } else { t.raised })
+                        .stroke(if selected { Stroke::new(1.0, t.accent) } else { Stroke::NONE })
+                        .corner_radius(t.corner_small())
+                        .inner_margin(Margin::same(10));
+                    let resp = frame
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                w::avatar(ui, t, &art::avatar(p.avatar_hash.as_deref()), 32.0, Some(crate::shell::status_color(t, &p)));
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    let name = if p.name.is_empty() { owner.to_string() } else { p.name.clone() };
+                                    let r = ui.add(egui::Label::new(w::text(name, 14.0, crate::shell::status_color(t, &p))).sense(Sense::click()));
+                                    if r.on_hover_text(t!("View profile")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        profile = Some(owner);
+                                    }
+                                    ui.label(w::text(crate::shell::status_text(ctx.state, &p), 12.0, crate::shell::status_color(t, &p)));
+                                });
+                                if current == Some(owner) {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(w::text(icons::STAR, 13.0, t.accent));
+                                        ui.label(w::text_semibold(t!("PREFERRED COPY"), 11.5, t.accent));
+                                    });
+                                }
+                            });
+                            ui.indent(("dlc", owner), |ui| {
+                                ui.add_space(4.0);
+                                if dlc.is_empty() && family.shared_dlc_complete {
+                                    ui.label(w::text(t!("Base game only"), 14.0, t.text));
+                                }
+                                for d in dlc.iter().take(2) {
+                                    ui.horizontal(|ui| {
+                                        let (r, _) = ui.allocate_exact_size(vec2(64.0, 30.0), Sense::hover());
+                                        if !w::paint_cover_first(ui, r, &[&art::header(d.app_id)], CornerRadius::same(2)) {
+                                            ui.painter().rect_filled(r, CornerRadius::same(2), t.surface);
+                                        }
+                                        ui.label(w::text(&d.name, 12.5, t.text_dim));
+                                    });
+                                }
+                                if dlc.len() > 2 {
+                                    ui.label(w::text(t!("+{n} more", n = dlc.len() - 2), 14.0, t.text_dim));
+                                }
+                            });
+                        })
+                        .response
+                        .interact(Sense::click());
+                    if !pending && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        pick = Some(owner);
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            if family.shared_dlc_complete {
+                ui.label(w::text(t!("+ {n} DLC in common to all copies in the Steam Family", n = common), 13.0, t.text_dim));
+            } else {
+                ui.label(w::text(t!("Some DLC details are unavailable."), 13.0, t.text_dim));
+            }
+            if pending {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(w::text(t!("Updating Steam Family…"), 13.0, t.text_dim));
+                });
+            }
+            ui.add_space(12.0);
+            ui.columns(2, |cols| {
+                cols[0].add_enabled_ui(pick.is_some() && !pending, |ui| {
+                    if w::button(ui, t, None, t!("Confirm"), w::Kind::Primary, w::Size::Md).clicked() {
+                        done = Some(true);
+                    }
+                });
+                if w::button(&mut cols[1], t, None, t!("Cancel"), w::Kind::Secondary, w::Size::Md).clicked() {
+                    done = Some(false);
+                }
+            });
+        });
+        if let Some(id) = profile {
+            self.preferred_copy = None;
+            ctx.navigate("profile", Some(id.to_string()));
+            return;
+        }
+        match done {
+            Some(true) => {
+                if let Some(lender) = pick.filter(|_| pick != current && !pending) {
+                    self.preferred_copy_request_id = self.preferred_copy_request_id.wrapping_add(1);
+                    let request_id = self.preferred_copy_request_id;
+                    self.pending_preferred_copy = Some(request_id);
+                    self.preferred_copy = Some((app_id, pick));
+                    ctx.send(Command::SetPreferredLender { request_id, family_id, app_id, lender });
+                } else if !pending {
+                    self.preferred_copy = None;
+                }
+            }
+            Some(false) => self.preferred_copy = None,
+            None => self.preferred_copy = Some((app_id, pick)),
+        }
+    }
+
+    fn load_family(&mut self, ctx: &Ctx) {
+        if !self.family_loading {
+            self.family_loading = true;
+            ctx.send(Command::LoadFamily { language: i18n::language().steam_name().to_string() });
+        }
+    }
+
+    fn family_retry(&mut self, ui: &mut Ui, t: &Theme, ctx: &Ctx) {
+        egui::Frame::new().outer_margin(Margin::symmetric(24, 0)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(w::text(t!("Steam Family details are unavailable."), 14.0, t.text_dim));
+                if self.family_loading {
+                    ui.spinner();
+                } else if w::button(ui, t, None, t!("Retry"), w::Kind::Secondary, w::Size::Sm).clicked() {
+                    self.load_family(ctx);
+                }
+            });
+        });
+    }
+}
+
 impl crate::theme_renderer::LibraryHost for Library {
     fn is_detail_open(&self) -> bool {
         self.custom_selected.is_some()
@@ -4403,7 +4691,7 @@ impl crate::theme_renderer::LibraryHost for Library {
                     });
 
                     let installed_on = self.filter == Filter::Installed;
-                    let recent_on = self.filter == Filter::Playing;
+                    let recent_on = self.recent_order;
                     let circle_toggle = |ui: &mut Ui, icon: &str, tip: &str, active: bool| -> bool {
                         let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
                         let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.08);
@@ -4414,8 +4702,9 @@ impl crate::theme_renderer::LibraryHost for Library {
                     if circle_toggle(ui, icons::PLAY, t!("Ready to play"), installed_on) {
                         self.filter = if installed_on { Filter::All } else { Filter::Installed };
                     }
-                    if circle_toggle(ui, icons::CLOCK, t!("Played"), recent_on) {
-                        self.filter = if recent_on { Filter::All } else { Filter::Playing };
+                    // Like Steam: sorts the list by recent activity; the filter stays.
+                    if circle_toggle(ui, icons::CLOCK, t!("Sort by recent activity"), recent_on) {
+                        self.recent_order = !recent_on;
                     }
                 });
             }
@@ -4459,6 +4748,7 @@ impl crate::theme_renderer::LibraryHost for Library {
         if self.hide_collections && matches!(self.filter, Filter::Collection(_)) {
             self.filter = Filter::All;
         }
+        let group_by = if self.recent_order { themes::LibraryGrouping::LastPlayed } else { group_by };
         let items = self.filtered(ctx);
         let searching = !self.search.trim().is_empty();
         let groups = self.sidebar_groups(&items, ctx, group_by, t!("All games"), !self.hide_collections && group_headers);
@@ -4480,6 +4770,11 @@ impl crate::theme_renderer::LibraryHost for Library {
         let fs = style.font_size.unwrap_or(12.5);
         let row_h = row_height.clamp(20.0, 48.0);
         let ic_sz = icon_size.clamp(14.0, (row_h - 4.0).max(14.0));
+        // Optional row styling; unset fields keep the default tinted look.
+        let row_radius = CornerRadius::same(style.radius.unwrap_or(2));
+        let sel_bg = style.active_bg.map(|c| c.resolve(t)).unwrap_or(t.accent.gamma_multiply(0.22));
+        let sel_fg = style.active_color.map(|c| c.resolve(t));
+        let hover_bg = style.hover_bg.map(|c| c.resolve(t));
 
         egui::ScrollArea::vertical().id_salt("lib-side-themed").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -4546,9 +4841,10 @@ impl crate::theme_renderer::LibraryHost for Library {
                         let sel = self.selected == Some(e.app_id);
                         let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.08);
                         if sel {
-                            ui.painter().rect_filled(rect, CornerRadius::same(2), t.accent.gamma_multiply(0.22));
+                            ui.painter().rect_filled(rect, row_radius, sel_bg);
                         } else if hover > 0.0 {
-                            ui.painter().rect_filled(rect, CornerRadius::same(2), t.surface_hover.gamma_multiply(hover * 0.75));
+                            let fill = hover_bg.map(|c| c.gamma_multiply(hover)).unwrap_or(t.surface_hover.gamma_multiply(hover * 0.75));
+                            ui.painter().rect_filled(rect, row_radius, fill);
                         }
                         let icon = Rect::from_min_size(pos2(rect.left() + 18.0, rect.center().y - ic_sz * 0.5), vec2(ic_sz, ic_sz));
                         let url = e.owned.and_then(|o| o.icon.as_deref()).map(|h| art::icon(e.app_id, h));
@@ -4559,7 +4855,9 @@ impl crate::theme_renderer::LibraryHost for Library {
                         }
                         let setup = setup_state(ctx, e.app_id, e.installed.is_some());
                         let busy = matches!(setup, Setup::Downloading(_) | Setup::Queued);
-                        let color = if busy {
+                        let color = if let Some(fg) = sel_fg.filter(|_| sel) {
+                            fg
+                        } else if busy {
                             t.accent
                         } else if sel || e.installed.is_some() {
                             t.text
@@ -4986,6 +5284,63 @@ impl crate::theme_renderer::LibraryHost for Library {
 #[cfg(test)]
 mod themed_library_tests {
     use super::*;
+
+    #[test]
+    fn game_page_requests_family_again_after_account_switch() {
+        let mut library = Library::default();
+        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let client = client::Client::from_sender(tx);
+        let local = local::LocalState::default();
+        let theme = Theme::default();
+        let mut registry = extensions::Registry::default();
+        let mut actions = Vec::new();
+        let egui = egui::Context::default();
+
+        for steam_id in [20, 30] {
+            let mut state = client::State::default();
+            let login = client::Event::LoggedIn { steam_id, account: steam_id.to_string() };
+            state.apply(&login);
+            state.apply(&client::Event::Link(client::Link::Online));
+            let mut ctx = Ctx::new(&state, &local, &theme, 1.0, &client, &mut registry, &mut actions);
+            library.on_event(&login, &mut ctx);
+            for _ in 0..2 {
+                let mut frame = egui.run_ui(egui::RawInput::default(), |ui| library.family_line(ui, &theme, &mut ctx, 620));
+                frame.textures_delta.clear();
+            }
+            let mut loads = 0;
+            while let Ok(command) = commands.try_recv() {
+                if matches!(command, Command::LoadFamily { .. }) {
+                    loads += 1;
+                }
+            }
+            assert_eq!(loads, 1, "account {steam_id}");
+        }
+    }
+
+    #[test]
+    fn rejected_preferred_copy_keeps_selection_and_reports_the_error() {
+        let mut library = Library {
+            preferred_copy: Some((620, Some(30))),
+            pending_preferred_copy: Some(1),
+            ..Default::default()
+        };
+        let state = client::State { steam_id: 20, ..Default::default() };
+        let local = local::LocalState::default();
+        let theme = Theme::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = client::Client::from_sender(tx);
+        let mut registry = extensions::Registry::default();
+        let mut actions = Vec::new();
+        let mut ctx = Ctx::new(&state, &local, &theme, 1.0, &client, &mut registry, &mut actions);
+        library.on_event(&client::Event::PreferredCopyChanged {
+            request_id: 1, steam_id: 20, family_id: 5, app_id: 620, lender: 30,
+            result: Err("COPY_REJECTED".into()),
+        }, &mut ctx);
+
+        assert_eq!(library.preferred_copy, Some((620, Some(30))));
+        assert_eq!(library.pending_preferred_copy, None);
+        assert!(matches!(actions.as_slice(), [extensions::Action::Toast(message)] if message.contains("COPY_REJECTED")));
+    }
 
     #[test]
     fn steam_collections_button_opens_overview_and_drops_dragged_games() {

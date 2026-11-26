@@ -71,9 +71,9 @@ fn main() {
                     Err(e) => println!("licenses: {e}"),
                 }
             }
-            Event::Family(r) => {
+            Event::Family { result, .. } => {
                 left -= 1;
-                match r {
+                match result {
                     Ok(f) => match &f.family {
                         Some(g) => println!("family '{}': {} members, {} invites, {} free spots, {} shared apps", g.name, g.members.len(), g.invites.len(), g.free_spots, g.shared.len()),
                         None => println!("family: none (cooldown {} s, {} invites)", f.cooldown, f.invites.len()),

@@ -5,7 +5,7 @@
 //! Family management actions run through `FamilyGroups`.
 
 use crate::market::Web;
-use model::{AccountSecurity, Family, FamilyInvite, FamilyMember, FamilyRole, FamilyStatus, GuardDevice, License, Purchase, PurchasePage, SharedApp, SteamId};
+use model::{AccountSecurity, Family, FamilyInvite, FamilyMember, FamilyRole, FamilyStatus, GuardDevice, License, Purchase, PurchasePage, SharedApp, SharedDlc, SteamId};
 use net::Connection;
 use proto::webui::*;
 use proto::*;
@@ -84,21 +84,30 @@ pub async fn family(conn: &Connection, me: SteamId, language: &str) -> Result<Fa
                 include_excluded: Some(true),
                 language: Some(language.to_string()),
                 max_apps: None,
-                include_non_games: Some(false),
+                include_non_games: Some(true),
                 steamid: Some(me),
             },
         )
-        .await
-        .map(|s| s.apps)
-        .unwrap_or_else(|e| {
+        .await;
+    let (shared, shared_available) = match shared {
+        Ok(response) => (response.apps, true),
+        Err(e) => {
             tracing::warn!("family library: {e}");
-            Vec::new()
-        });
-    let mut shared: Vec<SharedApp> = shared
+            (Vec::new(), false)
+        }
+    };
+    let (dlc, games): (Vec<_>, Vec<_>) = shared.into_iter().partition(|a| a.app_type() == APP_TYPE_DLC);
+    let mut shared: Vec<SharedApp> = games
         .into_iter()
         .map(|a| SharedApp { app_id: a.appid(), name: a.name().to_string(), owners: a.owner_steamids.clone(), excluded: a.exclude_reason() != 0 })
         .collect();
     shared.sort_by_key(|a| a.name.to_lowercase());
+    let (shared_dlc, shared_dlc_complete) = if shared_available {
+        shared_dlc(conn, dlc, me).await
+    } else {
+        (Vec::new(), false)
+    };
+    let preferred = preferred_lenders(conn, id).await;
     status.family = Some(Family {
         id,
         name: g.name().to_string(),
@@ -112,8 +121,80 @@ pub async fn family(conn: &Connection, me: SteamId, language: &str) -> Result<Fa
         country: g.country().to_string(),
         slot_cooldown: g.slot_cooldown_remaining_seconds(),
         shared,
+        shared_available,
+        shared_dlc,
+        shared_dlc_complete,
+        preferred,
     });
     Ok(status)
+}
+
+/// Steam's `EProtoAppType` value for DLC.
+const APP_TYPE_DLC: i32 = 32;
+
+/// Attach each family DLC to its game through PICS public info.
+async fn shared_dlc(
+    conn: &Connection,
+    mut dlc: Vec<CFamilyGroupsGetSharedLibraryAppsResponseSharedApp>,
+    me: SteamId,
+) -> (Vec<SharedDlc>, bool) {
+    // An excluded DLC can be used with your own copy, but cannot be borrowed.
+    for entry in &mut dlc {
+        if entry.exclude_reason() != 0 {
+            entry.owner_steamids.retain(|owner| *owner == me);
+        }
+    }
+    dlc.retain(|entry| !entry.owner_steamids.is_empty());
+    if dlc.is_empty() {
+        return (Vec::new(), true);
+    }
+    let ids: Vec<u32> = dlc.iter().map(|d| d.appid()).collect();
+    let parents = match crate::pics::dlc_parents(conn, &ids).await {
+        Ok(parents) => parents,
+        Err(e) => {
+            tracing::warn!("family dlc parents: {e}");
+            return (Vec::new(), false);
+        }
+    };
+    let parents: std::collections::HashMap<_, _> =
+        parents.into_iter().map(|(id, parent, name)| (id, (parent, name))).collect();
+    let expected = dlc.len();
+    let entries: Vec<_> = dlc
+        .into_iter()
+        .filter_map(|d| {
+            let (parent, pics_name) = parents.get(&d.appid())?;
+            let name = if d.name().is_empty() { pics_name.clone() } else { d.name().to_string() };
+            Some(SharedDlc { app_id: d.appid(), parent: *parent, name, owners: d.owner_steamids })
+        })
+        .collect();
+    let complete = entries.len() == expected;
+    (entries, complete)
+}
+
+/// Your preferred copy per game, as `(app, lender)`.
+async fn preferred_lenders(conn: &Connection, family_id: u64) -> Vec<(u32, SteamId)> {
+    match conn
+        .call::<_, CFamilyGroupsGetPreferredLendersResponse>("FamilyGroups.GetPreferredLenders#1", &CFamilyGroupsGetPreferredLendersRequest { family_groupid: Some(family_id) })
+        .await
+    {
+        Ok(r) => r.members.iter().flat_map(|m| m.preferred_appids.iter().map(move |a| (*a, m.steamid()))).collect(),
+        Err(e) => {
+            tracing::warn!("preferred lenders: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Choose whose copy of `app_id` you play (Steam's "Change Preferred Copy").
+pub async fn set_preferred_lender(conn: &Connection, family_id: u64, app_id: u32, lender: SteamId) -> Result<(), String> {
+    let _: CFamilyGroupsSetPreferredLenderResponse = conn
+        .call(
+            "FamilyGroups.SetPreferredLender#1",
+            &CFamilyGroupsSetPreferredLenderRequest { family_groupid: Some(family_id), appid: Some(app_id), lender_steamid: Some(lender) },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Validate and trim a Steam Family name before sending it to Steam.

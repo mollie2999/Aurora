@@ -646,6 +646,8 @@ async fn online(
             (Connection::closed(), rx, Logon { steam_id: account.steam_id, heartbeat: 9, cell_id: 0, public_ip: 0 })
         }
     };
+    // Publish family snapshots and accepted preferences in order.
+    let family_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let me = info.steam_id;
     let mut st = Online {
         conn: conn.clone(),
@@ -1514,52 +1516,52 @@ async fn online(
                     tokio::spawn(async move { sink(Event::AccountSecurity(crate::account::security(&conn).await)) });
                 }
                 Some(Command::LoadFamily { language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
-                    tokio::spawn(async move { reload_family(&conn, &sink, me, &language).await });
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
+                    tokio::spawn(async move { reload_family(&family_gate, &conn, &sink, me, &language).await });
                 }
                 Some(Command::CreateFamily { name, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::create_family(&conn, me, &name).await {
                             Ok(_) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::Created)));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
                     });
                 }
                 Some(Command::RenameFamily { family_id, name, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::rename_family(&conn, family_id, &name).await {
                             Ok(()) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::Renamed)));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
                     });
                 }
                 Some(Command::InviteToFamily { family_id, steam_id, role, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::invite_to_family(&conn, family_id, steam_id, role).await {
                             Ok(needs_2fa) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::Invited { needs_2fa })));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
                     });
                 }
                 Some(Command::CancelFamilyInvite { family_id, steam_id, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::cancel_family_invite(&conn, family_id, steam_id).await {
                             Ok(()) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::InviteCancelled)));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
@@ -1575,40 +1577,48 @@ async fn online(
                     });
                 }
                 Some(Command::JoinFamily { family_id, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::join_family(&conn, family_id).await {
                             Ok(needs_2fa) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::Joined { needs_2fa })));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
                     });
                 }
                 Some(Command::RemoveFromFamily { family_id, steam_id, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::remove_from_family(&conn, family_id, steam_id).await {
                             Ok(()) => {
                                 let done = if steam_id == me { model::FamilyActionDone::Left } else { model::FamilyActionDone::Removed };
                                 sink(Event::FamilyAction(Ok(done)));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
                     });
                 }
                 Some(Command::DeleteFamily { family_id, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::delete_family(&conn, family_id).await {
                             Ok(()) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::Deleted)));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
+                    });
+                }
+                Some(Command::SetPreferredLender { request_id, family_id, app_id, lender }) => {
+                    let (conn, sink, steam_id, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
+                    tokio::spawn(async move {
+                        let _guard = family_gate.lock().await;
+                        let result = crate::account::set_preferred_lender(&conn, family_id, app_id, lender).await;
+                        sink(Event::PreferredCopyChanged { request_id, steam_id, family_id, app_id, lender, result });
                     });
                 }
                 Some(Command::LoadPurchases { language, cursor }) => st.with_web(sink, move |web, sink| async move {
@@ -4330,7 +4340,8 @@ fn invite_link(app_id: AppId, connect: &str) -> String {
 
 /// Fetch the user's Steam Family status, request personas for non-friend
 /// members/inviters, and emit `Event::Family`.
-async fn reload_family(conn: &Connection, sink: &Sink, me: SteamId, language: &str) {
+async fn reload_family(gate: &tokio::sync::Mutex<()>, conn: &Connection, sink: &Sink, me: SteamId, language: &str) {
+    let _guard = gate.lock().await;
     let r = crate::account::family(conn, me, language).await;
     if let Ok(f) = &r {
         let mut ids: Vec<SteamId> = f.invites.iter().map(|i| i.inviter).collect();
@@ -4342,7 +4353,7 @@ async fn reload_family(conn: &Connection, sink: &Sink, me: SteamId, language: &s
             let _ = conn.send(emsg::CLIENT_REQUEST_FRIEND_DATA, &CMsgClientRequestFriendData { persona_state_requested: Some(PERSONA_FLAGS), friends: ids });
         }
     }
-    sink(Event::Family(r));
+    sink(Event::Family { steam_id: me, result: r });
 }
 
 #[cfg(test)]

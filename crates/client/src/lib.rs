@@ -286,6 +286,8 @@ pub enum Command {
     RemoveFromFamily { family_id: u64, steam_id: SteamId, language: String },
     /// Delete a Steam Family (adult role required).
     DeleteFamily { family_id: u64, language: String },
+    /// Play `lender`'s copy of a family-shared game.
+    SetPreferredLender { request_id: u64, family_id: u64, app_id: AppId, lender: SteamId },
     CancelListing { listing_id: u64 },
     CancelBuyOrder { order_id: u64 },
     /// Fetch the games on someone's profile with their playtime.
@@ -484,6 +486,9 @@ impl std::fmt::Debug for Command {
                 f.debug_struct("RemoveFromFamily").field("family_id", family_id).field("steam_id", steam_id).field("language", language).finish()
             }
             Command::DeleteFamily { family_id, language } => f.debug_struct("DeleteFamily").field("family_id", family_id).field("language", language).finish(),
+            Command::SetPreferredLender { request_id, family_id, app_id, lender } => {
+                f.debug_struct("SetPreferredLender").field("request_id", request_id).field("family_id", family_id).field("app_id", app_id).field("lender", lender).finish()
+            }
             Command::CancelListing { listing_id } => f.debug_struct("CancelListing").field("listing_id", listing_id).finish(),
             Command::CancelBuyOrder { order_id } => f.debug_struct("CancelBuyOrder").field("order_id", order_id).finish(),
             Command::LoadPlayerGames { steam_id, language } => f.debug_struct("LoadPlayerGames").field("steam_id", steam_id).field("language", language).finish(),
@@ -682,7 +687,9 @@ pub enum Event {
     /// A page of purchase history; `more` is true when it continues the list.
     Purchases { more: bool, result: Result<model::PurchasePage, String> },
     LicenseList(Result<Vec<model::License>, String>),
-    Family(Result<model::FamilyStatus, String>),
+    Family { steam_id: SteamId, result: Result<model::FamilyStatus, String> },
+    /// Steam's response to a preferred-copy change from the Library.
+    PreferredCopyChanged { request_id: u64, steam_id: SteamId, family_id: u64, app_id: AppId, lender: SteamId, result: Result<(), String> },
     /// Outcome of a Steam Family management action.
     FamilyAction(Result<model::FamilyActionDone, String>),
     /// Community Market fee rules for your wallet currency.

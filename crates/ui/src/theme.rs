@@ -339,6 +339,11 @@ impl Theme {
         hex(if self.dark { dark } else { light })
     }
 
+    /// Color for hyperlinks on neutral surfaces.
+    pub fn link_color(&self) -> Color32 {
+        if self.name.eq_ignore_ascii_case("Metro") && self.dark { Color32::WHITE } else { self.accent_text() }
+    }
+
     /// Background paired with white text for a destructive action or badge.
     pub fn danger_fill(&self) -> Color32 {
         if let Some(native) = self.native_metrics.filter(|native| native.danger == self.danger) {
@@ -365,7 +370,7 @@ impl Theme {
         v.extreme_bg_color = self.raised;
         v.faint_bg_color = self.surface;
         v.code_bg_color = self.raised;
-        v.hyperlink_color = self.accent_text();
+        v.hyperlink_color = self.link_color();
         v.selection.bg_fill = self.accent.linear_multiply(0.35);
         v.selection.stroke = Stroke::new(1.0, self.accent_text());
         v.text_cursor.stroke = Stroke::new(2.0, self.accent);

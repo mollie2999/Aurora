@@ -5,6 +5,7 @@
 
 pub mod shortcuts;
 pub mod manage;
+pub mod servers;
 
 pub mod compat;
 pub mod steam_settings;

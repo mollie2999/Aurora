@@ -44,11 +44,22 @@ type = "menu"
 label = "View"
 style = { font_size = 12, color = "$text_dim", hover_color = "$text", padding = [2, 6, 2, 2] }
 items = [
-    { label = "Library", action = "navigate:library" },
-    { label = "Store", action = "navigate:store" },
-    { label = "Community", action = "navigate:community" },
-    { label = "Downloads", action = "navigate:downloads" },
-    { label = "Settings", action = "navigate:settings" },
+    { label = "Library", icon = "books", action = "navigate:library" },
+    { label = "Hidden Games", icon = "eye_slash", action = "navigate:library:hidden" },
+    { label = "Soundtracks", icon = "music", action = "navigate:library:soundtracks" },
+    { label = "Downloads", icon = "download", action = "navigate:downloads" },
+    "separator",
+    { label = "Small Mode", icon = "list", action = "toggle_small_mode" },
+    { label = "Big Picture Mode", icon = "monitor", action = "big_picture" },
+    "separator",
+    { label = "Friends List", icon = "users", action = "open_friends" },
+    { label = "Players", icon = "clock", action = "navigate:community:players" },
+    { label = "Game Servers", icon = "globe", action = "navigate:servers" },
+    { label = "Screenshots", icon = "camera", action = "navigate:screenshots" },
+    { label = "Inventory", icon = "backpack", action = "navigate:inventory" },
+    { label = "Update News", icon = "note", action = "navigate:library:news" },
+    "separator",
+    { label = "Settings", icon = "gear", action = "navigate:settings" },
 ]
 
 [[shell.children.children]]

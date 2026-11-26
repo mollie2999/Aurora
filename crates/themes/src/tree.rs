@@ -261,10 +261,13 @@ pub struct NodeStyle {
     pub align: Option<AlignMode>,
 }
 
+/// Maximum nesting depth for a declarative menu submenu.
+pub const MAX_MENU_DEPTH: usize = 4;
+
 /// An entry in a declarative [`Node::Menu`] dropdown.
 ///
-/// Accepts either the string `"separator"` or a table
-/// `{ label = "...", icon = "...", action = "..." }`.
+/// Accepts the string `"separator"`, a table `{ label, icon?, action }`,
+/// or a nested submenu table `{ label, icon?, items = [...] }`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuItemSpec {
     Separator,
@@ -272,6 +275,11 @@ pub enum MenuItemSpec {
         label: String,
         icon: Option<String>,
         action: String,
+    },
+    Submenu {
+        label: String,
+        icon: Option<String>,
+        items: Vec<MenuItemSpec>,
     },
 }
 
@@ -284,12 +292,25 @@ impl Serialize for MenuItemSpec {
             icon: Option<&'a str>,
             action: &'a str,
         }
+        #[derive(Serialize)]
+        struct SubmenuHelper<'a> {
+            label: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            icon: Option<&'a str>,
+            items: &'a [MenuItemSpec],
+        }
         match self {
             Self::Separator => serializer.serialize_str("separator"),
             Self::Item { label, icon, action } => ItemHelper {
                 label,
                 icon: icon.as_deref(),
                 action,
+            }
+            .serialize(serializer),
+            Self::Submenu { label, icon, items } => SubmenuHelper {
+                label,
+                icon: icon.as_deref(),
+                items,
             }
             .serialize(serializer),
         }
@@ -303,7 +324,10 @@ impl<'de> Deserialize<'de> for MenuItemSpec {
             label: String,
             #[serde(default)]
             icon: Option<String>,
-            action: String,
+            #[serde(default)]
+            action: Option<String>,
+            #[serde(default)]
+            items: Option<Vec<MenuItemSpec>>,
         }
 
         struct MenuItemVisitor;
@@ -312,7 +336,7 @@ impl<'de> Deserialize<'de> for MenuItemSpec {
             type Value = MenuItemSpec;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "\"separator\" or a table {{ label, icon?, action }}")
+                write!(f, "\"separator\", {{ label, icon?, action }}, or {{ label, icon?, items }}")
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
@@ -327,11 +351,21 @@ impl<'de> Deserialize<'de> for MenuItemSpec {
 
             fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
                 let h = ItemHelper::deserialize(de::value::MapAccessDeserializer::new(map))?;
-                Ok(MenuItemSpec::Item {
-                    label: h.label,
-                    icon: h.icon,
-                    action: h.action,
-                })
+                if let Some(items) = h.items {
+                    Ok(MenuItemSpec::Submenu {
+                        label: h.label,
+                        icon: h.icon,
+                        items,
+                    })
+                } else if let Some(action) = h.action {
+                    Ok(MenuItemSpec::Item {
+                        label: h.label,
+                        icon: h.icon,
+                        action,
+                    })
+                } else {
+                    Err(de::Error::custom("menu item requires either 'action' or 'items'"))
+                }
             }
         }
 
@@ -810,9 +844,23 @@ fn validate_nodes(nodes: &mut [Node], depth: usize, total: &mut usize) -> Result
                 sanitize_style(style)?;
             }
             Node::Menu { items, style, .. } => {
-                if items.len() > MAX_MENU_ITEMS {
-                    return Err(format!("menu exceeds maximum of {MAX_MENU_ITEMS} items"));
+                fn validate_menu_items(items: &[MenuItemSpec], depth: usize, total: &mut usize) -> Result<(), String> {
+                    if depth > MAX_MENU_DEPTH {
+                        return Err(format!("menu submenu nesting exceeds maximum depth of {MAX_MENU_DEPTH}"));
+                    }
+                    for item in items {
+                        *total += 1;
+                        if *total > MAX_MENU_ITEMS {
+                            return Err(format!("menu exceeds maximum of {MAX_MENU_ITEMS} items"));
+                        }
+                        if let MenuItemSpec::Submenu { items: sub, .. } = item {
+                            validate_menu_items(sub, depth + 1, total)?;
+                        }
+                    }
+                    Ok(())
                 }
+                let mut total_items = 0;
+                validate_menu_items(items, 1, &mut total_items)?;
                 sanitize_style(style)?;
             }
             Node::NavTabs { indicator_height, tab_gap, style, .. } => {
@@ -940,5 +988,32 @@ mod tests {
             }
             _ => panic!("expected Logo"),
         }
+    }
+
+    #[test]
+    fn parses_submenu_items_and_rejects_excessive_nesting() {
+        let valid = r#"
+[[shell]]
+type = "menu"
+label = "View"
+items = [
+    { label = "Library", action = "navigate:library" },
+    "separator",
+    { label = "More", icon = "eye", items = [
+        { label = "Servers", action = "navigate:servers" },
+        { label = "Screenshots", action = "navigate:screenshots" },
+    ] },
+]
+"#;
+        let tree = LayoutTree::parse(valid).unwrap();
+        assert_eq!(tree.shell.len(), 1);
+
+        let deep = r#"
+[[shell]]
+type = "menu"
+label = "Deep"
+items = [{ label = "1", items = [{ label = "2", items = [{ label = "3", items = [{ label = "4", items = [{ label = "5", action = "x" }] }] }] }] }]
+"#;
+        assert!(LayoutTree::parse(deep).is_err());
     }
 }

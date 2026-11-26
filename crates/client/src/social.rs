@@ -99,6 +99,75 @@ pub async fn block_user(web: &Web, steam_id: SteamId, block: bool) -> Result<boo
     if resp.status().is_success() { Ok(block) } else { Err(format!("Steam said {}", resp.status())) }
 }
 
+/// Recent co-play players from Steam Community (`/profiles/{id}/friends/coplay`).
+pub async fn recent_players(web: Option<&Web>, steam_id: SteamId) -> Result<Vec<model::RecentPlayer>, String> {
+    let resp = http(web)
+        .get(format!("{COMMUNITY}/profiles/{steam_id}/friends/coplay"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Steam said {}", resp.status()));
+    }
+    let html = resp.text().await.map_err(|e| e.to_string())?;
+    Ok(parse_recent_players(&html))
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    unescape(out.trim())
+}
+
+pub fn parse_recent_players(html: &str) -> Vec<model::RecentPlayer> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for block in html.split("data-steamid=\"").skip(1) {
+        let Some(id_str) = block.split('"').next() else { continue };
+        let Ok(steam_id) = id_str.trim().parse::<u64>() else { continue };
+        if !seen.insert(steam_id) {
+            continue;
+        }
+        let end = block.find("class=\"friend_block_v2").unwrap_or(block.len().min(2048));
+        let chunk = &block[..end];
+        let avatar = between(chunk, "class=\"playerAvatar", ">")
+            .and_then(|_| between(chunk, "<img", ">"))
+            .and_then(|img| between(img, "src=\"", "\""))
+            .filter(|u| u.starts_with("http"))
+            .unwrap_or_default()
+            .to_string();
+        let name = between(chunk, "friend_block_content\">", "<br")
+            .or_else(|| between(chunk, "friend_block_content\">", "</div>"))
+            .map(strip_tags)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| steam_id.to_string());
+        let played_at = between(chunk, "friend_small_text\">", "</span>")
+            .or_else(|| between(chunk, "friend_small_text\">", "</div>"))
+            .map(strip_tags)
+            .unwrap_or_default();
+        let app_id = between(chunk, "/app/", "/")
+            .or_else(|| between(chunk, "app/", "\""))
+            .and_then(|d| d.trim().parse::<u32>().ok());
+        out.push(model::RecentPlayer {
+            steam_id,
+            name,
+            avatar,
+            app_id,
+            game_name: String::new(),
+            played_at,
+        });
+    }
+    out
+}
+
 /// `Community.DeleteCommentFromThread#1`, the comment service Steam's own
 /// web pages use to delete comments now (the old form endpoint below fails
 /// with a generic error). Defined here instead of vendoring
@@ -497,5 +566,16 @@ mod tests {
         assert_eq!(badges.items[0].title, "Power Player");
         assert_eq!(badges.items[0].detail, "340 XP");
         assert_eq!(badges.items[0].icon.as_deref(), Some("https://x/13.png"));
+    }
+
+    #[test]
+    fn reads_recent_players() {
+        let html = r#"<div class="friend_block_v2" data-steamid="76561197960287930"><div class="playerAvatar offline"><img src="https://avatars.example/p1.jpg"></div><div class="friend_block_content">SquadMate<br><span class="friend_small_text">Team Fortress 2 - Yesterday</span></div></div>"#;
+        let list = super::parse_recent_players(html);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].steam_id, 76561197960287930);
+        assert_eq!(list[0].name, "SquadMate");
+        assert_eq!(list[0].avatar, "https://avatars.example/p1.jpg");
+        assert_eq!(list[0].played_at, "Team Fortress 2 - Yesterday");
     }
 }

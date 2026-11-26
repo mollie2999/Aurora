@@ -883,6 +883,7 @@ fn content(app: &mut SteamApp, ui: &mut Ui, t: &Theme, actions: &mut Vec<Action>
     community_window(app, &ctx, t, actions);
     store_window(app, &ctx, t, actions);
     crate::builtin::group_chat::modals(&ctx, t, &app.state, &app.client, &mut app.overlay.group_ui);
+    crate::builtin::chat_render::show_lightbox(&ctx, t);
     if active && app.overlay.ingame.is_some() {
         software_cursor(&ctx);
     }

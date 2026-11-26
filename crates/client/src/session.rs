@@ -1328,6 +1328,77 @@ async fn online(
                         sink(Event::ServerInfo { addr, result });
                     });
                 }
+                Some(Command::BrowseGameServers { request_id, filter, max }) => {
+                    let conn = st.conn.clone();
+                    let sink = sink.clone();
+                    let app_id = filter
+                        .split('\\')
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .find(|w| w[0].eq_ignore_ascii_case("appid"))
+                        .and_then(|w| w[1].parse::<AppId>().ok())
+                        .unwrap_or(0);
+                    tokio::spawn(async move {
+                        let result = crate::game_servers::browse(&conn, app_id, &filter, max)
+                            .await
+                            .map(|list| list.into_iter().map(crate::game_servers::entry_from_wire).collect());
+                        sink(Event::GameServerList { request_id, result });
+                    });
+                }
+                Some(Command::DiscoverLanServers { request_id }) => {
+                    let sink = sink.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let found = crate::a2s::discover_lan(Duration::from_millis(1500));
+                        let servers = found
+                            .into_iter()
+                            .map(|(addr, info)| {
+                                let port = addr
+                                    .rsplit_once(':')
+                                    .and_then(|(_, p)| p.parse::<u16>().ok())
+                                    .unwrap_or(27015);
+                                let ip = local::servers::parse_ipv4_port(&addr).map(|(ip, _)| ip).unwrap_or(0);
+                                model::GameServerEntry {
+                                    addr,
+                                    ip,
+                                    game_port: port,
+                                    query_port: port,
+                                    steam_id: 0,
+                                    app_id: 0,
+                                    name: info.name,
+                                    map: info.map,
+                                    game_dir: String::new(),
+                                    description: info.game,
+                                    players: u32::from(info.players),
+                                    max_players: u32::from(info.max_players),
+                                    bots: u32::from(info.bots),
+                                    password: info.password,
+                                    secure: info.vac,
+                                    ping_ms: info.ping_ms,
+                                    tags: String::new(),
+                                }
+                            })
+                            .collect();
+                        sink(Event::LanServerList { request_id, servers });
+                    });
+                }
+                Some(Command::QueryServerDetails { addr }) => {
+                    let sink = sink.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let info = crate::a2s::query(&addr);
+                        sink(Event::ServerInfo { addr: addr.clone(), result: info });
+                        let players = crate::a2s::query_players(&addr);
+                        sink(Event::ServerPlayers { addr: addr.clone(), result: players });
+                        let rules = crate::a2s::query_rules(&addr);
+                        sink(Event::ServerRules { addr, result: rules });
+                    });
+                }
+                Some(Command::LoadRecentPlayers) => {
+                    let me = st.me;
+                    st.with_web(sink, move |web, sink| async move {
+                        let result = crate::social::recent_players(web.as_deref().ok(), me).await;
+                        sink(Event::RecentPlayers(result));
+                    });
+                }
                 Some(Command::PostComment { steam_id, text }) => st.with_web(sink, move |web, sink| async move {
                     let result = match web {
                         Ok(w) => crate::social::post_comment(&w, steam_id, &text).await,
@@ -2148,7 +2219,7 @@ impl Online {
                         1 => {
                             // The markup keeps invites (game, lobby, group); the plain text loses them.
                             let parsed = model::chat::parse_message(n.message());
-                            let text = if parsed.text.is_empty() && parsed.invite.is_none() && parsed.group_invite.is_none() {
+                            let text = if parsed.text.is_empty() && parsed.invite.is_none() && parsed.group_invite.is_none() && parsed.media.is_empty() {
                                 n.message_no_bbcode().to_string()
                             } else {
                                 parsed.text
@@ -2160,6 +2231,7 @@ impl Online {
                                 time: n.rtime32_server_timestamp() as u64,
                                 invite: parsed.invite,
                                 group_invite: parsed.group_invite,
+                                media: parsed.media,
                             }))
                         }
                         2 => sink(Event::Typing { from: n.steamid_friend() }),
@@ -2222,6 +2294,7 @@ impl Online {
                         time: r.server_timestamp() as u64,
                         invite: parsed.invite,
                         group_invite: parsed.group_invite,
+                        media: parsed.media,
                     }))
                 }
                 Err(e) => sink(Event::Error(format!("Message not sent: {e}"))),
@@ -2995,6 +3068,7 @@ impl Online {
                                 time: m.timestamp() as u64,
                                 invite: parsed.invite,
                                 group_invite: parsed.group_invite,
+                                media: parsed.media,
                             }
                         })
                         .collect();
@@ -3642,6 +3716,91 @@ impl Online {
                 tokio::spawn(async move {
                     let _ = reply.send(crate::game_servers::list(&conn, app_id, &filter, max).await);
                 });
+            }
+            Request::FavoriteServers { history } => {
+                let root = self.steam_root.clone().unwrap_or_else(|| store::config_dir().join("steam"));
+                let account_id = model::account_id(self.me);
+                let lists = local::servers::load_lists(&root, account_id);
+                let src = if history { &lists.history } else { &lists.favorites };
+                let flag = if history { 2 } else { 1 };
+                let servers = src
+                    .iter()
+                    .filter_map(|s| {
+                        let (ip, port) = local::servers::parse_ipv4_port(&s.addr)?;
+                        Some(crate::ipc::protocol::FavoriteServer {
+                            app_id: s.app_id,
+                            ip,
+                            conn_port: port,
+                            query_port: port,
+                            flags: flag,
+                            last_played: u32::try_from(s.last_played).unwrap_or(u32::MAX),
+                        })
+                    })
+                    .collect();
+                let _ = reply.send(Reply::FavoriteServers { servers });
+            }
+            Request::FavoriteServerAdd(srv) => {
+                let root = self.steam_root.clone().unwrap_or_else(|| store::config_dir().join("steam"));
+                let account_id = model::account_id(self.me);
+                let port = if srv.query_port != 0 { srv.query_port } else { srv.conn_port };
+                let addr = local::servers::format_ipv4_port(srv.ip, port);
+                let entry = local::servers::SavedServer {
+                    addr,
+                    name: String::new(),
+                    app_id: srv.app_id,
+                    game_dir: String::new(),
+                    last_played: u64::from(srv.last_played),
+                };
+                if srv.flags & 2 != 0 {
+                    let _ = local::servers::record_history(&root, account_id, entry.clone());
+                }
+                if srv.flags & 1 != 0 || srv.flags == 0 {
+                    let _ = local::servers::add_favorite(&root, account_id, entry);
+                }
+                let _ = reply.send(Reply::Ok);
+            }
+            Request::FavoriteServerRemove { app_id: _, ip, conn_port, query_port, flags } => {
+                let root = self.steam_root.clone().unwrap_or_else(|| store::config_dir().join("steam"));
+                let account_id = model::account_id(self.me);
+                let q_addr = local::servers::format_ipv4_port(ip, query_port);
+                let c_addr = local::servers::format_ipv4_port(ip, conn_port);
+                let mut lists = local::servers::load_lists(&root, account_id);
+                if flags & 1 != 0 || flags == 0 {
+                    lists.favorites.retain(|s| s.addr != q_addr && s.addr != c_addr);
+                }
+                if flags & 2 != 0 {
+                    lists.history.retain(|s| s.addr != q_addr && s.addr != c_addr);
+                }
+                let _ = local::servers::save_lists(&root, account_id, &lists);
+                let _ = reply.send(Reply::Ok);
+            }
+            Request::FriendServers { app_id: filter_app } => {
+                let servers = self
+                    .personas
+                    .values()
+                    .filter(|p| filter_app == 0 || p.game_app_id == Some(filter_app))
+                    .filter_map(|p| {
+                        let srv = p.server.as_deref()?;
+                        let (ip, port) = local::servers::parse_ipv4_port(srv)?;
+                        Some(crate::ipc::protocol::GameServer {
+                            ip,
+                            query_port: port,
+                            game_port: port,
+                            app_id: p.game_app_id.unwrap_or(filter_app),
+                            name: p.name.clone(),
+                            ..Default::default()
+                        })
+                    })
+                    .collect();
+                let _ = reply.send(Reply::Servers { servers });
+            }
+            Request::PlayedWith { steam_id } => {
+                let time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                _sink(Event::CoplayRecorded { steam_id, app_id, time });
+                let _ = reply.send(Reply::Ok);
             }
             Request::PromoItems => {
                 tokio::spawn(async move {

@@ -104,6 +104,7 @@ pub fn imp(kind: &str, name: &str) -> Option<Fp> {
         ("ISteamFriends", "ActivateGameOverlayInviteDialogConnectString") => f!(fr_overlay_invite_connect),
         ("ISteamFriends", "InviteUserToGame") => f!(fr_invite_to_game),
         ("ISteamFriends", "ActivateGameOverlayToStore") => f!(fr_overlay_store),
+        ("ISteamFriends", "SetPlayedWith") => f!(fr_set_played_with),
         ("ISteamFriends", "SetRichPresence") => f!(fr_set_rich_presence),
         ("ISteamFriends", "ClearRichPresence") => f!(fr_clear_rich_presence),
         ("ISteamFriends", "GetFriendRichPresence") => f!(fr_rich_presence),
@@ -613,6 +614,14 @@ fn overlay(dialog: String, target: String) {
 }
 extern "C" fn fr_overlay(_t: This, dialog: *const c_char) {
     overlay(unsafe { text(dialog) }.to_lowercase(), String::new());
+}
+extern "C" fn fr_set_played_with(_t: This, user: u64) {
+    if user == 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        crate::ipc::request(Request::PlayedWith { steam_id: user });
+    });
 }
 extern "C" fn fr_overlay_user(_t: This, dialog: *const c_char, user: u64) {
     overlay(format!("user:{}", unsafe { text(dialog) }.to_lowercase()), user.to_string());

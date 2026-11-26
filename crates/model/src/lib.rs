@@ -1635,6 +1635,26 @@ mod price_tests {
     }
 }
 
+/// Media item extracted from chat BBCode (`[img]`, `[url]`) or message URLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChatMediaKind {
+    Image,
+    Video,
+    Link,
+}
+
+/// Extracted link or media preview attached to a chat message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMedia {
+    pub kind: ChatMediaKind,
+    pub url: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// True for trusted Steam CDN / YouTube thumbnail hosts that can auto-load.
+    #[serde(default)]
+    pub trusted: bool,
+}
+
 /// One chat message in a 1:1 conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -1653,6 +1673,9 @@ pub struct ChatMessage {
     /// shown as a card with a Join button.
     #[serde(default)]
     pub group_invite: Option<GroupInviteRef>,
+    /// Embedded media/link previews parsed from BBCode and URLs.
+    #[serde(default)]
+    pub media: Vec<ChatMedia>,
 }
 
 /// Reference to a group chat invitation embedded in a message.
@@ -1969,6 +1992,8 @@ pub struct GroupMessage {
     pub reactions: Vec<MessageReaction>,
     #[serde(default)]
     pub mentioned_me: bool,
+    #[serde(default)]
+    pub media: Vec<ChatMedia>,
 }
 
 /// An active invite link for a group chat.
@@ -2022,13 +2047,209 @@ impl GameInvite {
 /// Steam chat markup ("BBCode") to plain text plus any embedded game or
 /// group-chat invite.
 pub mod chat {
-    use super::{GameInvite, GroupInviteRef};
+    use super::{ChatMedia, ChatMediaKind, GameInvite, GroupInviteRef};
+
+    const MAX_CHAT_MEDIA: usize = 8;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ParsedChat {
         pub text: String,
         pub invite: Option<GameInvite>,
         pub group_invite: Option<GroupInviteRef>,
+        pub media: Vec<ChatMedia>,
+    }
+
+    const TRUSTED_MEDIA_HOSTS: &[&str] = &[
+        "steamusercontent.com",
+        "steamstatic.com",
+        "steamcdn-a.akamaihd.net",
+        "steamcommunity.com",
+        "media.steampowered.com",
+        "i.ytimg.com",
+        "img.youtube.com",
+    ];
+
+    /// Return true when `host` is an allowed Steam CDN or YouTube thumbnail host.
+    pub fn is_trusted_media_host(host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        TRUSTED_MEDIA_HOSTS.iter().any(|allowed| {
+            host == *allowed
+                || (host.len() > allowed.len()
+                    && host.ends_with(allowed)
+                    && host.as_bytes()[host.len() - allowed.len() - 1] == b'.')
+        })
+    }
+
+    fn http_rest(raw: &str) -> Option<&str> {
+        let s = raw.trim();
+        if s.chars().any(char::is_control) {
+            return None;
+        }
+        if s.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
+            Some(&s[8..])
+        } else if s.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) {
+            Some(&s[7..])
+        } else {
+            None
+        }
+    }
+
+    /// Extract the host portion of an `http://` or `https://` URL.
+    pub fn url_host(raw: &str) -> Option<&str> {
+        let rest = http_rest(raw)?;
+        let authority = rest.split(['/', '?', '#']).next()?;
+        if authority.is_empty() || authority.contains('\\') || authority.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+        if host_port.is_empty() {
+            return None;
+        }
+        let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+            bracketed.split(']').next()?
+        } else {
+            host_port.split(':').next()?
+        };
+        (!host.is_empty()).then_some(host)
+    }
+
+    fn is_safe_http_url(raw: &str) -> bool {
+        url_host(raw).is_some()
+    }
+
+    fn has_image_extension(url: &str) -> bool {
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        let lower = path.to_ascii_lowercase();
+        [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+    }
+
+    fn valid_yt_id(id: &str) -> bool {
+        id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }
+
+    /// Extract a validated 11-character YouTube video ID from common watch/short/embed URLs.
+    pub fn youtube_id_from_url(url: &str) -> Option<String> {
+        let host = url_host(url)?.to_ascii_lowercase();
+        let host = host.strip_prefix("www.").or_else(|| host.strip_prefix("m.")).unwrap_or(&host);
+        let rest = http_rest(url)?;
+        let path_and_query = match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => "",
+        };
+        let without_frag = path_and_query.split('#').next().unwrap_or("");
+        let (path, query) = without_frag.split_once('?').unwrap_or((without_frag, ""));
+        if host == "youtu.be" {
+            let seg = path.trim_start_matches('/').split('/').next().unwrap_or("");
+            return valid_yt_id(seg).then(|| seg.to_string());
+        }
+        if host == "youtube.com" || host == "youtube-nocookie.com" {
+            let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+            if segs.first() == Some(&"watch") || segs.is_empty() {
+                for pair in query.split('&') {
+                    if let Some(v) = pair.strip_prefix("v=") {
+                        if valid_yt_id(v) {
+                            return Some(v.to_string());
+                        }
+                    }
+                }
+            }
+            if let [kind, id, ..] = segs.as_slice() {
+                if matches!(*kind, "shorts" | "embed" | "live" | "v") && valid_yt_id(id) {
+                    return Some((*id).to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn trim_trailing_url_punct(raw: &str) -> &str {
+        let mut s = raw;
+        while let Some(last) = s.chars().last() {
+            let strip = match last {
+                '.' | ',' | '!' | '?' | ';' | ':' | '"' | '\'' | '>' => true,
+                ')' => s.chars().filter(|&c| c == ')').count() > s.chars().filter(|&c| c == '(').count(),
+                ']' => s.chars().filter(|&c| c == ']').count() > s.chars().filter(|&c| c == '[').count(),
+                _ => false,
+            };
+            if strip {
+                s = &s[..s.len() - last.len_utf8()];
+            } else {
+                break;
+            }
+        }
+        s
+    }
+
+    /// Find all `http://` and `https://` URLs with their byte spans in `text`.
+    pub fn find_http_urls(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+        let mut out = Vec::new();
+        let bytes = text.as_bytes();
+        let mut idx = 0;
+        while idx < text.len() {
+            let slice = &text[idx..];
+            let next_rel = slice
+                .find("https://")
+                .into_iter()
+                .chain(slice.find("http://"))
+                .min();
+            let Some(rel) = next_rel else { break };
+            let start = idx + rel;
+            if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+                idx = start + 4;
+                continue;
+            }
+            let rest = &text[start..];
+            let end_rel = rest
+                .char_indices()
+                .find(|&(_, ch)| ch.is_whitespace() || matches!(ch, '<' | '"'))
+                .map(|(i, _)| i)
+                .unwrap_or(rest.len());
+            let candidate = trim_trailing_url_punct(&rest[..end_rel]);
+            if is_safe_http_url(candidate) {
+                let end = start + candidate.len();
+                out.push((start..end, candidate.to_string()));
+                idx = end.max(start + 1);
+            } else {
+                idx = start + 7.min(rest.len());
+            }
+        }
+        out
+    }
+
+    /// Extract validated `http(s)://` URL strings from plain message text.
+    pub fn extract_http_urls(text: &str) -> Vec<String> {
+        find_http_urls(text).into_iter().map(|(_, u)| u).collect()
+    }
+
+    fn push_media_classified(media: &mut Vec<ChatMedia>, url: &str, label: Option<String>, force_image: bool) {
+        if media.len() >= MAX_CHAT_MEDIA {
+            return;
+        }
+        let trimmed = url.trim();
+        let Some(host) = url_host(trimmed) else { return };
+        if media.iter().any(|m| m.url == trimmed) {
+            return;
+        }
+        let (kind, trusted) = if force_image {
+            (ChatMediaKind::Image, is_trusted_media_host(host))
+        } else if youtube_id_from_url(trimmed).is_some() {
+            (ChatMediaKind::Video, true)
+        } else if has_image_extension(trimmed) {
+            (ChatMediaKind::Image, is_trusted_media_host(host))
+        } else {
+            (ChatMediaKind::Link, is_trusted_media_host(host))
+        };
+        media.push(ChatMedia {
+            kind,
+            url: trimmed.to_string(),
+            label: label.filter(|l| !l.trim().is_empty() && l.trim() != trimmed),
+            trusted,
+        });
     }
 
     /// `name="value"` (or `name=value`) from inside a tag.
@@ -2084,16 +2305,24 @@ pub mod chat {
         None
     }
 
-    /// Parse Steam chat markup into display text plus optional game or group-chat invite.
+    /// Parse Steam chat markup into display text plus optional invites and media/link previews.
     pub fn parse_message(raw: &str) -> ParsedChat {
         let mut out = String::new();
         let mut invite = None;
         let mut group_invite = None;
+        let mut media = Vec::new();
+        let mut open_url: Option<(Option<String>, usize)> = None;
+        let mut open_img: Option<(Option<String>, String)> = None;
         let mut rest = raw;
         while let Some(c) = rest.chars().next() {
             // Steam escapes a literal "[" as "\[".
             if let Some(after) = rest.strip_prefix("\\[").or_else(|| rest.strip_prefix("\\\\")) {
-                out.push(rest.as_bytes()[1] as char);
+                let ch = rest.as_bytes()[1] as char;
+                if let Some((_, buf)) = &mut open_img {
+                    buf.push(ch);
+                } else {
+                    out.push(ch);
+                }
                 rest = after;
                 continue;
             }
@@ -2103,11 +2332,46 @@ pub mod chat {
                     let closing = tag.starts_with('/');
                     let name = tag.trim_start_matches('/').split(|c: char| c.is_whitespace() || c == '=').next().unwrap_or("");
                     if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                        match name {
+                        let lower_name = name.to_ascii_lowercase();
+                        match lower_name.as_str() {
                             "gameinvite" | "lobbyinvite" if !closing => invite = invite.or_else(|| invite_from(tag)),
                             "invite" | "inviteurl" if !closing => group_invite = group_invite.or_else(|| group_invite_from(tag)),
                             "emoticon" => out.push(':'),
                             "sticker" if !closing => out.push_str(&format!("[{}]", attr(tag, "type").unwrap_or_else(|| "sticker".into()))),
+                            "img" if !closing => {
+                                let src = tag
+                                    .strip_prefix(name)
+                                    .and_then(|t| t.trim_start().strip_prefix('='))
+                                    .map(|v| v.trim().trim_matches('"').to_string())
+                                    .filter(|v| !v.is_empty())
+                                    .or_else(|| attr(tag, "src"));
+                                open_img = Some((src, String::new()));
+                            }
+                            "img" if closing => {
+                                if let Some((src, inner)) = open_img.take() {
+                                    let url = src.filter(|s| !s.is_empty()).unwrap_or(inner);
+                                    push_media_classified(&mut media, &url, None, true);
+                                }
+                            }
+                            "url" if !closing => {
+                                let href = tag
+                                    .strip_prefix(name)
+                                    .and_then(|t| t.trim_start().strip_prefix('='))
+                                    .map(|v| v.trim().trim_matches('"').to_string())
+                                    .filter(|v| !v.is_empty())
+                                    .or_else(|| attr(tag, "href"));
+                                open_url = Some((href, out.len()));
+                            }
+                            "url" if closing => {
+                                if let Some((href_opt, start)) = open_url.take() {
+                                    let label = out[start..].trim().to_string();
+                                    let href = href_opt.unwrap_or_else(|| label.clone());
+                                    if label.is_empty() && !href.is_empty() && is_safe_http_url(&href) {
+                                        out.push_str(&href);
+                                    }
+                                    push_media_classified(&mut media, &href, Some(label), false);
+                                }
+                            }
                             _ => {}
                         }
                         rest = &rest[end + 1..];
@@ -2115,8 +2379,21 @@ pub mod chat {
                     }
                 }
             }
-            out.push(c);
+            if let Some((_, buf)) = &mut open_img {
+                buf.push(c);
+            } else {
+                out.push(c);
+            }
             rest = &rest[c.len_utf8()..];
+        }
+        if let Some((src, inner)) = open_img.take() {
+            let url = src.filter(|s| !s.is_empty()).unwrap_or(inner);
+            push_media_classified(&mut media, &url, None, true);
+        }
+        if let Some((href_opt, start)) = open_url.take() {
+            let label = out[start..].trim().to_string();
+            let href = href_opt.unwrap_or_else(|| label.clone());
+            push_media_classified(&mut media, &href, Some(label), false);
         }
         let text = out.trim().to_string();
         // Aurora's invites: "Play X with me! steam://run/123//+args".
@@ -2126,7 +2403,15 @@ pub mod chat {
         if group_invite.is_none() {
             group_invite = link_group_invite(&text);
         }
-        ParsedChat { text, invite, group_invite }
+        for url in extract_http_urls(&text) {
+            if group_invite.is_some()
+                && (url.contains("s.team/chat/") || url.contains("steamcommunity.com/chat/invite/"))
+            {
+                continue;
+            }
+            push_media_classified(&mut media, &url, None, false);
+        }
+        ParsedChat { text, invite, group_invite, media }
     }
 
     /// Plain text for display, and the game invite in it.
@@ -2257,6 +2542,48 @@ pub mod chat {
             let (text, inv) = parse("Сыграем в Human Fall Flat? steam://run/477160");
             assert_eq!(text, "Сыграем в Human Fall Flat? steam://run/477160");
             assert_eq!(inv, Some(GameInvite { app_id: 477160, connect: String::new() }));
+        }
+
+        #[test]
+        fn media_links_images_and_youtube() {
+            let p_img = parse_message("[img]https://images.steamusercontent.com/ugc/1234/shot.png[/img]");
+            assert_eq!(p_img.text, "");
+            assert_eq!(p_img.media.len(), 1);
+            assert_eq!(p_img.media[0].kind, ChatMediaKind::Image);
+            assert!(p_img.media[0].trusted);
+
+            let p_ext = parse_message("look https://example.com/pic.jpg.");
+            assert_eq!(p_ext.media.len(), 1);
+            assert_eq!(p_ext.media[0].url, "https://example.com/pic.jpg");
+            assert_eq!(p_ext.media[0].kind, ChatMediaKind::Image);
+            assert!(!p_ext.media[0].trusted);
+
+            let p_evil_suffix = parse_message("https://evil-steamstatic.com/x.png");
+            assert!(!p_evil_suffix.media[0].trusted);
+
+            let p_url = parse_message("[url=https://store.steampowered.com/app/620]Portal 2[/url]");
+            assert_eq!(p_url.text, "Portal 2");
+            assert_eq!(p_url.media[0].kind, ChatMediaKind::Link);
+            assert_eq!(p_url.media[0].url, "https://store.steampowered.com/app/620");
+            assert_eq!(p_url.media[0].label.as_deref(), Some("Portal 2"));
+
+            let p_yt = parse_message("watch https://youtu.be/dQw4w9WgXcQ!");
+            assert_eq!(p_yt.media[0].kind, ChatMediaKind::Video);
+            assert_eq!(p_yt.media[0].url, "https://youtu.be/dQw4w9WgXcQ");
+            assert_eq!(youtube_id_from_url(&p_yt.media[0].url).as_deref(), Some("dQw4w9WgXcQ"));
+
+            // Bad schemes ignored
+            let p_bad = parse_message("[img]file:///etc/passwd[/img] [url=javascript:alert(1)]bad[/url]");
+            assert!(p_bad.media.is_empty());
+
+            // Deduplicates and caps at MAX_CHAT_MEDIA
+            let mut raw = String::from("https://example.com/1 https://example.com/1 ");
+            for i in 2..15 {
+                raw.push_str(&format!("https://example.com/{i} "));
+            }
+            let p_cap = parse_message(&raw);
+            assert_eq!(p_cap.media.len(), MAX_CHAT_MEDIA);
+            assert_eq!(p_cap.media[0].url, "https://example.com/1");
         }
     }
 }
@@ -2389,6 +2716,43 @@ mod trade_url_tests {
         };
         assert_eq!(fallback.join_args().as_deref(), Some("+connect_lobby 42"));
     }
+}
+
+/// Entry in Aurora's Game Servers browser (master server, Favorites, History, LAN, Friends).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameServerEntry {
+    pub addr: String,
+    pub ip: u32,
+    pub game_port: u16,
+    pub query_port: u16,
+    pub steam_id: u64,
+    pub app_id: u32,
+    pub name: String,
+    pub map: String,
+    pub game_dir: String,
+    pub description: String,
+    pub players: u32,
+    pub max_players: u32,
+    pub bots: u32,
+    pub password: bool,
+    pub secure: bool,
+    pub ping_ms: u32,
+    pub tags: String,
+}
+
+/// Player recently played with (`View -> Players` / `/friends/coplay`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentPlayer {
+    pub steam_id: SteamId,
+    pub name: String,
+    #[serde(default)]
+    pub avatar: String,
+    #[serde(default)]
+    pub app_id: Option<AppId>,
+    #[serde(default)]
+    pub game_name: String,
+    #[serde(default)]
+    pub played_at: String,
 }
 
 /// Compare names as lowercase text, with no allocation for ASCII names.

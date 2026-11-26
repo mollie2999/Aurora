@@ -180,11 +180,55 @@ fn icon_for_name(name: &str) -> &str {
         "search" => icons::SEARCH,
         "play" => icons::PLAY,
         "bell" => icons::BELL,
-        "speaker" => icons::SPEAKER_HIGH,
+        "speaker" | "music" => icons::SPEAKER_HIGH,
         "sliders" => icons::SLIDERS,
+        "eye" => icons::EYE,
+        "eye_slash" => icons::EYE_SLASH,
+        "camera" => icons::CAMERA,
+        "globe" => icons::GLOBE,
+        "backpack" => icons::BACKPACK,
+        "sparkle" => icons::SPARKLE,
+        "monitor" | "tv" => icons::MONITOR,
+        "clock" => icons::CLOCK,
+        "note" | "news" => icons::NOTE,
         "menu" | "list" => icons::LIST,
         "close" => icons::X,
         other => other,
+    }
+}
+
+fn render_menu_items(app: &mut SteamApp, ui: &mut Ui, t: &Theme, actions: &mut Vec<Action>, items: &[MenuItemSpec]) {
+    w::menu_spacing(ui);
+    for item in items {
+        match item {
+            MenuItemSpec::Separator => {
+                ui.separator();
+            }
+            MenuItemSpec::Item { label, icon, action } => {
+                let display = if action == "toggle_small_mode" && app.prefs.small_mode {
+                    i18n::t!("Large Mode").to_string()
+                } else {
+                    i18n::tr_dyn(label)
+                };
+                let ic = if action == "toggle_small_mode" && app.prefs.small_mode {
+                    icons::GRID
+                } else {
+                    icon.as_deref().map(icon_for_name).unwrap_or("")
+                };
+                if w::menu_item(ui, t, ic, &display).clicked() {
+                    dispatch_shell_action(app, ui, actions, action);
+                    ui.close();
+                }
+            }
+            MenuItemSpec::Submenu { label, icon, items } => {
+                let ic = icon.as_deref().map(icon_for_name).unwrap_or("");
+                let sub = w::submenu_item(ui, t, ic, &i18n::tr_dyn(label));
+                egui::containers::menu::SubMenu::new().show(ui, &sub, |ui| {
+                    ui.set_min_width(220.0);
+                    render_menu_items(app, ui, t, actions, items);
+                });
+            }
+        }
     }
 }
 
@@ -245,6 +289,8 @@ fn dispatch_shell_action(app: &mut SteamApp, ui: &Ui, actions: &mut Vec<Action>,
             "activate_product" => app.activate = Some(Default::default()),
             "open_friends" => app.friends_window.open = !app.friends_window.open,
             "toggle_friends_drawer" => app.prefs.friends_open = !app.prefs.friends_open,
+            "toggle_small_mode" => actions.push(Action::ToggleSmallMode),
+            "big_picture" => actions.push(Action::EnterBigPicture),
             "back" => app.go_back(),
             "forward" => app.go_forward(),
             "check_updates" => crate::updater::check(ui.ctx().clone(), true),
@@ -476,20 +522,7 @@ fn render_shell_node(rctx: &mut ShellRenderCtx<'_, '_, '_>, ui: &mut Ui, node: &
         Node::Menu { label, icon, items, style } => {
             let resp = render_styled_button(ui, &t, label, icon.as_deref(), style);
             egui::Popup::menu(&resp).width(240.0).show(|ui| {
-                for item in items {
-                    match item {
-                        MenuItemSpec::Separator => {
-                            ui.separator();
-                        }
-                        MenuItemSpec::Item { label, icon, action } => {
-                            let ic = icon.as_deref().map(icon_for_name).unwrap_or("");
-                            if w::menu_item(ui, &t, ic, &i18n::tr_dyn(label)).clicked() {
-                                dispatch_shell_action(rctx.app, ui, rctx.actions, action);
-                                ui.close();
-                            }
-                        }
-                    }
-                }
+                render_menu_items(rctx.app, ui, &t, rctx.actions, items);
             });
         }
 

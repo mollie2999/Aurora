@@ -30,7 +30,10 @@ pub fn imp(name: &str) -> Option<Fp> {
     match name {
         "RequestInternetServerList" => f!(internet),
         "RequestLANServerList" => f!(lan),
-        "RequestFriendsServerList" | "RequestFavoritesServerList" | "RequestHistoryServerList" | "RequestSpectatorServerList" => f!(empty_list),
+        "RequestFriendsServerList" => f!(friends),
+        "RequestFavoritesServerList" => f!(favorites),
+        "RequestHistoryServerList" => f!(history),
+        "RequestSpectatorServerList" => f!(empty_list),
         "ReleaseRequest" => f!(release),
         "GetServerDetails" => f!(details),
         "CancelQuery" => f!(cancel),
@@ -54,6 +57,15 @@ const NONE_LISTED: i32 = 2;
 /// gameserveritem_t (Windows packing).
 const ITEM: usize = 376;
 
+#[derive(Clone, Copy)]
+enum ListKind {
+    Internet,
+    Lan,
+    Favorites,
+    History,
+    Friends,
+}
+
 struct List {
     app_id: u32,
     filter: String,
@@ -62,7 +74,7 @@ struct List {
     items: Vec<Box<[u8; ITEM]>>,
     refreshing: bool,
     cancelled: Arc<AtomicBool>,
-    lan: bool,
+    kind: ListKind,
 }
 
 #[derive(Default)]
@@ -279,31 +291,64 @@ fn filter_text(filters: *const *const u8, n: u32) -> String {
     out
 }
 
-fn new_list(app_id: u32, filter: String, response: usize, lan: bool) -> usize {
+fn new_list(app_id: u32, filter: String, response: usize, kind: ListKind) -> usize {
     let mut st = s();
     st.next += 8;
     let h = st.next;
-    st.lists.insert(h, List { app_id, filter, response, items: Vec::new(), refreshing: true, cancelled: Arc::new(AtomicBool::new(false)), lan });
+    st.lists.insert(h, List { app_id, filter, response, items: Vec::new(), refreshing: true, cancelled: Arc::new(AtomicBool::new(false)), kind });
     h
 }
 
 /// Fetch and query a list, then tell the game server by server.
 fn run_list(h: usize) {
-    let Some((app_id, filter, response, cancelled, lan)) = s().lists.get(&h).map(|l| (l.app_id, l.filter.clone(), l.response, l.cancelled.clone(), l.lan)) else { return };
+    let Some((app_id, filter, response, cancelled, kind)) = s().lists.get(&h).map(|l| (l.app_id, l.filter.clone(), l.response, l.cancelled.clone(), l.kind)) else { return };
     std::thread::spawn(move || {
-        let (listed, fresh) = if lan {
-            let targets: Vec<(u32, u16)> = (27015..=27020).chain(26900..=26905).map(|p| (u32::MAX, p)).collect();
-            let found = query_all(&targets, Duration::from_millis(1500), &cancelled, true);
-            (found.values().map(|(s, _)| s.clone()).collect::<Vec<_>>(), found)
-        } else {
-            let filter = if app_id != 0 && !filter.contains("\\appid\\") { format!("\\appid\\{app_id}{filter}") } else { filter };
-            let listed = match crate::ipc::request(Request::ServerList { filter, max: 0 }) {
-                Some(Reply::Servers { servers }) => servers,
-                _ => Vec::new(),
-            };
-            let targets: Vec<(u32, u16)> = listed.iter().map(|s| (s.ip, s.query_port)).collect();
-            let fresh = query_all(&targets, Duration::from_millis(2500), &cancelled, false);
-            (listed, fresh)
+        let (listed, fresh) = match kind {
+            ListKind::Lan => {
+                let targets: Vec<(u32, u16)> = (27015..=27020).chain(26900..=26905).map(|p| (u32::MAX, p)).collect();
+                let found = query_all(&targets, Duration::from_millis(1500), &cancelled, true);
+                (found.values().map(|(s, _)| s.clone()).collect::<Vec<_>>(), found)
+            }
+            ListKind::Internet => {
+                let filter = if app_id != 0 && !filter.contains("\\appid\\") { format!("\\appid\\{app_id}{filter}") } else { filter };
+                let listed = match crate::ipc::request(Request::ServerList { filter, max: 0 }) {
+                    Some(Reply::Servers { servers }) => servers,
+                    _ => Vec::new(),
+                };
+                let targets: Vec<(u32, u16)> = listed.iter().map(|s| (s.ip, s.query_port)).collect();
+                let fresh = query_all(&targets, Duration::from_millis(2500), &cancelled, false);
+                (listed, fresh)
+            }
+            ListKind::Favorites | ListKind::History => {
+                let history = matches!(kind, ListKind::History);
+                let favs = match crate::ipc::request(Request::FavoriteServers { history }) {
+                    Some(Reply::FavoriteServers { servers }) => servers,
+                    _ => Vec::new(),
+                };
+                let listed: Vec<GameServer> = favs
+                    .into_iter()
+                    .filter(|s| app_id == 0 || s.app_id == 0 || s.app_id == app_id)
+                    .map(|s| GameServer {
+                        ip: s.ip,
+                        query_port: if s.query_port != 0 { s.query_port } else { s.conn_port },
+                        game_port: s.conn_port,
+                        app_id: s.app_id,
+                        ..Default::default()
+                    })
+                    .collect();
+                let targets: Vec<(u32, u16)> = listed.iter().map(|s| (s.ip, s.query_port)).collect();
+                let fresh = query_all(&targets, Duration::from_millis(2500), &cancelled, false);
+                (listed, fresh)
+            }
+            ListKind::Friends => {
+                let listed = match crate::ipc::request(Request::FriendServers { app_id }) {
+                    Some(Reply::Servers { servers }) => servers,
+                    _ => Vec::new(),
+                };
+                let targets: Vec<(u32, u16)> = listed.iter().map(|s| (s.ip, s.query_port)).collect();
+                let fresh = query_all(&targets, Duration::from_millis(2500), &cancelled, false);
+                (listed, fresh)
+            }
         };
         crate::log!("servers: list {h}: {} listed, {} answered", listed.len(), fresh.len());
         let mut answered = Vec::new();
@@ -357,7 +402,7 @@ extern "C" fn internet(_t: This, app_id: u32, filters: *const *const u8, n: u32,
     if response.is_null() {
         return 0;
     }
-    let h = new_list(app_id, filter_text(filters, n), response as usize, false);
+    let h = new_list(app_id, filter_text(filters, n), response as usize, ListKind::Internet);
     run_list(h);
     h
 }
@@ -366,7 +411,34 @@ extern "C" fn lan(_t: This, app_id: u32, response: *mut c_void) -> usize {
     if response.is_null() {
         return 0;
     }
-    let h = new_list(app_id, String::new(), response as usize, true);
+    let h = new_list(app_id, String::new(), response as usize, ListKind::Lan);
+    run_list(h);
+    h
+}
+
+extern "C" fn friends(_t: This, app_id: u32, filters: *const *const u8, n: u32, response: *mut c_void) -> usize {
+    if response.is_null() {
+        return 0;
+    }
+    let h = new_list(app_id, filter_text(filters, n), response as usize, ListKind::Friends);
+    run_list(h);
+    h
+}
+
+extern "C" fn favorites(_t: This, app_id: u32, filters: *const *const u8, n: u32, response: *mut c_void) -> usize {
+    if response.is_null() {
+        return 0;
+    }
+    let h = new_list(app_id, filter_text(filters, n), response as usize, ListKind::Favorites);
+    run_list(h);
+    h
+}
+
+extern "C" fn history(_t: This, app_id: u32, filters: *const *const u8, n: u32, response: *mut c_void) -> usize {
+    if response.is_null() {
+        return 0;
+    }
+    let h = new_list(app_id, filter_text(filters, n), response as usize, ListKind::History);
     run_list(h);
     h
 }
@@ -375,7 +447,7 @@ extern "C" fn empty_list(_t: This, app_id: u32, _filters: *const *const u8, _n: 
     if response.is_null() {
         return 0;
     }
-    let h = new_list(app_id, String::new(), response as usize, false);
+    let h = new_list(app_id, String::new(), response as usize, ListKind::Internet);
     let Some(cancelled) = s().lists.get(&h).map(|l| l.cancelled.clone()) else {
         return h;
     };

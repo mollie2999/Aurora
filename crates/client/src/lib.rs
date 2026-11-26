@@ -143,6 +143,14 @@ pub enum Command {
     BlockFriend { steam_id: SteamId, block: bool },
     /// Ask a game server about itself ("ip:port").
     QueryServer { addr: String },
+    /// Browse Internet master game servers matching a `\key\value` filter.
+    BrowseGameServers { request_id: u64, filter: String, max: u32 },
+    /// Discover game servers on the LAN via UDP A2S_INFO broadcast.
+    DiscoverLanServers { request_id: u64 },
+    /// Query A2S info, player list, and server rules/convars for `"ip:port"`.
+    QueryServerDetails { addr: String },
+    /// Load Steam Community's "Recently Played With" coplay list.
+    LoadRecentPlayers,
     /// Tell a friend you're typing.
     Typing { to: SteamId },
     /// Fetch recent chat history with a friend.
@@ -385,6 +393,10 @@ impl std::fmt::Debug for Command {
             Command::SetNickname { steam_id, nickname } => f.debug_struct("SetNickname").field("steam_id", steam_id).field("nickname", nickname).finish(),
             Command::BlockFriend { steam_id, block } => f.debug_struct("BlockFriend").field("steam_id", steam_id).field("block", block).finish(),
             Command::QueryServer { addr } => f.debug_struct("QueryServer").field("addr", addr).finish(),
+            Command::BrowseGameServers { request_id, filter, max } => f.debug_struct("BrowseGameServers").field("request_id", request_id).field("filter", filter).field("max", max).finish(),
+            Command::DiscoverLanServers { request_id } => f.debug_struct("DiscoverLanServers").field("request_id", request_id).finish(),
+            Command::QueryServerDetails { addr } => f.debug_struct("QueryServerDetails").field("addr", addr).finish(),
+            Command::LoadRecentPlayers => f.write_str("LoadRecentPlayers"),
             Command::Typing { to } => f.debug_struct("Typing").field("to", to).finish(),
             Command::LoadHistory { friend } => f.debug_struct("LoadHistory").field("friend", friend).finish(),
             Command::LoadChatGroups => f.write_str("LoadChatGroups"),
@@ -632,6 +644,12 @@ pub enum Event {
     Comments { steam_id: SteamId, result: Result<model::Comments, String> },
     CommentPosted { steam_id: SteamId, result: Result<(), String> },
     ServerInfo { addr: String, result: Result<crate::a2s::ServerInfo, String> },
+    GameServerList { request_id: u64, result: Result<Vec<model::GameServerEntry>, String> },
+    LanServerList { request_id: u64, servers: Vec<model::GameServerEntry> },
+    ServerPlayers { addr: String, result: Result<Vec<crate::a2s::ServerPlayer>, String> },
+    ServerRules { addr: String, result: Result<Vec<(String, String)>, String> },
+    RecentPlayers(Result<Vec<model::RecentPlayer>, String>),
+    CoplayRecorded { steam_id: SteamId, app_id: AppId, time: u64 },
     Blocked { steam_id: SteamId, result: Result<bool, String> },
     Badges { steam_id: SteamId, result: Result<model::Badges, String> },
     Reviews { steam_id: SteamId, page: u32, result: Result<model::UserReviews, String> },

@@ -88,6 +88,14 @@ pub struct State {
     pub achievements: HashMap<AppId, (u32, u32)>,
     /// Game server details asked for with "View server info".
     pub servers: HashMap<String, Result<crate::a2s::ServerInfo, String>>,
+    /// Cached A2S_PLAYER lists keyed by `"ip:port"`.
+    pub server_players: HashMap<String, Result<Vec<crate::a2s::ServerPlayer>, String>>,
+    /// Cached A2S_RULES key/value lists keyed by `"ip:port"`.
+    pub server_rules: HashMap<String, Result<Vec<(String, String)>, String>>,
+    /// Steam Community "Recently Played With" coplay list.
+    pub recent_players: Option<Result<Vec<model::RecentPlayer>, String>>,
+    /// Players seen in-session via `ISteamFriends::SetPlayedWith`.
+    pub session_coplay: Vec<(SteamId, AppId, u64)>,
     /// A game's achievement list, once loaded.
     pub achievement_list: crate::read_cache::ReadCache<AppId, Result<Vec<model::Achievement>, String>, 64>,
     pub downloads: HashMap<AppId, model::DownloadStatus>,
@@ -403,7 +411,14 @@ impl State {
             Event::Friends(list) => self.friends = list.iter().copied().collect(),
             Event::Personas(list) => {
                 for p in list {
-                    self.personas.insert(p.steam_id, p.clone());
+                    let mut p = p.clone();
+                    // Steam's echoes of our own persona often leave the game
+                    // out; keep the game we know is running so our status
+                    // stays "In game" (green) instead of falling back to Online.
+                    if p.steam_id == self.steam_id && !p.in_game() {
+                        p.game_app_id = self.playing;
+                    }
+                    self.personas.insert(p.steam_id, p);
                 }
             }
             Event::Message(m) => {
@@ -771,6 +786,21 @@ impl State {
             | Event::ControllerLayoutDownloaded { .. }
             | Event::ControllerLayoutRoute { .. }
             | Event::ControllerLayoutApplied { .. } => {}
+            Event::GameServerList { .. } | Event::LanServerList { .. } => {}
+            Event::ServerPlayers { addr, result } => {
+                self.server_players.insert(addr.clone(), result.clone());
+            }
+            Event::ServerRules { addr, result } => {
+                self.server_rules.insert(addr.clone(), result.clone());
+            }
+            Event::RecentPlayers(r) => {
+                self.recent_players = Some(r.clone());
+            }
+            Event::CoplayRecorded { steam_id, app_id, time } => {
+                self.session_coplay.retain(|(id, _, _)| *id != *steam_id);
+                self.session_coplay.insert(0, (*steam_id, *app_id, *time));
+                self.session_coplay.truncate(200);
+            }
         }
     }
 
@@ -1027,6 +1057,7 @@ mod group_tests {
             server_msg: None,
             reactions: Vec::new(),
             mentioned_me: false,
+            media: Vec::new(),
         };
         s.apply(&Event::GroupMessage(msg.clone()));
         // Duplicate delivery is ignored.
@@ -1077,6 +1108,22 @@ mod group_tests {
         assert_eq!(r.fraction(), 0.8);
         s.apply(&Event::RestoreFinished { result: Err("cancelled".into()) });
         assert!(s.restoring.is_none());
+    }
+
+    #[test]
+    fn own_persona_stays_in_game_while_playing() {
+        let mut s = State { steam_id: 7, ..Default::default() };
+        s.apply(&Event::GameStarted { app_id: 730 });
+        // Steam echoes our persona without the game.
+        s.apply(&Event::Personas(vec![Persona { steam_id: 7, state: model::PersonaState::Online, ..Default::default() }]));
+        assert_eq!(s.me().unwrap().game_app_id, Some(730));
+        // Friends are taken as Steam sends them.
+        s.apply(&Event::Personas(vec![Persona { steam_id: 8, ..Default::default() }]));
+        assert!(!s.persona(8).in_game());
+        // Once the game closes, a later echo shows plain Online again.
+        s.apply(&Event::GameStopped { app_id: 730 });
+        s.apply(&Event::Personas(vec![Persona { steam_id: 7, ..Default::default() }]));
+        assert!(!s.me().unwrap().in_game());
     }
 
     #[test]

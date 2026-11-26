@@ -68,8 +68,49 @@ pub enum Link {
     Uninstall(u32),
     Validate(u32),
     Store(u32),
+    Connect { addr: String, password: Option<String> },
     Page(&'static str),
     Show,
+}
+
+fn valid_connect_addr(raw: &str) -> Option<String> {
+    let addr = raw.trim();
+    if addr.is_empty()
+        || addr.len() > 253
+        || addr.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, ';' | '"' | '\'' | '\\' | '/'))
+    {
+        return None;
+    }
+    let (host, port) = addr.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    let port_num: u16 = port.parse().ok()?;
+    if port_num == 0 {
+        return None;
+    }
+    if host.starts_with('[') && host.ends_with(']') {
+        let inner = &host[1..host.len() - 1];
+        inner.parse::<std::net::Ipv6Addr>().ok()?;
+    } else if host.parse::<std::net::Ipv4Addr>().is_err() {
+        if !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+            || host.starts_with('.')
+            || host.ends_with('.')
+        {
+            return None;
+        }
+    }
+    Some(addr.to_string())
+}
+
+fn valid_connect_password(raw: Option<&str>) -> Option<String> {
+    let p = raw?.trim();
+    if p.is_empty() || p.len() > 128 || p.chars().any(|c| c.is_control() || matches!(c, ';' | '"' | '\n' | '\r')) {
+        return None;
+    }
+    Some(p.to_string())
 }
 
 pub fn parse(url: &str) -> Option<Link> {
@@ -84,11 +125,17 @@ pub fn parse(url: &str) -> Option<Link> {
         "uninstall" => Link::Uninstall(id()?),
         "validate" => Link::Validate(id()?),
         "store" | "advertise" => Link::Store(id()?),
+        "connect" => Link::Connect {
+            addr: valid_connect_addr(parts.next()?)?,
+            password: valid_connect_password(parts.next()),
+        },
         "nav" | "open" => match parts.next().unwrap_or_default() {
             "downloads" => Link::Page("downloads"),
             "friends" => Link::Page("community"),
             "settings" => Link::Page("settings"),
             "games" | "library" => Link::Page("library"),
+            "servers" => Link::Page("servers"),
+            "screenshots" => Link::Page("screenshots"),
             _ => Link::Show,
         },
         "friends" => Link::Page("community"),
@@ -621,6 +668,16 @@ mod tests {
         assert_eq!(parse("steam://install/440"), Some(Link::Install(440)));
         assert_eq!(parse("steam://store/620"), Some(Link::Store(620)));
         assert_eq!(parse("steam://open/downloads"), Some(Link::Page("downloads")));
+        assert_eq!(
+            parse("steam://connect/198.51.100.1:27015"),
+            Some(Link::Connect { addr: "198.51.100.1:27015".into(), password: None })
+        );
+        assert_eq!(
+            parse("steam://connect/play.example.com:27015/secret"),
+            Some(Link::Connect { addr: "play.example.com:27015".into(), password: Some("secret".into()) })
+        );
+        assert_eq!(parse("steam://connect/1.2.3.4:27015;quit"), None);
+        assert_eq!(parse("steam://connect/notaport"), None);
         assert_eq!(parse("https://example.com"), None);
         assert!(shortcut_runs("[InternetShortcut]\r\nURL=steam://rungameid/570\r\n", 570));
         assert!(!shortcut_runs("[InternetShortcut]\r\nURL=steam://rungameid/5700\r\n", 570));

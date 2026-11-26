@@ -1,6 +1,5 @@
 //! Minimal Hyprland IPC helpers for locating game/overlay windows,
-//! moving/raising/focusing Aurora's fallback overlay across workspaces, and
-//! temporarily clearing/restoring a game's fullscreen layer when needed.
+//! and moving, raising and focusing Aurora's fallback overlay across workspaces.
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -86,28 +85,13 @@ impl HyprMonitor {
     }
 }
 
-/// Saved fullscreen state of a game window whose internal fullscreen layer was
-/// temporarily cleared while the fallback overlay is visible above it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FullscreenRestore {
-    pub address: String,
-    pub internal: u8,
-    pub client: u8,
-}
-
 /// Parameters for placing and raising Aurora's fallback overlay window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayPlacement<'a> {
     pub overlay_addr: &'a str,
-    pub overlay_floating: bool,
-    pub overlay_fullscreen: u8,
     pub ws_id: i64,
     pub ws_name: &'a str,
     pub monitor_geom: Option<[i32; 4]>,
-    /// `(address, client_fullscreen_mode)` of a fullscreen window on the target
-    /// workspace whose internal fullscreen must be cleared so the overlay can
-    /// render above it.
-    pub fullscreen_blocker: Option<(&'a str, u8)>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -259,7 +243,7 @@ pub fn is_valid_workspace_name(name: &str) -> bool {
         && name.len() <= 128
         && !name
             .bytes()
-            .any(|b| matches!(b, b',' | b';') || b.is_ascii_control())
+            .any(|b| matches!(b, b',' | b';' | b'[' | b']') || b.is_ascii_control())
 }
 
 fn socket_path_from(runtime_dir: Option<&OsStr>, instance_sig: Option<&OsStr>) -> Option<PathBuf> {
@@ -276,7 +260,12 @@ fn socket_path_from(runtime_dir: Option<&OsStr>, instance_sig: Option<&OsStr>) -
     {
         return None;
     }
-    Some(PathBuf::from(runtime).join("hypr").join(sig).join(".socket.sock"))
+    Some(
+        PathBuf::from(runtime)
+            .join("hypr")
+            .join(sig)
+            .join(".socket.sock"),
+    )
 }
 
 /// Resolve the active Hyprland command socket path, if running under Hyprland.
@@ -445,31 +434,6 @@ pub fn find_overlay_window(our_pid: u32, overlay_title: &str) -> Option<HyprWind
     select_overlay_window(&all, our_pid, overlay_title).cloned()
 }
 
-/// Find any fullscreen window on `ws_id` (preferring `game_addr` if present)
-/// that currently occupies the workspace's top fullscreen layer.
-pub fn find_fullscreen_blocker<'a>(
-    windows: &'a [HyprWindow],
-    overlay_addr: &str,
-    ws_id: i64,
-    game_addr: Option<&str>,
-) -> Option<&'a HyprWindow> {
-    if let Some(addr) = game_addr {
-        if let Some(game) = windows
-            .iter()
-            .find(|w| w.address == addr && w.address != overlay_addr && w.fullscreen != 0)
-        {
-            return Some(game);
-        }
-    }
-    windows.iter().find(|w| {
-        w.address != overlay_addr
-            && w.workspace_id == ws_id
-            && w.mapped
-            && !w.hidden
-            && w.fullscreen != 0
-    })
-}
-
 /// Select the logical `[x, y, width, height]` geometry for the target monitor.
 pub fn select_monitor_geom(
     monitors: &[HyprMonitor],
@@ -515,150 +479,109 @@ pub fn workspace_selector(ws_id: i64, ws_name: &str) -> Option<String> {
     }
 }
 
-/// Build the `[[BATCH]]` dispatch command that clears any blocking fullscreen
-/// layer on the target workspace (preserving the game's client-side state),
-/// moves `overlay_addr` silently to the workspace, ensures it floats at
-/// `monitor_geom`, focuses it, and raises it to the top of the z-order.
-pub fn build_place_overlay_batch(p: &OverlayPlacement<'_>) -> Result<String, String> {
+/// Build the commands for preparing a window that can be focused over fullscreen.
+fn prepare_overlay_commands(p: &OverlayPlacement<'_>) -> Result<Vec<String>, String> {
     if !is_valid_address(p.overlay_addr) {
         return Err("invalid hyprland overlay window address".into());
     }
     let ws = workspace_selector(p.ws_id, p.ws_name)
         .ok_or_else(|| "invalid hyprland target workspace".to_string())?;
-    let mut cmds = Vec::new();
-    if let Some((blocker_addr, client_fs)) = p.fullscreen_blocker {
-        if !is_valid_address(blocker_addr) {
-            return Err("invalid hyprland fullscreen blocker address".into());
-        }
-        if client_fs > 3 {
-            return Err("invalid hyprland fullscreen mode".into());
-        }
-        cmds.push(format!("dispatch focuswindow address:{blocker_addr}"));
-        cmds.push(format!("dispatch fullscreenstate 0 {client_fs} set"));
-    }
-    cmds.push(format!(
-        "dispatch movetoworkspacesilent {ws},address:{}",
-        p.overlay_addr
-    ));
-    if p.overlay_fullscreen != 0 {
-        cmds.push(format!("dispatch focuswindow address:{}", p.overlay_addr));
-        cmds.push("dispatch fullscreenstate 0 0 set".to_string());
-    }
-    if !p.overlay_floating {
-        cmds.push(format!(
-            "dispatch togglefloating address:{}",
-            p.overlay_addr
-        ));
-    }
+    let address = format!("address:{}", p.overlay_addr);
+    let mut commands = vec![
+        format!("dispatch setfloating {address}"),
+        format!("dispatch movetoworkspacesilent {ws},{address}"),
+    ];
     if let Some([x, y, w, h]) = p.monitor_geom {
         if w > 0 && h > 0 {
-            cmds.push(format!(
-                "dispatch resizewindowpixel exact {w} {h},address:{}",
-                p.overlay_addr
+            commands.push(format!(
+                "dispatch resizewindowpixel exact {w} {h},{address}"
             ));
-            cmds.push(format!(
-                "dispatch movewindowpixel exact {x} {y},address:{}",
-                p.overlay_addr
-            ));
+            commands.push(format!("dispatch movewindowpixel exact {x} {y},{address}"));
         }
     }
-    cmds.push(format!("dispatch focuswindow address:{}", p.overlay_addr));
-    cmds.push(format!(
-        "dispatch alterzorder top,address:{}",
-        p.overlay_addr
-    ));
-    Ok(format!("[[BATCH]]{}", cmds.join(";")))
+    Ok(commands)
 }
 
-/// Build the IPC command that returns focus to `game_addr` and optionally
-/// restores its Hyprland `fullscreenstate` `(internal, client)`.
-pub fn build_restore_window_batch(
-    game_addr: &str,
-    fullscreen: Option<(u8, u8)>,
-) -> Result<String, String> {
-    if !is_valid_address(game_addr) {
+fn focus_command(addr: &str) -> Result<String, String> {
+    if !is_valid_address(addr) {
         return Err("invalid hyprland window address".into());
     }
-    if let Some((internal, client)) = fullscreen {
-        if internal > 3 || client > 3 {
-            return Err("invalid hyprland fullscreen mode".into());
-        }
-        Ok(format!(
-            "[[BATCH]]dispatch focuswindow address:{game_addr};dispatch fullscreenstate {internal} {client} set"
-        ))
+    Ok(format!("dispatch focuswindow address:{addr}"))
+}
+
+fn raise_command(addr: &str) -> Result<String, String> {
+    if !is_valid_address(addr) {
+        return Err("invalid hyprland window address".into());
+    }
+    Ok(format!("dispatch alterzorder top,address:{addr}"))
+}
+
+fn check_dispatch_ok(reply: &str, expected_replies: usize) -> Result<(), String> {
+    let replies: Vec<_> = reply
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if replies.len() == expected_replies && replies.iter().all(|line| *line == "ok") {
+        Ok(())
     } else {
-        Ok(format!("dispatch focuswindow address:{game_addr}"))
+        Err(format!("hyprland dispatch error: {}", reply.trim()))
     }
 }
 
-/// Build the IPC command that focuses `game_addr` while keeping `overlay_addr`
-/// at the top of the floating z-order (e.g. for click-through pinned windows).
-pub fn build_focus_game_keeping_overlay_top_batch(
+fn place_overlay_with(
+    p: &OverlayPlacement<'_>,
+    mut query: impl FnMut(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    let commands = prepare_overlay_commands(p)?;
+    let batch = format!("[[BATCH]]{}", commands.join(";"));
+    check_dispatch_ok(&query(&batch)?, commands.len())?;
+
+    // Focusing a floating window on a fullscreen workspace enables Hyprland's
+    // above-fullscreen rendering and fade. Focusing a tiled window can transfer
+    // or exit fullscreen, so verify the compositor applied the preparation.
+    let windows = parse_clients(&query("j/clients")?);
+    if !windows.iter().any(|w| {
+        w.address == p.overlay_addr
+            && w.workspace_id == p.ws_id
+            && w.mapped
+            && !w.hidden
+            && w.floating
+            && w.fullscreen == 0
+    }) {
+        return Err(
+            "hyprland overlay is not a mapped floating window on the target workspace".into(),
+        );
+    }
+    check_dispatch_ok(&query(&focus_command(p.overlay_addr)?)?, 1)?;
+    check_dispatch_ok(&query(&raise_command(p.overlay_addr)?)?, 1)
+}
+
+/// Place Aurora's overlay above the game without changing the game's fullscreen mode.
+pub fn place_overlay_on_workspace(p: &OverlayPlacement<'_>) -> Result<(), String> {
+    place_overlay_with(p, ipc_query)
+}
+
+fn focus_game_with(
     game_addr: &str,
     overlay_addr: Option<&str>,
-) -> Result<String, String> {
-    if !is_valid_address(game_addr) {
-        return Err("invalid hyprland window address".into());
-    }
-    if let Some(ov_addr) = overlay_addr {
-        if !is_valid_address(ov_addr) {
-            return Err("invalid hyprland overlay window address".into());
-        }
-        Ok(format!(
-            "[[BATCH]]dispatch focuswindow address:{game_addr};dispatch alterzorder top,address:{ov_addr}"
-        ))
-    } else {
-        Ok(format!("dispatch focuswindow address:{game_addr}"))
-    }
-}
-
-fn check_dispatch_ok(reply: &str) -> Result<(), String> {
-    let trimmed = reply.trim();
-    if trimmed == "ok"
-        || trimmed
-            .lines()
-            .all(|line| line.trim().eq_ignore_ascii_case("ok"))
-    {
-        Ok(())
-    } else if trimmed.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("hyprland dispatch error: {trimmed}"))
-    }
-}
-
-/// Place Aurora's overlay window on the target workspace above the game.
-pub fn place_overlay_on_workspace(p: &OverlayPlacement<'_>) -> Result<(), String> {
-    let batch = build_place_overlay_batch(p)?;
-    let reply = ipc_query(&batch)?;
-    check_dispatch_ok(&reply)
-}
-
-/// Return keyboard/window focus to the given Hyprland window address and
-/// optionally restore its `fullscreenstate`.
-pub fn restore_game_window(
-    addr: &str,
-    fullscreen: Option<(u8, u8)>,
+    mut query: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<(), String> {
-    let cmd = build_restore_window_batch(addr, fullscreen)?;
-    let reply = ipc_query(&cmd)?;
-    check_dispatch_ok(&reply)
+    let focus = focus_command(game_addr)?;
+    let raise = overlay_addr.map(raise_command).transpose()?;
+    check_dispatch_ok(&query(&focus)?, 1)?;
+    if let Some(raise) = raise {
+        check_dispatch_ok(&query(&raise)?, 1)?;
+    }
+    Ok(())
 }
 
-/// Return keyboard/window focus to `game_addr` while keeping `overlay_addr`
-/// raised at the top of the floating stack.
+/// Return keyboard focus to the game and keep any click-through overlay above it.
 pub fn focus_game_keeping_overlay_top(
     game_addr: &str,
     overlay_addr: Option<&str>,
 ) -> Result<(), String> {
-    let cmd = build_focus_game_keeping_overlay_top_batch(game_addr, overlay_addr)?;
-    let reply = ipc_query(&cmd)?;
-    check_dispatch_ok(&reply)
-}
-
-/// Return keyboard/window focus to the given Hyprland window address.
-pub fn focus_window(addr: &str) -> Result<(), String> {
-    restore_game_window(addr, None)
+    focus_game_with(game_addr, overlay_addr, ipc_query)
 }
 
 #[cfg(test)]
@@ -689,10 +612,7 @@ mod tests {
             None
         );
         assert_eq!(
-            socket_path_from(
-                Some(OsStr::new("/run/user/1000")),
-                Some(OsStr::new("a/b"))
-            ),
+            socket_path_from(Some(OsStr::new("/run/user/1000")), Some(OsStr::new("a/b"))),
             None
         );
         assert_eq!(
@@ -718,6 +638,7 @@ mod tests {
         assert!(!is_valid_workspace_name("ws,1"));
         assert!(!is_valid_workspace_name("ws;dispatch"));
         assert!(!is_valid_workspace_name("ws\n2"));
+        assert!(!is_valid_workspace_name("ws[2]"));
     }
 
     #[test]
@@ -762,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn select_window_matches_pid_then_title_and_finds_fullscreen_blocker() {
+    fn select_window_matches_pid_then_title() {
         let json = r#"[
             {
                 "address": "0x10",
@@ -834,13 +755,6 @@ mod tests {
         assert_eq!(by_title.address, "0x30");
         let ov = select_overlay_window(&clients, 100, "Aurora Overlay").expect("overlay window");
         assert_eq!(ov.address, "0x40");
-        let blocker = find_fullscreen_blocker(&clients, "0x40", 2, Some("0x30"))
-            .expect("fullscreen blocker");
-        assert_eq!(blocker.address, "0x30");
-        assert_eq!(
-            find_fullscreen_blocker(&clients, "0x40", 1, None),
-            None
-        );
     }
 
     #[test]
@@ -871,120 +785,128 @@ mod tests {
         assert_eq!(mons.len(), 2);
         assert_eq!(mons[0].logical_geom(), Some([0, 0, 2560, 1440]));
         assert_eq!(mons[1].logical_geom(), Some([2560, 0, 1080, 1920]));
-        assert_eq!(select_monitor_geom(&mons, None, 2), Some([2560, 0, 1080, 1920]));
+        assert_eq!(
+            select_monitor_geom(&mons, None, 2),
+            Some([2560, 0, 1080, 1920])
+        );
     }
 
-    #[test]
-    fn batch_builder_places_raises_and_restores_fullscreen() {
-        assert!(
-            build_place_overlay_batch(&OverlayPlacement {
-                overlay_addr: "bad",
-                overlay_floating: false,
-                overlay_fullscreen: 0,
-                ws_id: 2,
-                ws_name: "2",
-                monitor_geom: None,
-                fullscreen_blocker: None,
-            })
-            .is_err()
-        );
-        assert!(
-            build_place_overlay_batch(&OverlayPlacement {
-                overlay_addr: "0x123",
-                overlay_floating: false,
-                overlay_fullscreen: 0,
-                ws_id: 0,
-                ws_name: "bad,name",
-                monitor_geom: None,
-                fullscreen_blocker: None,
-            })
-            .is_err()
-        );
-        assert!(
-            build_place_overlay_batch(&OverlayPlacement {
-                overlay_addr: "0x123",
-                overlay_floating: false,
-                overlay_fullscreen: 0,
-                ws_id: 2,
-                ws_name: "2",
-                monitor_geom: None,
-                fullscreen_blocker: Some(("bad;cmd", 2)),
-            })
-            .is_err()
-        );
-        assert!(
-            build_place_overlay_batch(&OverlayPlacement {
-                overlay_addr: "0x123",
-                overlay_floating: false,
-                overlay_fullscreen: 0,
-                ws_id: 2,
-                ws_name: "2",
-                monitor_geom: None,
-                fullscreen_blocker: Some(("0x456", 9)),
-            })
-            .is_err()
-        );
+    const PREPARE_OK: &str = "ok\n\n\nok\n\n\nok\n\n\nok";
 
-        // Fullscreen game on workspace 2: clears internal fullscreen while preserving
-        // client state, moves & floats overlay, fits monitor, focuses, and raises top.
-        let fs_cmd = build_place_overlay_batch(&OverlayPlacement {
-            overlay_addr: "0xabc123",
-            overlay_floating: false,
-            overlay_fullscreen: 0,
+    fn placement() -> OverlayPlacement<'static> {
+        OverlayPlacement {
+            overlay_addr: "0x123",
             ws_id: 2,
             ws_name: "2",
-            monitor_geom: Some([0, 0, 2560, 1440]),
-            fullscreen_blocker: Some(("0xdeadbeef", 2)),
-        })
-        .unwrap();
-        assert_eq!(
-            fs_cmd,
-            "[[BATCH]]dispatch focuswindow address:0xdeadbeef;\
-            dispatch fullscreenstate 0 2 set;\
-            dispatch movetoworkspacesilent 2,address:0xabc123;\
-            dispatch togglefloating address:0xabc123;\
-            dispatch resizewindowpixel exact 2560 1440,address:0xabc123;\
-            dispatch movewindowpixel exact 0 0,address:0xabc123;\
-            dispatch focuswindow address:0xabc123;\
-            dispatch alterzorder top,address:0xabc123"
-        );
-
-        // Windowed/borderless floating game + already-floating overlay on special workspace:
-        // does not toggle floating back to tiled, still raises z-order above the game.
-        let floating_cmd = build_place_overlay_batch(&OverlayPlacement {
-            overlay_addr: "0xabc123",
-            overlay_floating: true,
-            overlay_fullscreen: 2,
-            ws_id: -98,
-            ws_name: "special:game",
             monitor_geom: Some([1920, 0, 1920, 1080]),
-            fullscreen_blocker: None,
-        })
-        .unwrap();
-        assert!(!floating_cmd.contains("togglefloating"));
-        assert!(floating_cmd.contains("movetoworkspacesilent special:game,address:0xabc123"));
-        assert!(floating_cmd.contains("fullscreenstate 0 0 set"));
-        assert!(floating_cmd.contains("movewindowpixel exact 1920 0,address:0xabc123"));
-        assert!(floating_cmd.ends_with("dispatch alterzorder top,address:0xabc123"));
+        }
     }
 
     #[test]
-    fn restore_and_pinned_focus_batches_validate_and_format() {
-        assert!(build_restore_window_batch("bad", Some((2, 2))).is_err());
-        assert!(build_restore_window_batch("0x123", Some((4, 2))).is_err());
-        assert_eq!(
-            build_restore_window_batch("0xdeadbeef", None).unwrap(),
-            "dispatch focuswindow address:0xdeadbeef"
-        );
-        assert_eq!(
-            build_restore_window_batch("0xdeadbeef", Some((2, 2))).unwrap(),
-            "[[BATCH]]dispatch focuswindow address:0xdeadbeef;dispatch fullscreenstate 2 2 set"
-        );
+    fn floating_overlay_raises_without_changing_game_fullscreen() {
+        for mode in [0, 1, 2, 3] {
+            let mut requests = Vec::new();
+            place_overlay_with(&placement(), |command| {
+                requests.push(command.to_string());
+                Ok(match command {
+                    "j/clients" => format!(
+                        r#"[
+                            {{"address":"0x123","mapped":true,"floating":true,"workspace":{{"id":2}}}},
+                            {{"address":"0x456","mapped":true,"floating":true,"workspace":{{"id":2}},
+                              "fullscreen":{mode},"fullscreenClient":2}}
+                        ]"#
+                    ),
+                    _ if command.starts_with("[[BATCH]]") => PREPARE_OK.into(),
+                    _ => "ok".into(),
+                })
+            })
+            .unwrap();
+            assert_eq!(
+                requests,
+                [
+                    concat!(
+                        "[[BATCH]]dispatch setfloating address:0x123;",
+                        "dispatch movetoworkspacesilent 2,address:0x123;",
+                        "dispatch resizewindowpixel exact 1920 1080,address:0x123;",
+                        "dispatch movewindowpixel exact 1920 0,address:0x123"
+                    ),
+                    "j/clients",
+                    "dispatch focuswindow address:0x123",
+                    "dispatch alterzorder top,address:0x123",
+                ]
+            );
+        }
+    }
 
-        assert!(build_focus_game_keeping_overlay_top_batch("0xdeadbeef", Some("bad")).is_err());
-        assert_eq!(
-            build_focus_game_keeping_overlay_top_batch("0xdeadbeef", Some("0xabc123")).unwrap(),
-            "[[BATCH]]dispatch focuswindow address:0xdeadbeef;dispatch alterzorder top,address:0xabc123"
+    #[test]
+    fn placement_never_focuses_a_tiled_fullscreen_or_misplaced_overlay() {
+        for (floating, fullscreen, workspace) in [(false, 0, 2), (true, 2, 2), (true, 0, 3)] {
+            let result = place_overlay_with(&placement(), |command| {
+                Ok(if command == "j/clients" {
+                    format!(
+                        r#"[{{"address":"0x123","mapped":true,"floating":{floating},
+                              "fullscreen":{fullscreen},"workspace":{{"id":{workspace}}}}}]"#
+                    )
+                } else {
+                    assert!(command.starts_with("[[BATCH]]"), "{command}");
+                    PREPARE_OK.into()
+                })
+            });
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn placement_rejects_invalid_input_and_incomplete_dispatches() {
+        let mut p = placement();
+        p.overlay_addr = "0x123;dispatch";
+        assert!(place_overlay_with(&p, |_| panic!("invalid address reached IPC")).is_err());
+        p.overlay_addr = "0x123";
+        p.ws_id = 0;
+        p.ws_name = "ws[;dispatch";
+        assert!(place_overlay_with(&p, |_| panic!("invalid workspace reached IPC")).is_err());
+        p.ws_id = -98;
+        p.ws_name = "special:game";
+        p.monitor_geom = None;
+        for reply in ["", "ok", "ok\n\n\nWindow not found"] {
+            let result = place_overlay_with(&p, |command| {
+                assert_eq!(
+                    command,
+                    "[[BATCH]]dispatch setfloating address:0x123;dispatch movetoworkspacesilent special:game,address:0x123"
+                );
+                Ok(reply.into())
+            });
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn close_restores_game_focus_and_raises_pinned_overlay_when_present() {
+        for overlay in [None, Some("0x123")] {
+            let mut requests = Vec::new();
+            focus_game_with("0x456", overlay, |command| {
+                requests.push(command.to_string());
+                Ok("ok".into())
+            })
+            .unwrap();
+            let mut expected = vec!["dispatch focuswindow address:0x456"];
+            if overlay.is_some() {
+                expected.push("dispatch alterzorder top,address:0x123");
+            }
+            assert_eq!(requests, expected);
+        }
+        assert!(
+            focus_game_with("0x456", Some("bad"), |_| panic!(
+                "invalid address reached IPC"
+            ))
+            .is_err()
+        );
+        assert!(
+            focus_game_with("0x456", Some("0x123"), |command| {
+                assert_eq!(command, "dispatch focuswindow address:0x456");
+                Ok("Window not found".into())
+            })
+            .is_err()
         );
     }
 }

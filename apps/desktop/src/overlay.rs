@@ -74,9 +74,16 @@ struct ForegroundProbe {
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct HyprOverlayState {
-    want_open: bool,
+    placement_generation: u64,
     overlay_addr: Option<String>,
-    restore: Option<crate::hyprland::FullscreenRestore>,
+}
+
+#[cfg(target_os = "linux")]
+impl HyprOverlayState {
+    fn cancel_placement(&mut self) {
+        self.placement_generation = self.placement_generation.wrapping_add(1);
+        self.overlay_addr = None;
+    }
 }
 
 pub struct Overlay {
@@ -248,7 +255,7 @@ impl Overlay {
         #[cfg(target_os = "linux")]
         {
             let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
-            *st = HyprOverlayState::default();
+            st.cancel_placement();
         }
         self.fps = None;
         self.screenshots.clear();
@@ -324,7 +331,7 @@ impl Overlay {
         #[cfg(target_os = "linux")]
         {
             let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
-            *st = HyprOverlayState::default();
+            st.cancel_placement();
         }
         self.ingame = None;
         self.open = false;
@@ -368,10 +375,6 @@ impl Overlay {
             self.game_window = foreground_window();
             #[cfg(target_os = "linux")]
             if crate::hyprland::is_available() {
-                {
-                    let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
-                    st.want_open = true;
-                }
                 if let Some(aw) = crate::hyprland::active_window() {
                     if aw.pid != std::process::id() {
                         self.game_hypr_addr = Some(aw.address);
@@ -385,43 +388,19 @@ impl Overlay {
     fn close(&mut self) {
         self.open = false;
         self.hypr_placed = false;
-        // Give the keyboard back to the game (and restore its fullscreen layer
-        // unless pinned windows still need the overlay above it).
+        // Give the keyboard back to the game and keep any pinned windows above it.
         #[cfg(target_os = "linux")]
-        if crate::hyprland::is_available() {
+        {
             let any_pinned = self.any_pinned();
             let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
-            st.want_open = false;
-            let overlay_addr = st.overlay_addr.clone();
-            if !any_pinned {
-                let restore = st.restore.take();
-                drop(st);
-                if let Some(r) = restore {
-                    if let Err(err) = crate::hyprland::restore_game_window(
-                        &r.address,
-                        Some((r.internal, r.client)),
-                    ) {
-                        tracing::warn!("Hyprland fullscreen/focus restore failed: {err}");
-                    } else {
-                        return;
-                    }
-                } else if let Some(addr) = self.game_hypr_addr.as_deref() {
-                    if let Err(err) = crate::hyprland::focus_window(addr) {
-                        tracing::warn!("Hyprland focus restore failed: {err}");
-                    } else {
-                        return;
-                    }
-                }
-            } else {
-                drop(st);
+            let overlay_addr = if any_pinned { st.overlay_addr.take() } else { None };
+            st.cancel_placement();
+            drop(st);
+            if crate::hyprland::is_available() {
                 if let Some(addr) = self.game_hypr_addr.as_deref() {
-                    if let Err(err) = crate::hyprland::focus_game_keeping_overlay_top(
-                        addr,
-                        overlay_addr.as_deref(),
-                    ) {
-                        tracing::warn!("Hyprland focus restore (pinned) failed: {err}");
-                    } else {
-                        return;
+                    match crate::hyprland::focus_game_keeping_overlay_top(addr, overlay_addr.as_deref()) {
+                        Ok(()) => return,
+                        Err(err) => tracing::warn!("Hyprland focus restore failed: {err}"),
                     }
                 }
             }
@@ -962,7 +941,11 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
         .with_mouse_passthrough(!active)
         .with_taskbar(false);
     #[cfg(target_os = "linux")]
-    if !crate::hyprland::is_available() {
+    if crate::hyprland::is_available() {
+        // Fixed-size Wayland toplevels map as floating in Hyprland. This also
+        // avoids its tiled-window fullscreen policy during the initial map.
+        builder = builder.with_resizable(false);
+    } else {
         builder = builder.with_fullscreen(true);
     }
     // Linux: the overlay window draws in its own frames. The main window is
@@ -988,18 +971,18 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
             if opened_now {
                 if !crate::hyprland::is_available() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
                 app.overlay.focused = true;
             }
             if active && !app.overlay.hypr_placed && crate::hyprland::is_available() {
                 app.overlay.hypr_placed = true;
                 if let Some((ws_id, ws_name)) = app.overlay.game_hypr_ws.clone() {
                     let hypr_state = app.overlay.hypr_state.clone();
-                    {
-                        let mut st = hypr_state.lock().unwrap_or_else(|e| e.into_inner());
-                        st.want_open = true;
-                    }
+                    let generation = hypr_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .placement_generation;
                     let game_addr = app.overlay.game_hypr_addr.clone();
                     let overlay_title = format!("{} Overlay", i18n::BRAND);
                     let our_pid = std::process::id();
@@ -1007,7 +990,7 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
                         for attempt in 0..16 {
                             {
                                 let st = hypr_state.lock().unwrap_or_else(|e| e.into_inner());
-                                if !st.want_open {
+                                if st.placement_generation != generation {
                                     return;
                                 }
                             }
@@ -1016,26 +999,19 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
                                 &all_clients,
                                 our_pid,
                                 &overlay_title,
-                            ) {
-                                if !win.mapped && attempt < 15 {
-                                    std::thread::sleep(std::time::Duration::from_millis(25));
-                                    continue;
+                            )
+                            .filter(|win| win.mapped && !win.hidden)
+                            {
+                                if win.fullscreen != 0 {
+                                    tracing::warn!("Hyprland overlay must be non-fullscreen to float above a game");
+                                    return;
                                 }
                                 let monitors = crate::hyprland::monitors();
-                                let blocker = crate::hyprland::find_fullscreen_blocker(
-                                    &all_clients,
-                                    &win.address,
-                                    ws_id,
-                                    game_addr.as_deref(),
-                                );
-                                let target_game = game_addr
-                                    .as_deref()
-                                    .and_then(|addr| {
-                                        all_clients
-                                            .iter()
-                                            .find(|w| w.address == addr && w.address != win.address)
-                                    })
-                                    .or(blocker);
+                                let target_game = game_addr.as_deref().and_then(|addr| {
+                                    all_clients
+                                        .iter()
+                                        .find(|w| w.address == addr && w.workspace_id == ws_id)
+                                });
                                 let monitor_geom = crate::hyprland::select_monitor_geom(
                                     &monitors,
                                     target_game,
@@ -1043,30 +1019,17 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
                                 );
                                 let placement = crate::hyprland::OverlayPlacement {
                                     overlay_addr: &win.address,
-                                    overlay_floating: win.floating,
-                                    overlay_fullscreen: win.fullscreen,
                                     ws_id,
                                     ws_name: &ws_name,
                                     monitor_geom,
-                                    fullscreen_blocker: blocker
-                                        .map(|b| (b.address.as_str(), b.fullscreen_client)),
                                 };
                                 let mut st = hypr_state.lock().unwrap_or_else(|e| e.into_inner());
-                                if !st.want_open {
+                                if st.placement_generation != generation {
                                     return;
                                 }
                                 match crate::hyprland::place_overlay_on_workspace(&placement) {
                                     Ok(()) => {
                                         st.overlay_addr = Some(win.address.clone());
-                                        if let Some(b) = blocker {
-                                            if st.restore.is_none() {
-                                                st.restore = Some(crate::hyprland::FullscreenRestore {
-                                                    address: b.address.clone(),
-                                                    internal: b.fullscreen,
-                                                    client: b.fullscreen_client,
-                                                });
-                                            }
-                                        }
                                     }
                                     Err(err) => {
                                         tracing::warn!("Hyprland overlay placement failed: {err}");

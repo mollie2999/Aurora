@@ -71,6 +71,14 @@ struct ForegroundProbe {
     hypr_window: Option<(String, i64, String)>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct HyprOverlayState {
+    want_open: bool,
+    overlay_addr: Option<String>,
+    restore: Option<crate::hyprland::FullscreenRestore>,
+}
+
 pub struct Overlay {
     pub open: bool,
     manager: Option<GlobalHotKeyManager>,
@@ -108,6 +116,9 @@ pub struct Overlay {
     game_hypr_ws: Option<(i64, String)>,
     /// True once `"Aurora Overlay"` has been moved/focused onto `game_hypr_ws`.
     hypr_placed: bool,
+    /// Shared Hyprland open/restore state between the UI thread and placement task.
+    #[cfg(target_os = "linux")]
+    hypr_state: Arc<std::sync::Mutex<HyprOverlayState>>,
     /// Data asked for this session.
     asked: bool,
     /// What the Community window shows (with its own back history).
@@ -187,6 +198,8 @@ impl Overlay {
             game_hypr_addr: None,
             game_hypr_ws: None,
             hypr_placed: false,
+            #[cfg(target_os = "linux")]
+            hypr_state: Arc::new(std::sync::Mutex::new(HyprOverlayState::default())),
             asked: false,
             community: Default::default(),
             achievements: Default::default(),
@@ -232,6 +245,11 @@ impl Overlay {
         self.game_hypr_addr = None;
         self.game_hypr_ws = None;
         self.hypr_placed = false;
+        #[cfg(target_os = "linux")]
+        {
+            let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+            *st = HyprOverlayState::default();
+        }
         self.fps = None;
         self.screenshots.clear();
         self.screenshots_dirty = true;
@@ -303,6 +321,11 @@ impl Overlay {
         self.game_hypr_addr = None;
         self.game_hypr_ws = None;
         self.hypr_placed = false;
+        #[cfg(target_os = "linux")]
+        {
+            let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+            *st = HyprOverlayState::default();
+        }
         self.ingame = None;
         self.open = false;
         self.fps = None;
@@ -345,6 +368,10 @@ impl Overlay {
             self.game_window = foreground_window();
             #[cfg(target_os = "linux")]
             if crate::hyprland::is_available() {
+                {
+                    let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.want_open = true;
+                }
                 if let Some(aw) = crate::hyprland::active_window() {
                     if aw.pid != std::process::id() {
                         self.game_hypr_addr = Some(aw.address);
@@ -358,14 +385,44 @@ impl Overlay {
     fn close(&mut self) {
         self.open = false;
         self.hypr_placed = false;
-        // Give the keyboard back to the game.
+        // Give the keyboard back to the game (and restore its fullscreen layer
+        // unless pinned windows still need the overlay above it).
         #[cfg(target_os = "linux")]
-        if let Some(addr) = self.game_hypr_addr.clone() {
-            if crate::hyprland::is_available() {
-                if let Err(err) = crate::hyprland::focus_window(&addr) {
-                    tracing::warn!("Hyprland focus restore failed: {err}");
-                } else {
-                    return;
+        if crate::hyprland::is_available() {
+            let any_pinned = self.any_pinned();
+            let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+            st.want_open = false;
+            let overlay_addr = st.overlay_addr.clone();
+            if !any_pinned {
+                let restore = st.restore.take();
+                drop(st);
+                if let Some(r) = restore {
+                    if let Err(err) = crate::hyprland::restore_game_window(
+                        &r.address,
+                        Some((r.internal, r.client)),
+                    ) {
+                        tracing::warn!("Hyprland fullscreen/focus restore failed: {err}");
+                    } else {
+                        return;
+                    }
+                } else if let Some(addr) = self.game_hypr_addr.as_deref() {
+                    if let Err(err) = crate::hyprland::focus_window(addr) {
+                        tracing::warn!("Hyprland focus restore failed: {err}");
+                    } else {
+                        return;
+                    }
+                }
+            } else {
+                drop(st);
+                if let Some(addr) = self.game_hypr_addr.as_deref() {
+                    if let Err(err) = crate::hyprland::focus_game_keeping_overlay_top(
+                        addr,
+                        overlay_addr.as_deref(),
+                    ) {
+                        tracing::warn!("Hyprland focus restore (pinned) failed: {err}");
+                    } else {
+                        return;
+                    }
                 }
             }
         }
@@ -905,7 +962,7 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
         .with_mouse_passthrough(!active)
         .with_taskbar(false);
     #[cfg(target_os = "linux")]
-    {
+    if !crate::hyprland::is_available() {
         builder = builder.with_fullscreen(true);
     }
     // Linux: the overlay window draws in its own frames. The main window is
@@ -929,29 +986,95 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
                 app.overlay.passthrough = Some(!active);
             }
             if opened_now {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                if !crate::hyprland::is_available() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
                 app.overlay.focused = true;
             }
             if active && !app.overlay.hypr_placed && crate::hyprland::is_available() {
                 app.overlay.hypr_placed = true;
                 if let Some((ws_id, ws_name)) = app.overlay.game_hypr_ws.clone() {
+                    let hypr_state = app.overlay.hypr_state.clone();
+                    {
+                        let mut st = hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.want_open = true;
+                    }
+                    let game_addr = app.overlay.game_hypr_addr.clone();
                     let overlay_title = format!("{} Overlay", i18n::BRAND);
                     let our_pid = std::process::id();
                     app._rt.spawn_blocking(move || {
-                        for attempt in 0..8 {
-                            if let Some(win) = crate::hyprland::find_overlay_window(our_pid, &overlay_title) {
-                                if let Err(err) = crate::hyprland::place_overlay_on_workspace(
+                        for attempt in 0..16 {
+                            {
+                                let st = hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+                                if !st.want_open {
+                                    return;
+                                }
+                            }
+                            let all_clients = crate::hyprland::clients();
+                            if let Some(win) = crate::hyprland::select_overlay_window(
+                                &all_clients,
+                                our_pid,
+                                &overlay_title,
+                            ) {
+                                if !win.mapped && attempt < 15 {
+                                    std::thread::sleep(std::time::Duration::from_millis(25));
+                                    continue;
+                                }
+                                let monitors = crate::hyprland::monitors();
+                                let blocker = crate::hyprland::find_fullscreen_blocker(
+                                    &all_clients,
                                     &win.address,
                                     ws_id,
-                                    &ws_name,
-                                    None,
-                                ) {
-                                    tracing::warn!("Hyprland overlay placement failed: {err}");
+                                    game_addr.as_deref(),
+                                );
+                                let target_game = game_addr
+                                    .as_deref()
+                                    .and_then(|addr| {
+                                        all_clients
+                                            .iter()
+                                            .find(|w| w.address == addr && w.address != win.address)
+                                    })
+                                    .or(blocker);
+                                let monitor_geom = crate::hyprland::select_monitor_geom(
+                                    &monitors,
+                                    target_game,
+                                    ws_id,
+                                );
+                                let placement = crate::hyprland::OverlayPlacement {
+                                    overlay_addr: &win.address,
+                                    overlay_floating: win.floating,
+                                    overlay_fullscreen: win.fullscreen,
+                                    ws_id,
+                                    ws_name: &ws_name,
+                                    monitor_geom,
+                                    fullscreen_blocker: blocker
+                                        .map(|b| (b.address.as_str(), b.fullscreen_client)),
+                                };
+                                let mut st = hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+                                if !st.want_open {
+                                    return;
+                                }
+                                match crate::hyprland::place_overlay_on_workspace(&placement) {
+                                    Ok(()) => {
+                                        st.overlay_addr = Some(win.address.clone());
+                                        if let Some(b) = blocker {
+                                            if st.restore.is_none() {
+                                                st.restore = Some(crate::hyprland::FullscreenRestore {
+                                                    address: b.address.clone(),
+                                                    internal: b.fullscreen,
+                                                    client: b.fullscreen_client,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!("Hyprland overlay placement failed: {err}");
+                                    }
                                 }
                                 break;
                             }
-                            if attempt < 7 {
+                            if attempt < 15 {
                                 std::thread::sleep(std::time::Duration::from_millis(25));
                             }
                         }
@@ -1673,7 +1796,11 @@ fn screenshots_window(app: &mut SteamApp, ctx: &egui::Context, t: &Theme) {
             if w::button(ui, t, Some(icons::CAMERA), t!("Take screenshot (F12)"), w::Kind::Primary, w::Size::Sm).clicked() {
                 app.overlay.take_shot_requested = true;
                 // Close overlay so the screenshot captures the game itself.
-                app.overlay.open = false;
+                if app.overlay.ingame.is_none() {
+                    app.overlay.close();
+                } else {
+                    app.overlay.open = false;
+                }
             }
             if w::button(ui, t, Some(icons::FOLDER), t!("Open folder"), w::Kind::Secondary, w::Size::Sm).clicked() {
                 let account = (app.state.steam_id & 0xFFFF_FFFF) as u32;

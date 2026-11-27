@@ -181,7 +181,7 @@ jobs:
           path: target/package/dist/*
 
   freebsd:
-    needs: version
+    needs: [version, windows, linux]
     if: needs.version.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
@@ -210,10 +210,29 @@ jobs:
             rm -rf dist
             mkdir -p dist/$name
             cp target/release/aurora README.md LICENSE assets/icon-256.png dist/$name/
-            tar -C dist -czf dist/$name.tar.gz $name
-            (cd dist && sha256 -q $name.tar.gz | awk -v f="$name.tar.gz" '{print $1 "  " f}' > $name.tar.gz.sha256)
             # Keep copyback fast: only dist/ needs to come back to the runner.
             rm -rf target
+
+      # Actions testers and release users need the same Wine clients and
+      # Linuxulator helper alongside the native FreeBSD executable.
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: linux
+      - name: Package FreeBSD archive
+        run: |
+          name=Aurora-FreeBSD-x86_64
+          unzip -j windows/*-portable.zip steamclient.dll steamclient32.dll -d "dist/$name"
+          mv "dist/$name/steamclient.dll" "dist/$name/steamclient64.dll"
+          tar -C "dist/$name" --strip-components=1 -xzf linux/Aurora-Linux-x86_64.tar.gz Aurora-Linux-x86_64/steamhost
+          test -x "dist/$name/aurora"
+          test -x "dist/$name/steamhost"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 
       - uses: actions/upload-artifact@v4
         with:
@@ -249,20 +268,6 @@ jobs:
           cp dlls/steamclient.dll work/$name/steamclient64.dll
           if [ -f dlls/steamclient32.dll ]; then cp dlls/steamclient32.dll work/$name/; fi
           tar -C work -czf dist/$name.tar.gz $name
-          (cd dist && sha256sum $name.tar.gz > $name.tar.gz.sha256)
-          tar -tzf dist/$name.tar.gz
-
-      # FreeBSD native Wine games use the Windows steamclient DLLs, and
-      # Linux-native games under Linuxulator can use the Linux steamhost helper.
-      - name: Add steamclient DLLs and steamhost to the FreeBSD archive
-        if: needs.freebsd.result == 'success'
-        run: |
-          name=Aurora-FreeBSD-x86_64
-          mkdir -p work-bsd && tar -C work-bsd -xzf dist/$name.tar.gz
-          cp dlls/steamclient.dll work-bsd/$name/steamclient64.dll
-          if [ -f dlls/steamclient32.dll ]; then cp dlls/steamclient32.dll work-bsd/$name/; fi
-          if [ -f work/Aurora-Linux-x86_64/steamhost ]; then cp work/Aurora-Linux-x86_64/steamhost work-bsd/$name/; fi
-          tar -C work-bsd -czf dist/$name.tar.gz $name
           (cd dist && sha256sum $name.tar.gz > $name.tar.gz.sha256)
           tar -tzf dist/$name.tar.gz
 

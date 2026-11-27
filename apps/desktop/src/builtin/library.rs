@@ -3379,7 +3379,8 @@ impl InstallDialog {
             libraries.push(default);
         }
         let owned = ctx.state.apps.as_ref().and_then(|a| a.get(&app));
-        let choose_platform = cfg!(target_os = "linux") && owned.is_some_and(|o| client::download::has_build(o, "linux") && client::download::has_build(o, "windows"));
+        let choose_platform = cfg!(any(target_os = "linux", target_os = "freebsd"))
+            && owned.is_some_and(|o| client::download::has_build(o, "linux") && client::download::has_build(o, "windows"));
         // Pick the library with the most free space.
         let library = libraries.iter().max_by_key(|l| fs4_free(l).unwrap_or(0)).cloned().unwrap_or_default();
         Self { app, libraries, library, desktop: true, platform: "windows".into(), choose_platform }

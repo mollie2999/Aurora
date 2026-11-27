@@ -493,6 +493,11 @@ fn cloud_lock(account: SteamId, app: AppId) -> std::sync::Arc<tokio::sync::Mutex
     lock
 }
 
+enum GameProcessEvent {
+    HeadlessStarted(AppId),
+    Exited(AppId, Option<std::path::PathBuf>),
+}
+
 /// Data the online loop keeps between messages.
 struct Online {
     conn: Connection,
@@ -702,7 +707,7 @@ async fn online(
     };
     let (dl_tx, mut dl_rx) = mpsc::unbounded_channel::<(AppId, Result<String, String>)>();
     let (apps_tx, mut apps_rx) = mpsc::unbounded_channel::<Vec<OwnedApp>>();
-    let (exit_tx, mut exit_rx) = mpsc::unbounded_channel::<(AppId, Option<std::path::PathBuf>)>();
+    let (process_tx, mut process_rx) = mpsc::unbounded_channel::<GameProcessEvent>();
     // Launches that waited for a Steam Cloud download.
     let (launch_tx, mut launch_rx) = mpsc::unbounded_channel::<(AppId, std::path::PathBuf, crate::LaunchArgs)>();
     // Launches that waited for Workshop downloads (Steam Cloud comes next).
@@ -836,13 +841,13 @@ async fn online(
                         });
                     }
                     None => {
-                        let _ = st.launch(app_id, &install_dir, &args, sink, &exit_tx);
+                        let _ = st.launch(app_id, &install_dir, &args, sink, &process_tx);
                     }
                 }
             }
             #[cfg(windows)]
             {
-                let _ = st.launch(app_id, &install_dir, &args, sink, &exit_tx);
+                let _ = st.launch(app_id, &install_dir, &args, sink, &process_tx);
             }
             }
             }
@@ -1857,7 +1862,7 @@ async fn online(
             Some((app_id, dir, args)) = launch_rx.recv() => launch_now!(app_id, dir, args),
             Some((app_id, dir, args)) = sh_rx.recv() => {
                 st.shader_jobs.remove(&app_id);
-                let _ = st.launch(app_id, &dir, &args, sink, &exit_tx);
+                let _ = st.launch(app_id, &dir, &args, sink, &process_tx);
             }
             Some((app_id, dir, args)) = ws_rx.recv() => launch_cloud!(app_id, dir, args),
             Some((app_id, report)) = vf_rx.recv() => {
@@ -1865,7 +1870,20 @@ async fn online(
                 sink(Event::VerifyFinished { app_id, result: Ok(report) });
             }
             Some(call) = ipc_rx.recv() => st.ipc_call(call, sink),
-            Some((app_id, host_cloud_dir)) = exit_rx.recv() => {
+            Some(event) = process_rx.recv() => {
+                let (app_id, host_cloud_dir) = match event {
+                    GameProcessEvent::HeadlessStarted(app_id) => {
+                        st.playing = Some(app_id);
+                        if st.link == Link::Online {
+                            if let Err(e) = games_played(&st.conn, Some(app_id)) {
+                                tracing::warn!("could not announce headless game {app_id}: {e}");
+                            }
+                        }
+                        sink(Event::GameStarted { app_id });
+                        continue;
+                    }
+                    GameProcessEvent::Exited(app_id, dir) => (app_id, dir),
+                };
                 st.running.remove(&app_id);
                 st.stop_flags.remove(&app_id);
                 st.launch_layouts.remove(&app_id);
@@ -3144,7 +3162,7 @@ impl Online {
         dir: &std::path::Path,
         args: &crate::LaunchArgs,
         sink: &Sink,
-        exit_tx: &mpsc::UnboundedSender<(AppId, Option<std::path::PathBuf>)>,
+        process_tx: &mpsc::UnboundedSender<GameProcessEvent>,
     ) -> Result<(), Error> {
         if let Err(e) = launch::safe_connect_args(&args.connect) {
             sink(Event::Error(e));
@@ -3175,20 +3193,19 @@ impl Online {
                 self.running.insert(app_id, 0);
                 self.stop_flags.insert(app_id, stop_flag);
                 self.official.insert(app_id, dir.to_path_buf());
-                let (tx, sink, args, me, offline) = (exit_tx.clone(), sink.clone(), args.clone(), self.me, self.link != Link::Online);
+                let (tx, sink, args, me, offline) = (process_tx.clone(), sink.clone(), args.clone(), self.me, self.link != Link::Online);
                 tokio::task::spawn_blocking(move || {
                     let started = || sink(Event::GameStarted { app_id });
                     if let Err(e) = launch::run_through_steam(app_id, &args, me, offline, started) {
                         sink(Event::Error(e));
                     }
-                    let _ = tx.send((app_id, None));
+                    let _ = tx.send(GameProcessEvent::Exited(app_id, None));
                 });
                 return Ok(());
             }
             crate::LaunchMode::HeadlessHost { steam_drm } => {
-                // The user's own Steam engine, headless, runs it; we follow
-                // along like the official-client case (the engine sends its
-                // own presence/stats). It needs the live refresh token.
+                // Aurora spawns the game after the headless engine signs in.
+                // Announce it to Steam once the spawn succeeds.
                 let app = app.clone();
                 let (account, token, me) = (self.account.clone(), self.refresh_token.clone(), self.me);
                 self.running.insert(app_id, 0);
@@ -3206,9 +3223,11 @@ impl Online {
                 };
                 #[cfg(windows)]
                 let overlay: Option<(u16, String)> = None;
-                let (tx, sink, args, dir2) = (exit_tx.clone(), sink.clone(), args.clone(), dir.to_path_buf());
+                let (tx, sink, args, dir2) = (process_tx.clone(), sink.clone(), args.clone(), dir.to_path_buf());
                 tokio::task::spawn_blocking(move || {
-                    let started = || sink(Event::GameStarted { app_id });
+                    let started = || {
+                        let _ = tx.send(GameProcessEvent::HeadlessStarted(app_id));
+                    };
                     let ov = overlay.as_ref().map(|(p, t)| (*p, t.as_str()));
                     let cloud_dir = match launch::run_through_host_cancellable(&app, &dir2, &args, &account, &token, me, ov, Some(&stop_flag), started) {
                         Ok(()) if !steam_drm => Some(dir2),
@@ -3218,7 +3237,7 @@ impl Online {
                             None
                         }
                     };
-                    let _ = tx.send((app_id, cloud_dir));
+                    let _ = tx.send(GameProcessEvent::Exited(app_id, cloud_dir));
                 });
                 return Ok(());
             }
@@ -3269,7 +3288,7 @@ impl Online {
                             tokio::time::sleep(Duration::from_secs(300)).await;
                             launch::swap_loaded(&token);
                         });
-                        self.track(app_id, dir, child, sink, exit_tx)?;
+                        self.track(app_id, dir, child, sink, process_tx)?;
                     }
                     Err(e) => {
                         launch::swap_exited(&token);
@@ -3296,7 +3315,7 @@ impl Online {
                         if let Some((_, tok)) = overlay {
                             self.launch_tokens.insert(app_id, tok);
                         }
-                        self.track(app_id, dir, child, sink, exit_tx)?;
+                        self.track(app_id, dir, child, sink, process_tx)?;
                     }
                     Err(e) => {
                         if let Some((_, tok)) = overlay {
@@ -3311,7 +3330,7 @@ impl Online {
     }
 
     /// A game we started ourselves: we're the one "playing" it.
-    fn track(&mut self, app_id: AppId, dir: &std::path::Path, child: std::process::Child, sink: &Sink, exit_tx: &mpsc::UnboundedSender<(AppId, Option<std::path::PathBuf>)>) -> Result<(), Error> {
+    fn track(&mut self, app_id: AppId, dir: &std::path::Path, child: std::process::Child, sink: &Sink, process_tx: &mpsc::UnboundedSender<GameProcessEvent>) -> Result<(), Error> {
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.running.insert(app_id, child.id());
         self.stop_flags.insert(app_id, stop_flag.clone());
@@ -3324,10 +3343,11 @@ impl Online {
             self.unconnected_play.insert(app_id, (unix_now(), self.link == Link::Offline));
         }
         sink(Event::GameStarted { app_id });
-        let tx = exit_tx.clone();
+        let tx = process_tx.clone();
         let dir_owned = dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let _ = tx.send((launch::wait_in_dir_cancellable(app_id, &dir_owned, child, Some(&stop_flag)), None));
+            let app_id = launch::wait_in_dir_cancellable(app_id, &dir_owned, child, Some(&stop_flag));
+            let _ = tx.send(GameProcessEvent::Exited(app_id, None));
         });
         Ok(())
     }

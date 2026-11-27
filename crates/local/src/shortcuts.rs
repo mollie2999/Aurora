@@ -87,6 +87,18 @@ pub fn load(steam_root: &Path, account_id: Option<u32>) -> Vec<Shortcut> {
     out
 }
 
+/// Look up Steam's non-Steam shortcut app id for `exe` (if registered in
+/// `shortcuts.vdf` with a non-zero id), so Aurora can reuse Steam's Proton prefix.
+pub fn app_id_for_exe(steam_root: &Path, account_id: Option<u32>, exe: &Path) -> Option<u32> {
+    if steam_root.as_os_str().is_empty() {
+        return None;
+    }
+    load(steam_root, account_id)
+        .into_iter()
+        .find(|s| s.app_id != 0 && Path::new(&s.exe) == exe)
+        .map(|s| s.app_id)
+}
+
 #[cfg(test)]
 mod tests {
     /// A `shortcuts.vdf` the way Steam writes it.
@@ -175,5 +187,22 @@ mod tests {
     fn broken_files_give_nothing() {
         assert!(super::parse(b"\x00shortcuts\x00\x01").is_empty());
         assert!(super::parse(b"").is_empty());
+    }
+
+    #[test]
+    fn finds_app_id_for_exe() {
+        let root = std::env::temp_dir().join(format!("sir-shortcuts-appid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cfg = root.join("userdata").join("99").join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("shortcuts.vdf"), sample()).unwrap();
+
+        let expected = (-1_234_567_890i32) as u32;
+        assert_eq!(super::app_id_for_exe(&root, Some(99), std::path::Path::new("/opt/heroic/game.exe")), Some(expected));
+        assert_eq!(super::app_id_for_exe(&root, None, std::path::Path::new("/opt/heroic/game.exe")), Some(expected));
+        // Second entry has no appid (0), so it returns None.
+        assert_eq!(super::app_id_for_exe(&root, Some(99), std::path::Path::new("C:\\Games\\old.exe")), None);
+        assert_eq!(super::app_id_for_exe(&root, Some(99), std::path::Path::new("/missing.exe")), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

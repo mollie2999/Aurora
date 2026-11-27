@@ -144,6 +144,10 @@ struct CustomGame {
     name: String,
     exe: String,
     args: String,
+    /// Steam shortcut app id (when imported from `shortcuts.vdf`), so Linux
+    /// can reuse Steam's existing Proton prefix in `steamapps/compatdata/`.
+    #[serde(default)]
+    steam_app_id: Option<u32>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -186,6 +190,8 @@ enum MenuAct {
     Hide,
     Shortcut,
     Browse,
+    #[cfg(not(windows))]
+    BrowsePrefix,
     Verify,
     Move,
     Backup,
@@ -355,6 +361,8 @@ pub struct Library {
     family_loading: bool,
     /// Sidebar grouped by recent activity instead of the theme's grouping.
     recent_order: bool,
+    /// Backfilled `steam_app_id` from `shortcuts.vdf` for legacy non-Steam games.
+    shortcuts_backfilled: bool,
 }
 
 impl Extension for Library {
@@ -1084,6 +1092,10 @@ impl Library {
                     w::menu_spacing(ui);
                     item(ui, icons::DESKTOP, t!("Add desktop shortcut"), MenuAct::Shortcut);
                     item(ui, icons::FOLDER, t!("Browse local files"), MenuAct::Browse);
+                    #[cfg(not(windows))]
+                    if ctx.local.games.iter().find(|g| g.app_id == id).and_then(|g| local::compat::existing_compat_data(&g.install_dir, id)).is_some() {
+                        item(ui, icons::FOLDER, t!("Show Proton prefix folder"), MenuAct::BrowsePrefix);
+                    }
                     item(ui, icons::SHIELD, t!("Verify game files"), MenuAct::Verify);
                     item(ui, icons::DRIVES, t!("Move install folder…"), MenuAct::Move);
                     item(ui, icons::PACKAGE, t!("Back up game files…"), MenuAct::Backup);
@@ -1159,6 +1171,12 @@ impl Library {
             MenuAct::Browse => {
                 if let Some(g) = local {
                     local::open_folder(&g.install_dir);
+                }
+            }
+            #[cfg(not(windows))]
+            MenuAct::BrowsePrefix => {
+                if let Some(dir) = local.and_then(|g| local::compat::existing_compat_data(&g.install_dir, id)) {
+                    local::open_folder(&dir);
                 }
             }
             MenuAct::Verify => {
@@ -1965,7 +1983,12 @@ impl Library {
             });
         });
         if add {
-            let g = self.adding.take().unwrap();
+            let mut g = self.adding.take().unwrap();
+            if g.steam_app_id.is_none() && !ctx.local.steam_root.as_os_str().is_empty() {
+                let account = Some((ctx.state.steam_id & 0xFFFF_FFFF) as u32).filter(|a| *a != 0);
+                let exe_path = std::path::Path::new(g.exe.trim().trim_matches('"'));
+                g.steam_app_id = local::shortcuts::app_id_for_exe(&ctx.local.steam_root, account, exe_path);
+            }
             ctx.toast(t!("{name} was added to your library", name = g.name));
             self.custom.push(g);
             self.custom_selected = Some(self.custom.len() - 1);
@@ -1997,7 +2020,12 @@ impl Library {
 
     fn import_shortcuts(&mut self, picks: Vec<local::shortcuts::Shortcut>) {
         for s in picks {
-            self.custom.push(CustomGame { name: s.display_name(), exe: s.exe, args: s.launch_options });
+            self.custom.push(CustomGame {
+                name: s.display_name(),
+                exe: s.exe,
+                args: s.launch_options,
+                steam_app_id: (s.app_id != 0).then_some(s.app_id),
+            });
         }
     }
 
@@ -2353,6 +2381,17 @@ impl Library {
     }
 
     fn custom_page(&mut self, i: usize, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+        if !self.shortcuts_backfilled && !ctx.local.steam_root.as_os_str().is_empty() && self.custom.iter().any(|g| g.steam_app_id.is_none()) {
+            let account = Some((ctx.state.steam_id & 0xFFFF_FFFF) as u32).filter(|a| *a != 0);
+            let shortcuts = local::shortcuts::load(&ctx.local.steam_root, account);
+            for c in &mut self.custom {
+                if c.steam_app_id.is_none() {
+                    let exe = std::path::Path::new(c.exe.trim().trim_matches('"'));
+                    c.steam_app_id = shortcuts.iter().find(|s| s.app_id != 0 && std::path::Path::new(&s.exe) == exe).map(|s| s.app_id);
+                }
+            }
+            self.shortcuts_backfilled = true;
+        }
         let Some(g) = self.custom.get(i).cloned() else {
             self.custom_selected = None;
             return;
@@ -2368,7 +2407,7 @@ impl Library {
                 if w::button(ui, t, Some(icons::PLAY), t!("Play"), w::Kind::Play, w::Size::Lg).clicked() {
                     // Windows programs run with Proton on Linux; shortcuts and
                     // admin-only programs go through the shell on Windows.
-                    match client::spawn_non_steam(&g.exe, &g.args) {
+                    match client::spawn_non_steam(&g.exe, &g.args, g.steam_app_id) {
                         Ok(Some(mut child)) => {
                             std::thread::spawn(move || child.wait());
                         }
@@ -2379,6 +2418,12 @@ impl Library {
                 if let Some(dir) = std::path::Path::new(g.exe.trim().trim_matches('"')).parent() {
                     if w::button(ui, t, Some(icons::FOLDER), t!("Browse local files"), w::Kind::Secondary, w::Size::Lg).clicked() {
                         local::open_folder(dir);
+                    }
+                }
+                #[cfg(not(windows))]
+                if let Some(pfx) = client::non_steam_compat_data(&g.exe, g.steam_app_id) {
+                    if w::button(ui, t, Some(icons::FOLDER), t!("Show Proton prefix folder"), w::Kind::Secondary, w::Size::Lg).clicked() {
+                        local::open_folder(&pfx);
                     }
                 }
                 if w::button(ui, t, Some(icons::TRASH), t!("Remove from library"), w::Kind::Danger, w::Size::Lg).clicked() {
@@ -2788,6 +2833,12 @@ impl Library {
             }
             if item(ui, icons::FOLDER, t!("Browse local files"), t.text) {
                 local::open_folder(&g.install_dir);
+            }
+            #[cfg(not(windows))]
+            if let Some(pfx) = local::compat::existing_compat_data(&g.install_dir, id) {
+                if item(ui, icons::FOLDER, t!("Show Proton prefix folder"), t.text) {
+                    local::open_folder(&pfx);
+                }
             }
             if item(ui, icons::SHIELD, t!("Verify game files"), t.text) {
                 self.start_verify(ctx, g);

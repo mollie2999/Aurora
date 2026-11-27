@@ -173,6 +173,11 @@ pub fn compat_data(install_dir: &Path, app: AppId) -> Option<PathBuf> {
     Some(steamapps.join("compatdata").join(app.to_string()))
 }
 
+/// The game's Proton prefix folder, if it already exists on disk.
+pub fn existing_compat_data(install_dir: &Path, app: AppId) -> Option<PathBuf> {
+    compat_data(install_dir, app).filter(|p| p.is_dir())
+}
+
 /// The Windows user folder inside a game's Proton prefix, where its saves
 /// go (`…/pfx/drive_c/users/steamuser`), if the prefix exists.
 pub fn prefix_user_dir(install_dir: &Path, app: AppId) -> Option<PathBuf> {
@@ -250,6 +255,19 @@ mod tests {
         assert_eq!(tools.len(), 1, "accepted unsafe compat tools: {tools:?}");
         assert_eq!(tools[0].name, "GE-Proton-Test");
         assert!(app_dir(&root, 1628350).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn existing_compat_data_checks_disk() {
+        let root = std::env::temp_dir().join(format!("sir-compat-exist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let install_dir = root.join("steamapps").join("common").join("KH2FM");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        assert_eq!(existing_compat_data(&install_dir, 2552430), None);
+        let pfx = root.join("steamapps").join("compatdata").join("2552430");
+        std::fs::create_dir_all(&pfx).unwrap();
+        assert_eq!(existing_compat_data(&install_dir, 2552430), Some(pfx));
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -281,9 +281,17 @@ mod tests {
         std::fs::create_dir_all(&compat).unwrap();
         assert_eq!(prefix_dir(&install_dir, 420), Some(compat.clone()));
 
+        // A non-directory `pfx` file must fall back to `compatdata/<app>`.
         let pfx = compat.join("pfx");
+        std::fs::write(&pfx, b"").unwrap();
+        assert_eq!(prefix_dir(&install_dir, 420), Some(compat.clone()));
+        std::fs::remove_file(&pfx).unwrap();
+
         std::fs::create_dir_all(&pfx).unwrap();
         assert_eq!(prefix_dir(&install_dir, 420), Some(pfx));
+
+        // Unsafe traversal components in `install_dir` are rejected.
+        assert_eq!(prefix_dir(&root.join("steamapps").join("common").join(".."), 420), None);
 
         let _ = std::fs::remove_dir_all(&root);
     }

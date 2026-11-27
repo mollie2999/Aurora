@@ -14,6 +14,8 @@ memmap2 = "0.9"
 resvg = { version = "0.45", default-features = false }
 eframe.workspace = true
 log = "0.4"
+# Decodes animated PNGs (Steam's avatar frames), which egui shows as stills.
+image = { workspace = true, features = ["gif"] }
 # Match epaint's parser when checking theme-provided font faces.
 skrifa = { version = "0.44.0", default-features = false, features = ["std"] }
 
@@ -27,4 +29,4 @@ eframe = { workspace = true, features = ["wgpu_no_default_features"] }
 wgpu = { version = "30", default-features = false, features = ["dx12"] }
 
 [dev-dependencies]
-image.workspace = true
+image = { workspace = true, features = ["gif"] }

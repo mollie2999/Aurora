@@ -508,7 +508,10 @@ fn trim(dir: &PathBuf) {
     }
 }
 
-const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+// Steam Workshop's animated GIF artwork is routinely larger than the 16 MiB
+// limit that is sensible for static thumbnails. Keep a firm bound for remote
+// data, but allow a complete GIF through to egui's animated-image loader.
+const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
     let [a, b, _, _] = ip.octets();
@@ -773,16 +776,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocks_redirect_ssrf_and_caps_streaming_body_at_16_mib() {
+    async fn blocks_redirect_ssrf_and_caps_streaming_body_at_64_mib() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let srv = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
             let mut req = [0u8; 1024];
             let _ = sock.read(&mut req);
-            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17825792\r\nConnection: close\r\n\r\n");
+            let too_large = MAX_IMAGE_BYTES + 1024 * 1024;
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {too_large}\r\nConnection: close\r\n\r\n");
+            let _ = sock.write_all(header.as_bytes());
             let block = vec![0u8; 1024 * 1024];
-            for _ in 0..17 {
+            for _ in 0..(MAX_IMAGE_BYTES / block.len() + 1) {
                 if sock.write_all(&block).is_err() {
                     break;
                 }
@@ -790,10 +795,10 @@ mod tests {
         });
         let raw_client = reqwest::Client::new();
         let resp = raw_client.get(format!("http://{addr}/bomb.png")).send().await.unwrap();
-        assert!(read_image_bytes(resp).await.is_err(), "image > 16 MiB must be rejected");
+        assert!(read_image_bytes(resp).await.is_err(), "image > 64 MiB must be rejected");
         tokio::task::spawn_blocking(move || srv.join().unwrap()).await.unwrap();
 
-        // Also test chunked body without Content-Length exceeding 16 MiB.
+        // Also test a chunked body without Content-Length exceeding 64 MiB.
         let chunked = TcpListener::bind("127.0.0.1:0").unwrap();
         let caddr = chunked.local_addr().unwrap();
         let csrv = std::thread::spawn(move || {
@@ -803,7 +808,7 @@ mod tests {
             let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
             let chunk_hdr = format!("{:x}\r\n", 1024 * 1024);
             let block = vec![b'a'; 1024 * 1024];
-            for _ in 0..17 {
+            for _ in 0..(MAX_IMAGE_BYTES / block.len() + 1) {
                 if sock.write_all(chunk_hdr.as_bytes()).is_err()
                     || sock.write_all(&block).is_err()
                     || sock.write_all(b"\r\n").is_err()
@@ -814,7 +819,7 @@ mod tests {
             let _ = sock.write_all(b"0\r\n\r\n");
         });
         let resp = raw_client.get(format!("http://{caddr}/chunked.png")).send().await.unwrap();
-        assert!(read_image_bytes(resp).await.is_err(), "chunked image > 16 MiB must be rejected");
+        assert!(read_image_bytes(resp).await.is_err(), "chunked image > 64 MiB must be rejected");
         drop(raw_client);
         tokio::task::spawn_blocking(move || csrv.join().unwrap()).await.unwrap();
 

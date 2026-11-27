@@ -4,18 +4,24 @@
 use ui::widgets::EditMenu;
 use client::Command;
 use egui::{Align, Align2, Color32, CornerRadius, Layout, Margin, Rect, Sense, Stroke, Ui, pos2, vec2};
-use extensions::{Action, Ctx, Extension, Manifest, PageSpec};
+use extensions::{Ctx, Extension, Manifest, PageSpec};
 use i18n::t;
 use model::{Relationship, SteamId, Visibility, art};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use ui::{Theme, icons, widgets as w};
 
+#[path = "profile_classic.rs"]
+mod classic;
 #[path = "profile_pages.rs"]
 mod pages;
 #[path = "profile_edit.rs"]
 pub(crate) mod edit;
 #[path = "profile_themes.rs"]
 pub(crate) mod themes;
+#[path = "profile_showcases.rs"]
+mod showcases;
+#[path = "profile_sidebar.rs"]
+mod sidebar;
 
 /// What the profile page shows: the profile, or one of its lists.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
@@ -26,6 +32,7 @@ enum Section {
     Badges,
     Reviews,
     Groups,
+    CommonGroups,
     /// A game's card collection (the game and foil set in `Profile::cards`).
     Cards,
     /// Editing your own profile.
@@ -40,13 +47,14 @@ impl Section {
             Section::Badges => "badges",
             Section::Reviews => "reviews",
             Section::Groups => "groups",
+            Section::CommonGroups => "groupscommon",
             Section::Cards => "cards",
             Section::Edit => "edit",
         }
     }
 
     fn from_slug(s: Option<&str>) -> Section {
-        [Section::Games, Section::Badges, Section::Reviews, Section::Groups, Section::Cards].into_iter().find(|x| Some(x.slug()) == s).unwrap_or_default()
+        [Section::Games, Section::Badges, Section::Reviews, Section::Groups, Section::CommonGroups, Section::Cards].into_iter().find(|x| Some(x.slug()) == s).unwrap_or_default()
     }
 }
 
@@ -60,8 +68,13 @@ enum GameSort {
 
 #[derive(Default)]
 pub struct Profile {
+    flags: super::settings::SharedFlags,
     /// `None` = your own profile.
     viewing: Option<SteamId>,
+    /// A custom profile URL (steamcommunity.com/id/<name>) waiting for its
+    /// SteamID, and the ones asked for.
+    vanity: Option<String>,
+    vanity_requested: HashSet<String>,
     requested: HashSet<SteamId>,
     games_requested: HashSet<SteamId>,
     /// The profile, or one of its lists (games, badges, reviews, groups).
@@ -74,12 +87,28 @@ pub struct Profile {
     games_search: String,
     games_sort: GameSort,
     showcase_requested: HashSet<SteamId>,
+    classic_inventory_requested: HashSet<SteamId>,
+    /// Last request for an item showcase inventory: (profile, app, context).
+    /// Failed inventory RPCs need a retry; keeping only a set left the tiles
+    /// shimmering forever after one transient Steam failure.
+    showcase_inventories: HashMap<(SteamId, model::AppId, u64), std::time::Instant>,
+    /// Steam profile pages and name histories asked for.
+    page_requested: HashSet<SteamId>,
+    aliases_requested: HashSet<SteamId>,
+    /// "Clear Previous Aliases" waiting for confirmation.
+    confirm_clear_aliases: bool,
     social_requested: HashSet<SteamId>,
     comment_draft: String,
     /// Which page of comments shows (first comment's index), per profile.
     comment_start: std::collections::HashMap<SteamId, u32>,
     /// Editing your profile ("Edit profile" pages).
     edit: edit::EditState,
+}
+
+impl Profile {
+    pub fn new(flags: super::settings::SharedFlags) -> Self {
+        Self { flags, ..Self::default() }
+    }
 }
 
 impl Extension for Profile {
@@ -99,6 +128,12 @@ impl Extension for Profile {
             _ => {}
         }
         self.edit_event(event, ctx);
+        if let client::Event::AliasesCleared(result) = event {
+            match result {
+                Ok(()) => ctx.toast(t!("Name history cleared")),
+                Err(e) => ctx.toast(t!("Couldn't clear the name history: {error}", error = i18n::tr_dyn(e))),
+            }
+        }
         if let client::Event::CommentPosted { result, .. } = event {
             match result {
                 Ok(()) => {
@@ -121,9 +156,11 @@ impl Extension for Profile {
             }
         }
         // "<id>/<part>", or just "<part>" ("games", "badges"…) for your own.
+        // "id:<name>/<part>": a custom profile URL, resolved before showing.
         let mut parts = arg.unwrap_or_default().split('/').peekable();
+        self.vanity = parts.peek().and_then(|a| a.strip_prefix("id:")).filter(|v| !v.is_empty()).map(|v| v.to_ascii_lowercase());
         self.viewing = parts.peek().and_then(|a| a.parse().ok());
-        if self.viewing.is_some() || parts.peek() == Some(&"") {
+        if self.viewing.is_some() || self.vanity.is_some() || parts.peek() == Some(&"") {
             parts.next();
         }
         self.section = Section::from_slug(parts.next());
@@ -136,15 +173,44 @@ impl Extension for Profile {
 
     fn page(&mut self, _page: &str, ui: &mut Ui, ctx: &mut Ctx) {
         let t = ctx.theme.clone();
+        let steam_profile_ui = self.flags.lock().unwrap().steam_profile_ui;
+        ui.ctx().data_mut(|d| d.remove::<ProfileStyle>(profile_style_id()));
+        // A custom profile URL: find its SteamID first.
+        if let Some(vanity) = self.vanity.clone() {
+            match ctx.state.vanity_ids.get(&vanity) {
+                Some(Ok(steam_id)) => {
+                    self.viewing = Some(*steam_id);
+                    self.vanity = None;
+                }
+                Some(Err(e)) => {
+                    let e = e.clone();
+                    ui.add_space(60.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(w::text_bold(t!("Couldn't open this profile"), 18.0, t.text));
+                        ui.label(w::text(i18n::tr_dyn(&e), 13.5, t.text_dim));
+                        if w::button(ui, &t, Some(icons::EXTERNAL), t!("View on Steam"), w::Kind::Secondary, w::Size::Sm).clicked() {
+                            crate::links::open_http(&format!("https://steamcommunity.com/id/{vanity}/"));
+                        }
+                    });
+                    return;
+                }
+                None => {
+                    if self.vanity_requested.insert(vanity.clone()) {
+                        ctx.send(Command::ResolveProfileUrl { vanity });
+                    }
+                    ui.add_space(80.0);
+                    ui.vertical_centered(|ui| ui.add(egui::Spinner::new().size(28.0).color(t.accent)));
+                    return;
+                }
+            }
+        }
         let id = self.viewing.filter(|id| *id != ctx.state.steam_id).unwrap_or(ctx.state.steam_id);
         let mine = id == ctx.state.steam_id;
         if id != 0 && !ctx.state.profiles.contains_key(&id) && self.requested.insert(id) {
             ctx.send(Command::LoadProfile { steam_id: id });
         }
-        let persona = ctx.state.persona(id);
-        let info = ctx.state.profiles.get(&id).cloned();
         let friend = ctx.state.friends.get(&id) == Some(&Relationship::Friend);
-        let visibility = info.as_ref().map(|i| i.visibility).unwrap_or_default();
+        let visibility = ctx.state.profiles.get(&id).map(|i| i.visibility).unwrap_or_default();
         // Whether Steam will show us this profile's games, inventory and friends.
         let open = mine
             || match visibility {
@@ -155,96 +221,176 @@ impl Extension for Profile {
         if id != 0 && open && !ctx.state.player_games.contains_key(&id) && self.games_requested.insert(id) {
             ctx.send(Command::LoadPlayerGames { steam_id: id, language: i18n::language().steam_name().into() });
         }
-        let display_name = if mine && !ctx.state.persona_name.is_empty() { ctx.state.persona_name.clone() } else { persona.name.clone() };
-
         // Right-click on empty space: "Copy page URL" (this profile on Steam).
         let path = match self.section {
             Section::Games => "games/?tab=all",
             Section::Badges => "badges/",
             Section::Reviews => "recommended/",
             Section::Groups => "groups/",
+            Section::CommonGroups => "groupscommon/",
             Section::Cards => "badges/",
             Section::Edit => "edit/info",
             Section::Profile => "",
         };
         crate::links::page_url_menu(ui, &format!("https://steamcommunity.com/profiles/{id}/{path}"));
 
+        if !steam_profile_ui {
+            self.classic_page(ui, &t, ctx, id, open);
+            return;
+        }
+        let persona = ctx.state.persona(id);
+        let info = ctx.state.profiles.get(&id).cloned();
+        let display_name = if mine && !ctx.state.persona_name.is_empty() { ctx.state.persona_name.clone() } else { persona.name.clone() };
+
+        // The profile's own Steam theme or game profile colors its panels,
+        // like on Steam. Profiles without one keep Aurora's look.
+        let steam_theme = match ctx.state.profile_pages.get(&id).and_then(|r| r.as_ref().ok()) {
+            Some(p) if p.theme == "GameProfile" => themes::from_vars(&p.theme_vars),
+            Some(p) if !p.theme.is_empty() => themes::get(&p.theme),
+            _ => info.as_ref().map(|i| i.theme.as_str()).filter(|t| !t.is_empty() && *t != "Default").and_then(themes::get),
+        };
+        ui.ctx().data_mut(|d| d.insert_temp(profile_style_id(), ProfileStyle::Steam(steam_theme)));
+
         // Full-page background, like a Steam profile.
         let full = ui.max_rect();
         let bg_url = info.as_ref().and_then(|i| i.background.clone());
-        let painted = bg_url.as_deref().is_some_and(|u| w::paint_cover(ui, full, u, CornerRadius::ZERO));
-        if painted {
-            ui.painter().rect_filled(full, CornerRadius::ZERO, Color32::from_black_alpha(120));
-        } else {
+        // Steam's page is black around and below a profile background,
+        // whatever Aurora theme is in use.
+        if bg_url.is_some() && self.section == Section::Profile {
+            ui.painter().rect_filled(full, CornerRadius::ZERO, Color32::BLACK);
+        }
+        if bg_url.is_none() {
             w::gradient(ui.painter(), Rect::from_min_size(full.min, vec2(full.width(), 340.0)), t.accent.gamma_multiply(0.30), t.accent_2.gamma_multiply(0.18), true);
             w::fade_down(ui, Rect::from_min_size(full.min, vec2(full.width(), 340.0)), t.bg, 0.0);
         }
 
+        let is_game_profile = matches!(ctx.state.profile_pages.get(&id), Some(Ok(p)) if p.theme == "GameProfile");
+        let bg_full = info.as_ref().is_some_and(|i| i.background_full);
+
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(40.0);
-            w::centered(ui, 1180.0, 32.0, |ui| {
+            // As on Steam, the background belongs to the page: its own size,
+            // centered at the top ("Full Screen": as wide as the window), and
+            // it scrolls away with the content.
+            let page_top = ui.max_rect().top();
+            let bg_rect = bg_url.as_deref().and_then(|url| w::paint_page_background(ui, full.center().x, page_top, url, bg_full.then_some(full.width())));
+            // The page column and its parts, painted once their size is known.
+            let column_slot = ui.painter().add(egui::Shape::Noop);
+            let content_slot = ui.painter().add(egui::Shape::Noop);
+            let tint_slot = ui.painter().add(egui::Shape::Noop);
+            w::centered(ui, PAGE_W, 0.0, |ui| {
                 match self.section {
                     Section::Profile => {}
-                    Section::Games => return self.games_page(ui, &t, ctx, id, &display_name, mine),
-                    Section::Edit => return self.edit_page(ui, &t, ctx),
-                    other => return self.list_page(ui, &t, ctx, id, &display_name, mine, other),
+                    Section::Games => {
+                        ui.add_space(40.0);
+                        return self.games_page(ui, &t, ctx, id, &display_name, mine);
+                    }
+                    Section::Edit => {
+                        ui.add_space(40.0);
+                        return self.edit_page(ui, &t, ctx);
+                    }
+                    other => {
+                        ui.add_space(40.0);
+                        return self.list_page(ui, &t, ctx, id, &display_name, mine, other);
+                    }
                 }
-                // Identity header on a translucent panel.
-                egui::Frame::new()
-                    .fill(t.chrome.gamma_multiply(0.82))
-                    .stroke(Stroke::new(1.0, t.border))
-                    .corner_radius(t.corner())
-                    .inner_margin(Margin::same(24))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal_top(|ui| {
-                            let (r, _) = ui.allocate_exact_size(vec2(164.0, 164.0), Sense::hover());
-                            let img = r.shrink(14.0);
-                            let still = art::avatar_full(persona.avatar_hash.as_deref());
-                            let avatar_url = info.as_ref().and_then(|i| i.animated_avatar.as_deref()).unwrap_or(&still);
-                            if !w::paint_cover(ui, img, avatar_url, CornerRadius::same(6)) {
-                                w::skeleton(ui, &t, img, CornerRadius::same(6));
-                            }
-                            if let Some(frame) = info.as_ref().and_then(|i| i.avatar_frame.as_deref()) {
-                                w::paint_cover(ui, r, frame, CornerRadius::ZERO);
-                            }
-                            ui.add_space(12.0);
-                            ui.vertical(|ui| {
-                                ui.add_space(10.0);
+                // Steam's grid: a 976 px column; the header holds the avatar,
+                // the name column at 228 px and the Level block at 676 px;
+                // below, a 652 px and a 288 px column with 12 px gutters.
+                let col = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 0.0));
+                // The columns get the height the scroll area offers, like any
+                // page content; infinite room would push centered rows (and
+                // everything after them, like the comments) out of sight.
+                let col_h = ui.available_height().max(1.0);
+                let scale_w = col.width();
+                let right_w = RIGHT_W.min(scale_w * 0.32);
+                let left_w = (scale_w - right_w - GUTTER * 3.0).max(200.0);
+                let right_x = col.left() + GUTTER * 2.0 + left_w;
+                let header_side_w = right_w;
+                let header_top = col.top();
+                // ---- header ----
+                let avatar_box = Rect::from_min_size(pos2(col.left() + 24.0, header_top + 24.0), vec2(166.0, 166.0));
+                {
+                    // Steam: a 166 px box, the picture inset 2 px (162 px) on
+                    // the status color's border, and the frame drawn over the
+                    // picture at 1.22× its size, centered.
+                    let img = avatar_box.shrink(2.0);
+                    let still = art::avatar_full(persona.avatar_hash.as_deref());
+                    let avatar_url = info.as_ref().and_then(|i| i.animated_avatar.as_deref()).unwrap_or(&still);
+                    let frame = info.as_ref().and_then(|i| i.avatar_frame.as_deref());
+                    if frame.is_none() {
+                        ui.painter().rect_filled(avatar_box, CornerRadius::ZERO, avatar_border(&t, &persona));
+                    }
+                    // Animated avatars and frames play, capped for performance.
+                    if !w::paint_cover_animated(ui, img, avatar_url, CornerRadius::ZERO, AVATAR_FPS) {
+                        w::skeleton(ui, &t, img, CornerRadius::ZERO);
+                    }
+                    if let Some(frame) = frame {
+                        w::paint_cover_animated(ui, Rect::from_center_size(img.center(), img.size() * 1.22), frame, CornerRadius::ZERO, AVATAR_FPS);
+                    }
+                }
+                let name_x = col.left() + 228.0;
+                let name_w = (right_x - GUTTER - name_x).max(160.0);
+                let mut name_ui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(name_x, header_top + 28.0), vec2(name_w, col_h))).layout(Layout::top_down(Align::Min)));
+                {
+                    let ui = &mut name_ui;
+                    ui.set_width(name_w);
+                    ui.spacing_mut().item_spacing = vec2(8.0, 4.0);
+                    // Rows as tall as their text, like Steam's lines: the
+                    // theme's 32 px button height would pad the location and
+                    // summary rows and push the summary down.
+                    ui.spacing_mut().interact_size.y = 0.0;
+                    {
                                 let name = if mine && !ctx.state.persona_name.is_empty() { ctx.state.persona_name.clone() } else { persona.name.clone() };
+                                // Steam's `profile_header_centered_persona`: the
+                                // name and the real name / location line, with
+                                // 18 px under it before the summary (the same
+                                // when there's no location line).
+                                let persona_block = ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(w::text_bold(name, 30.0, Color32::WHITE));
-                                    if mine {
-                                        if let Some(level) = ctx.state.level {
-                                            level_badge(ui, &t, level);
-                                        }
-                                    }
+                                    ui.label(w::text(name, 30.0, Color32::WHITE));
+                                    // Steam's chevron: the names this profile used before.
+                                    let chevron = ui.add(egui::Label::new(w::text(icons::CARET_DOWN, 16.0, t.text_dim)).sense(Sense::click()));
+                                    let chevron = chevron.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(t!("Previous names"));
+                                    egui::Popup::menu(&chevron).width(280.0).show(|ui| self.aliases_menu(ui, &t, ctx, id, mine));
                                 });
                                 if let Some(i) = &info {
-                                    let mut sub = Vec::new();
-                                    if !i.real_name.is_empty() {
-                                        sub.push(i.real_name.clone());
-                                    }
-                                    if !i.location.is_empty() {
-                                        sub.push(i.location.clone());
-                                    }
-                                    if !sub.is_empty() {
-                                        ui.label(w::text(sub.join("  ·  "), 14.0, t.text_dim));
+                                    // Real name, then the country flag and location, like Steam.
+                                    let flag = match ctx.state.profile_pages.get(&id) {
+                                        Some(Ok(p)) => p.country_flag.clone(),
+                                        _ => String::new(),
+                                    };
+                                    if !i.real_name.is_empty() || !i.location.is_empty() {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                            if !i.real_name.is_empty() {
+                                                ui.label(w::text(&i.real_name, 14.0, t.text_dim));
+                                            }
+                                            if !i.location.is_empty() {
+                                                if !i.real_name.is_empty() {
+                                                    ui.add_space(4.0);
+                                                }
+                                                if !flag.is_empty() {
+                                                    let (fr, _) = ui.allocate_exact_size(vec2(16.0, 11.0), Sense::hover());
+                                                    w::paint_contain(ui, fr, &flag, Align2::CENTER_CENTER);
+                                                }
+                                                ui.label(w::text(&i.location, 14.0, t.text_dim));
+                                            }
+                                        });
                                     }
                                 } else {
                                     let (r, _) = ui.allocate_exact_size(vec2(220.0, 14.0), Sense::hover());
                                     w::skeleton(ui, &t, r, CornerRadius::same(4));
                                 }
-                                let r = ui.add(egui::Label::new(w::text_medium(crate::shell::status_text(ctx.state, &persona), 14.0, crate::shell::status_color(&t, &persona))).sense(Sense::click()));
-                                if let Some(game) = persona.game_app_id.filter(|_| persona.in_game()) {
-                                    if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                        ctx.act(crate::shell::game_page(ctx.state, game));
-                                    }
-                                }
-                                ui.add_space(10.0);
-                                match info.as_ref().map(|i| i.summary.trim().to_string()) {
-                                    Some(s) if !s.is_empty() => {
-                                        w::markup_label(ui, &s, 14.0, t.text);
+                                }).response.rect;
+                                let gap = persona_block.bottom() + PERSONA_PADDING_BOTTOM - ui.cursor().top();
+                                ui.add_space(gap.max(0.0));
+                                // Leading line breaks go, but not full-width
+                                // spaces: people indent with them, and Steam
+                                // keeps that indent.
+                                match info.as_ref().map(|i| i.summary.trim_end().trim_start_matches(|c: char| c.is_ascii_whitespace()).to_string()) {
+                                    Some(s) if !s.trim().is_empty() => {
+                                        // Steam's BBCode, emoticons and emoji, like the real profile.
+                                        summary(ui, &t, ctx, id, &s);
                                     }
                                     Some(_) => {
                                         ui.label(w::text(t!("No profile summary yet."), 13.5, t.text_faint));
@@ -256,64 +402,29 @@ impl Extension for Profile {
                                         }
                                     }
                                 }
-                                if let Some(since) = info.as_ref().and_then(|i| i.member_since) {
-                                    ui.add_space(6.0);
-                                    ui.label(w::text(t!("Member since {date}", date = ui::date(since)), 12.5, t.text_faint)).on_hover_text(ui::ago(since));
-                                }
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    if !mine && w::button(ui, &t, Some(icons::CHAT), t!("Send a message"), w::Kind::Primary, w::Size::Sm).clicked() {
-                                        ctx.act(Action::OpenChat(id));
-                                    }
-                                    if mine {
-                                        if w::button(ui, &t, Some(icons::NOTE), t!("Edit profile"), w::Kind::Secondary, w::Size::Sm).clicked() {
-                                            ctx.navigate("profile", Some("edit".into()));
-                                        }
-                                    } else if w::button(ui, &t, Some(icons::EXTERNAL), t!("View on Steam"), w::Kind::Secondary, w::Size::Sm).clicked() {
-                                        crate::links::open_http(&format!("https://steamcommunity.com/profiles/{id}"));
-                                    }
-                                    if w::button(ui, &t, Some(icons::COPY), t!("Copy SteamID"), w::Kind::Ghost, w::Size::Sm).clicked() {
-                                        ui.ctx().copy_text(id.to_string());
-                                        ctx.toast(t!("SteamID copied"));
-                                    }
-                                });
-                            });
-                        });
-                    });
-                ui.add_space(16.0);
+                    }
+                }
+                // Level, featured badge, actions and Member since, at the
+                // right column's x like Steam.
+                let mut side_ui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(right_x, header_top + 28.0), vec2(header_side_w, col_h))).layout(Layout::top_down(Align::Min)));
+                side_ui.set_width(header_side_w);
+                let since = info.as_ref().and_then(|i| i.member_since);
+                self.header_side(&mut side_ui, &t, ctx, id, mine, since);
+                // Steam's header is at least 230 px tall; taller when its text runs longer.
+                let header_bottom = (header_top + HEADER_H).max(name_ui.min_rect().bottom() + 24.0).max(side_ui.min_rect().bottom() + 24.0);
+                ui.allocate_rect(Rect::from_min_max(col.min, pos2(col.right(), header_bottom)), Sense::hover());
 
-                // Two columns, like Steam: showcases on the left, links and
-                // friends on the right.
-                let side = 320.0;
-                let gap = 18.0;
-                let main_w = ui.available_width() - side - gap;
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    ui.allocate_ui_with_layout(vec2(main_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                        ui.set_width(main_w);
-                        if persona.in_game() {
-                            let game = persona.game_name.clone().or_else(|| persona.game_app_id.and_then(|g| ctx.state.app_name(g).map(String::from))).unwrap_or_default();
-                            panel(ui, &t, |ui| {
-                                ui.horizontal(|ui| {
-                                    if let Some(g) = persona.game_app_id {
-                                        let (r, _) = ui.allocate_exact_size(vec2(184.0, 69.0), Sense::hover());
-                                        w::image_or_skeleton(ui, &t, r, &art::header(g), t.corner_small());
-                                    }
-                                    ui.vertical(|ui| {
-                                        ui.label(w::text_semibold(w::sentence_case(t!("CURRENTLY IN GAME")), 12.0, t.in_game));
-                                        ui.label(w::text_semibold(game, 18.0, t.text));
-                                    });
-                                });
-                            });
-                            ui.add_space(14.0);
-                        }
+                // ---- the two columns ----
+                let content_top = header_bottom;
+                let mut left_ui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(col.left() + GUTTER, content_top + GUTTER), vec2(left_w, col_h))).layout(Layout::top_down(Align::Min)));
+                left_ui.set_width(left_w);
+                {
+                    let ui = &mut left_ui;
+                        // The in-game status is only in the right column, as on Steam.
                         if open {
-                            self.recent_games(ui, &t, ctx, id);
-                            ui.add_space(14.0);
-                            self.showcase(ui, &t, ctx, id);
-                            ui.add_space(14.0);
-                            self.most_played(ui, &t, ctx, id);
-                            ui.add_space(14.0);
+                            // Like Steam: showcases, recent activity, comments.
+                            self.showcases(ui, &t, ctx, id);
+                            self.recent_activity(ui, &t, ctx, id);
                             self.comments(ui, &t, ctx, id, mine);
                         } else {
                             panel(ui, &t, |ui| {
@@ -328,16 +439,47 @@ impl Extension for Profile {
                                 });
                             });
                         }
-                    });
-                    ui.allocate_ui_with_layout(vec2(side, 0.0), Layout::top_down(Align::Min), |ui| {
-                        ui.set_width(side);
-                        self.badges(ui, &t, ctx, id, open);
-                        self.sidebar(ui, &t, ctx, id, mine, open);
-                    });
-                });
+                }
+                // Steam's right column is its own box with its content 10 px
+                // in, 12 px away from the left column.
+                let right_inner = right_w - PANEL_PAD * 2.0;
+                let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(right_x + PANEL_PAD, content_top + GUTTER), vec2(right_inner, col_h))).layout(Layout::top_down(Align::Min)));
+                right_ui.set_width(right_inner);
+                self.right_column(&mut right_ui, &t, ctx, id, mine, open, &persona);
+                let content_bottom = left_ui.min_rect().bottom().max(right_ui.min_rect().bottom()) + GUTTER;
+                ui.allocate_rect(Rect::from_min_max(pos2(col.left(), content_top), pos2(col.right(), content_bottom)), Sense::hover());
+
+                // ---- the page column behind it all, as Steam themes paint it ----
+                let column = Rect::from_min_max(pos2(col.left(), page_top), pos2(col.right(), content_bottom));
+                match profile_theme(ui) {
+                    // Game profiles: a see-through header, and each column
+                    // frosted on its own with a gap between, like Steam.
+                    Some(theme) if is_game_profile => {
+                        let boxes = [
+                            Rect::from_min_max(pos2(col.left() + GUTTER, content_top), pos2(right_x - GUTTER, content_bottom)),
+                            Rect::from_min_max(pos2(right_x, content_top), pos2(right_x + right_w, content_bottom)),
+                        ];
+                        if let (Some(url), Some(bg)) = (bg_url.as_deref(), bg_rect) {
+                            let shapes: Vec<egui::Shape> = boxes.iter().filter_map(|b| w::blurred_background_shape(ui, bg, *b, url)).collect();
+                            ui.painter().set(content_slot, egui::Shape::Vec(shapes));
+                        }
+                        ui.painter().set(tint_slot, egui::Shape::Vec(boxes.iter().map(|b| egui::Shape::rect_filled(*b, CornerRadius::ZERO, theme.frost_tint())).collect()));
+                    }
+                    // Other themes: the whole column tinted, the panels on top.
+                    Some(theme) => {
+                        ui.painter().set(column_slot, egui::Shape::rect_filled(column, CornerRadius::ZERO, theme.column_fill()));
+                    }
+                    // Steam's default look.
+                    None => {
+                        ui.painter().set(column_slot, egui::Shape::rect_filled(column, CornerRadius::ZERO, Color32::from_black_alpha(110)));
+                    }
+                }
             });
             ui.add_space(40.0);
         });
+        if mine {
+            self.clear_aliases_dialog(ui, &t, ctx);
+        }
     }
 }
 
@@ -474,55 +616,6 @@ impl Profile {
         }
     }
 
-    /// Level, XP and badges, like the top of Steam's profile sidebar.
-    fn badges(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, id: SteamId, open: bool) {
-        if !open {
-            return;
-        }
-        self.request_social(ctx, id);
-        let Some(Ok(b)) = ctx.state.badges.get(&id).cloned() else { return };
-        panel(ui, t, |ui| {
-            ui.horizontal(|ui| {
-                level_badge(ui, t, b.level);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(w::text_bold(t!("Level {n}", n = b.level), 16.0, t.text));
-                    if !b.xp.is_empty() {
-                        ui.label(w::text(&b.xp, 12.0, t.text_dim));
-                    }
-                });
-            });
-            if !b.next.is_empty() {
-                ui.add_space(4.0);
-                let width = ui.available_width();
-                w::progress(ui, t, b.progress, width);
-                ui.label(w::text(&b.next, 11.5, t.text_faint));
-            }
-            if !b.items.is_empty() {
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label(w::text_bold(t!("Badges"), 14.0, t.text));
-                    ui.label(w::text(b.items.len().to_string(), 13.0, t.text_dim));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.link(w::text(t!("See all"), 12.5, t.accent)).clicked() {
-                            ctx.navigate("profile", Some(format!("{id}/{}", Section::Badges.slug())));
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                    for badge in b.items.iter().take(8) {
-                        if badge_icon(ui, t, badge, 54.0) {
-                            open_badge(ctx, id, badge);
-                        }
-                    }
-                });
-            }
-        });
-        ui.add_space(12.0);
-    }
-
     /// Profile comments, with posting. Respects profiles that hide or turn
     /// off comments (Steam answers with the reason, which is shown).
     fn comments(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, id: SteamId, mine: bool) {
@@ -584,7 +677,8 @@ impl Profile {
             if data.items.is_empty() {
                 ui.label(w::text(t!("No comments yet."), 13.0, t.text_faint));
             }
-            for c in &data.items {
+            // At most a page, even if Steam sends more (e.g. after posting).
+            for c in data.items.iter().take(model::COMMENTS_PER_PAGE as usize) {
                 ui.separator();
                 ui.horizontal_top(|ui| {
                     let (av, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
@@ -617,11 +711,20 @@ impl Profile {
                                 });
                             }
                         });
-                        w::markup_label(ui, c.html.trim(), 13.5, t.text);
+                        match profile_style(ui) {
+                            ProfileStyle::Classic => {
+                                w::markup_label(ui, c.html.trim(), 13.5, t.text);
+                            }
+                            ProfileStyle::Steam(_) => {
+                                let url = ui::steam_text::show(ui, t, c.html.trim(), ui::steam_text::Mode::Markup, 13.5, t.text);
+                                showcases::follow(ctx, url);
+                            }
+                        }
                     });
                 });
             }
-            // Older and newer pages, 20 at a time (like Steam's comment pages).
+            // Older and newer pages, 6 at a time.
+            let per = model::COMMENTS_PER_PAGE;
             let start = self.comment_start.get(&id).copied().unwrap_or(0);
             if data.total as usize > data.items.len() {
                 ui.add_space(4.0);
@@ -629,15 +732,15 @@ impl Profile {
                     let mut go = None;
                     ui.add_enabled_ui(start > 0, |ui| {
                         if w::button(ui, t, Some(icons::CARET_LEFT), t!("Newer"), w::Kind::Ghost, w::Size::Sm).clicked() {
-                            go = Some(start.saturating_sub(20));
+                            go = Some(start.saturating_sub(per));
                         }
                     });
-                    let page = start / 20 + 1;
-                    let pages = data.total.div_ceil(20).max(1);
+                    let page = start / per + 1;
+                    let pages = data.total.div_ceil(per).max(1);
                     ui.label(w::text(t!("Page {page} of {pages}", page = page, pages = pages), 12.5, t.text_dim));
-                    ui.add_enabled_ui(start + 20 < data.total, |ui| {
+                    ui.add_enabled_ui(start + per < data.total, |ui| {
                         if w::button(ui, t, Some(icons::CARET_RIGHT), t!("Older"), w::Kind::Ghost, w::Size::Sm).clicked() {
-                            go = Some(start + 20);
+                            go = Some(start + per);
                         }
                     });
                     if let Some(s) = go {
@@ -645,87 +748,6 @@ impl Profile {
                         ctx.send(Command::LoadComments { steam_id: id, start: s });
                     }
                 });
-            }
-        });
-    }
-
-    /// A few items from the Steam inventory, like Steam's item showcase.
-    fn showcase(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, id: SteamId) {
-        if self.showcase_requested.insert(id) {
-            ctx.send(Command::LoadInventory { steam_id: id, app_id: 753, context_id: 6, language: i18n::language().steam_name().into() });
-        }
-        let Some(inv) = ctx.state.inventories.get(&(id, 753, 6)) else { return };
-        if inv.items.is_empty() || inv.error.is_some() {
-            return;
-        }
-        // Prefer backgrounds and emoticons, then anything colorful.
-        let mut items: Vec<&model::InventoryItem> = inv.items.iter().collect();
-        items.sort_by_key(|i| std::cmp::Reverse((i.kind.to_lowercase().contains("background") as u8, i.marketable as u8)));
-        panel(ui, t, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(w::text_bold(t!("Item showcase"), 17.0, t.text));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.link(w::text(t!("Open inventory"), 12.5, t.accent)).clicked() {
-                        ctx.navigate("inventory", Some(id.to_string()));
-                    }
-                });
-            });
-            ui.add_space(8.0);
-            let size = 84.0;
-            let cols = (((ui.available_width() + 8.0) / (size + 8.0)).floor() as usize).max(1);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                for item in items.iter().take(cols) {
-                    let (r, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
-                    ui.painter().rect_filled(r, t.corner_small(), t.raised);
-                    if !w::paint_contain(ui, r.shrink(6.0), &art::econ(&item.icon, 192), Align2::CENTER_CENTER) {
-                        w::skeleton(ui, t, r.shrink(6.0), CornerRadius::same(4));
-                    }
-                    if let Some(c) = crate::builtin::inventory::rarity_color(item) {
-                        let bar = Rect::from_min_max(pos2(r.left() + 8.0, r.bottom() - 5.0), pos2(r.right() - 8.0, r.bottom() - 2.5));
-                        ui.painter().rect_filled(bar, CornerRadius::same(2), c);
-                    }
-                    if resp.on_hover_text(format!("{}\n{}", item.name, item.kind)).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        ctx.navigate("inventory", Some(format!("{id}/753")));
-                    }
-                }
-            });
-        });
-    }
-
-    /// Most played games by total hours.
-    fn most_played(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, id: SteamId) {
-        let mut games: Vec<(model::AppId, String, u64)> = match ctx.state.player_games.get(&id) {
-            Some(Ok(g)) if !g.is_empty() => g.iter().map(|g| (g.app_id, g.name.clone(), g.playtime_minutes)).collect(),
-            _ if id == ctx.state.steam_id => ctx.local.games.iter().map(|g| (g.app_id, g.name.clone(), g.playtime_minutes.unwrap_or(0))).collect(),
-            _ => return,
-        };
-        games.retain(|g| g.2 > 0);
-        if games.is_empty() {
-            return;
-        }
-        games.sort_by_key(|g| std::cmp::Reverse(g.2));
-        let max = games[0].2.max(1) as f32;
-        panel(ui, t, |ui| {
-            ui.label(w::text_bold(t!("Most played"), 17.0, t.text));
-            ui.add_space(6.0);
-            for (app, name, minutes) in games.iter().take(6) {
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(68.0, 32.0), Sense::hover());
-                    w::image_or_skeleton(ui, t, r, &art::header(*app), CornerRadius::same(4));
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 3.0;
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Label::new(w::text_medium(name, 13.5, t.text)).truncate());
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(w::text(ui::playtime(*minutes), 12.5, t.text_dim));
-                            });
-                        });
-                        let width = ui.available_width();
-                        w::progress(ui, t, *minutes as f32 / max, width);
-                    });
-                });
-                ui.add_space(4.0);
             }
         });
     }
@@ -867,18 +889,166 @@ fn game_row(ui: &mut Ui, t: &Theme, ctx: &mut Ctx, g: &model::PlayerGame) {
     }
 }
 
+/// Steam's profile grid, in CSS pixels (= points): the page column, the
+/// gutters, the right column and the header's minimum height. The left
+/// column is what's left: 976 − 3 × 12 − 288 = 652.
+const PAGE_W: f32 = 976.0;
+const GUTTER: f32 = 12.0;
+const RIGHT_W: f32 = 288.0;
+const HEADER_H: f32 = 230.0;
+/// Space under the name and location before the summary (Steam's
+/// `.profile_header_centered_persona { padding-bottom: 18px }`).
+const PERSONA_PADDING_BOTTOM: f32 = 18.0;
+
+/// The border behind a profile picture without a frame, in Steam's status
+/// colors (dimmed, as its gradient border reads).
+fn avatar_border(t: &Theme, p: &model::Persona) -> Color32 {
+    crate::shell::status_color(t, p).gamma_multiply(0.55)
+}
+
+/// Frame-rate cap for animated avatars and avatar frames.
+const AVATAR_FPS: f32 = 24.0;
+
+/// Steam's summary (profilev2.css + InitProfileSummary): 13 px text on
+/// 18 px lines; shown whole when it's at most 76 px tall, otherwise cut to
+/// 57 px with "View more info".
+const SUMMARY_TEXT: f32 = 13.0;
+const SUMMARY_FITS: f32 = 76.0;
+const SUMMARY_CLIPPED: f32 = 57.0;
+
+/// The profile summary, cut to Steam's height. When it runs longer,
+/// "View more info" opens the whole of it in an "Info" dialog, like Steam.
+fn summary(ui: &mut Ui, t: &Theme, ctx: &mut Ctx, id: SteamId, text: &str) {
+    let open_id = egui::Id::unique(("aurora-profile-summary-open", id));
+    let top = ui.cursor().min;
+    let width = ui.available_width();
+    // Steam's 76 px / 57 px on its fixed 18 px lines are 4 and 3 lines. Our
+    // rows vary with the font and inline pictures, so lines are counted:
+    // the text's own lines, or (when it wraps) last frame's height in rows.
+    let height_id = egui::Id::unique(("aurora-profile-summary-height", id));
+    let measured = ui.ctx().data(|d| d.get_temp::<f32>(height_id)).unwrap_or(0.0);
+    let lines = ui::steam_text::line_count(&ui::steam_text::parse(text, ui::steam_text::Mode::Markup)).max(1);
+    let row = ui.text_style_height(&egui::TextStyle::Body).max(SUMMARY_TEXT * 1.35) + 2.0;
+    let rows = lines.max((measured / row).floor() as usize);
+    let long = rows > (SUMMARY_FITS / 18.0) as usize;
+    let per_line = if measured > 0.0 { measured / rows as f32 } else { row };
+    let shown_max = if long { per_line * (SUMMARY_CLIPPED / 18.0).round() + 1.0 } else { f32::INFINITY };
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(top, vec2(width, ui.available_height().max(1.0)))).layout(Layout::top_down(Align::Min)));
+    child.set_clip_rect(child.clip_rect().intersect(Rect::from_min_size(top, vec2(width, shown_max))));
+    let url = ui::steam_text::show(&mut child, t, text, ui::steam_text::Mode::Markup, SUMMARY_TEXT, t.text);
+    let full = child.min_rect().height();
+    ui.ctx().data_mut(|d| d.insert_temp(height_id, full));
+    ui.allocate_rect(Rect::from_min_size(top, vec2(width, full.min(shown_max))), Sense::hover());
+    showcases::follow(ctx, url);
+    if !long {
+        return;
+    }
+    ui.add_space(6.0);
+    let r = ui.add(egui::Label::new(w::text(t!("View more info"), 13.0, t.text_dim)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if r.clicked() {
+        ui.ctx().data_mut(|d| d.insert_temp(open_id, true));
+    }
+    if !ui.ctx().data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false) {
+        return;
+    }
+    let mut close = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let mut follow = None;
+    let modal = w::modal(ui.ctx(), egui::Id::unique(("aurora-profile-summary-modal", id))).show(ui.ctx(), |ui| {
+        ui.set_width(620.0);
+        ui.horizontal(|ui| {
+            ui.label(w::text_bold(t!("Info"), 20.0, t.text));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if w::icon_button(ui, t, icons::X, t!("Close"), false, 0).clicked() {
+                    close = true;
+                }
+            });
+        });
+        ui.add_space(10.0);
+        egui::ScrollArea::vertical().max_height(480.0).auto_shrink([false, true]).show(ui, |ui| {
+            follow = ui::steam_text::show(ui, t, text, ui::steam_text::Mode::Markup, 15.0, t.text);
+        });
+    });
+    if modal.should_close() {
+        close = true;
+    }
+    if follow.is_some() {
+        close = true;
+        showcases::follow(ctx, follow);
+    }
+    if close {
+        ui.ctx().data_mut(|d| d.remove::<bool>(open_id));
+    }
+}
+
+/// The layout and Steam theme used while drawing the profile.
+#[derive(Clone, Copy, Default)]
+enum ProfileStyle {
+    #[default]
+    Classic,
+    Steam(Option<themes::SteamTheme>),
+}
+
+fn profile_style_id() -> egui::Id {
+    egui::Id::unique("aurora-profile-style")
+}
+
+fn profile_style(ui: &Ui) -> ProfileStyle {
+    ui.ctx().data(|d| d.get_temp(profile_style_id()).unwrap_or_default())
+}
+
+/// The shown profile's Steam theme, if it has one.
+pub(super) fn profile_theme(ui: &Ui) -> Option<themes::SteamTheme> {
+    match profile_style(ui) {
+        ProfileStyle::Classic => None,
+        ProfileStyle::Steam(theme) => theme,
+    }
+}
+
+/// A section title: on a themed profile, on Steam's showcase header bar.
+pub(super) fn section_title(ui: &mut Ui, t: &Theme, title: &str) {
+    match profile_theme(ui) {
+        Some(theme) => {
+            // Steam's bar runs edge to edge across the panel's top, over its
+            // padding; it's always the panel's first item.
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+            let bar = Rect::from_min_max(pos2(r.left() - PANEL_PAD, r.top() - PANEL_PAD), pos2(r.right() + PANEL_PAD, r.bottom()));
+            w::gradient(ui.painter(), bar, theme.showcase_header_left, theme.showcase_header, true);
+            ui.painter().text(pos2(bar.left() + 10.0, bar.center().y), Align2::LEFT_CENTER, title, w::font(16.0), Color32::WHITE);
+            ui.add_space(PANEL_PAD);
+        }
+        None => {
+            ui.label(w::text_bold(title, 17.0, t.text));
+        }
+    }
+}
+
 /// Translucent panel so the profile background shows through.
 pub(super) fn panel(ui: &mut Ui, t: &Theme, add: impl FnOnce(&mut Ui)) {
+    // A themed profile's panels take its background color (a game profile
+    // may make them see-through, as Steam does).
+    // Steam's panels: square, 10 px padding, 12 px apart.
+    let style = profile_style(ui);
+    let (fill, stroke, radius) = match style {
+        ProfileStyle::Steam(Some(theme)) => (theme.panel_fill(), Stroke::NONE, CornerRadius::ZERO),
+        _ => (t.chrome.gamma_multiply(0.85), Stroke::new(1.0, t.border), t.corner()),
+    };
+    let padding = match style {
+        ProfileStyle::Classic => 18,
+        ProfileStyle::Steam(_) => PANEL_PAD as i8,
+    };
     egui::Frame::new()
-        .fill(t.chrome.gamma_multiply(0.85))
-        .stroke(Stroke::new(1.0, t.border))
-        .corner_radius(t.corner())
-        .inner_margin(Margin::same(18))
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(radius)
+        .inner_margin(Margin::same(padding))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
         });
 }
+
+/// Padding inside profile panels, as on Steam.
+const PANEL_PAD: f32 = 10.0;
 
 /// Steam-style level circle; color steps every 10 levels.
 fn level_badge(ui: &mut Ui, t: &Theme, level: u32) {
@@ -927,6 +1097,39 @@ fn badge_icon(ui: &mut Ui, t: &Theme, badge: &model::Badge, size: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use extensions::Extension;
+
+    #[test]
+    fn only_steam_layout_requests_steam_profile_page_and_showcases() {
+        let flags = super::super::settings::SharedFlags::default();
+        let mut profile = super::Profile::new(flags.clone());
+        let egui = egui::Context::default();
+        ui::install_fonts(&egui);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = client::Client::from_sender(tx);
+        let state = client::State { steam_id: 76561198000000000, ..Default::default() };
+        let local = local::LocalState::default();
+        let theme = ui::Theme::default();
+        let mut registry = extensions::Registry::default();
+        let mut actions = Vec::new();
+
+        for (steam_style, profile_arg) in [(false, None), (true, None), (false, Some("76561198000000001"))] {
+            flags.lock().unwrap().steam_profile_ui = steam_style;
+            profile.on_navigate("profile", profile_arg);
+            let mut ctx = extensions::Ctx::new(&state, &local, &theme, 1.0, &client, &mut registry, &mut actions);
+            let mut output = egui.run_ui(egui::RawInput::default(), |ui| profile.page("profile", ui, &mut ctx));
+            output.textures_delta.clear();
+            let mut page = false;
+            let mut showcases = false;
+            while let Ok(command) = rx.try_recv() {
+                match command {
+                    client::Command::LoadProfilePage { .. } => page = true,
+                    client::Command::LoadShowcases { .. } => showcases = true,
+                    _ => {}
+                }
+            }
+            assert_eq!((page, showcases), (steam_style, steam_style));
+        }
+    }
 
     #[test]
     fn badges_from_card_collections() {

@@ -9,7 +9,7 @@ license.workspace = true
 egui = { workspace = true, features = ["serde"] }
 serde.workspace = true
 i18n.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["gif"] }
 memmap2 = "0.9"
 # Renders the Aurora SVG into the window/tray icon (same resvg egui_extras uses).
 resvg = { version = "0.45", default-features = false }

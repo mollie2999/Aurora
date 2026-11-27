@@ -45,7 +45,7 @@ const CSS: &[(&str, [&str; 10])] = &[
 ];
 
 /// One theme's colors, as Steam uses them on a profile.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SteamTheme {
     pub right: Color32,
     pub left: Color32,
@@ -53,6 +53,54 @@ pub(crate) struct SteamTheme {
     pub background_right: Color32,
     pub background_left: Color32,
     pub swatch: Color32,
+    /// --color-showcase-header and --gradient-showcase-header-left.
+    pub showcase_header: Color32,
+    pub showcase_header_left: Color32,
+    /// --btn-background.
+    pub button: Color32,
+    /// A game profile's theme: its content area is a blur of the background,
+    /// so panels add only their own (often see-through) color on top.
+    pub frosted: bool,
+}
+
+/// Steam's CSS variable names, in the `CSS` table's order.
+const VARS: [&str; 10] = [
+    "--gradient-right",
+    "--gradient-left",
+    "--gradient-background",
+    "--gradient-background-right",
+    "--gradient-background-left",
+    "--color-showcase-header",
+    "--gradient-showcase-header-left",
+    "--btn-background",
+    "--btn-background-hover",
+    "--btn-outline",
+];
+
+/// A game profile's own colors (its `body.GameProfileTheme` rule), with
+/// Steam's default for any variable it leaves out.
+pub(crate) fn from_vars(vars: &[(String, String)]) -> Option<SteamTheme> {
+    if vars.is_empty() {
+        return None;
+    }
+    let default = CSS.iter().find(|(n, _)| *n == "Default")?.1;
+    let value = |i: usize| vars.iter().find(|(k, _)| k == VARS[i]).map(|(_, v)| v.as_str()).unwrap_or(default[i]);
+    Some(SteamTheme { frosted: true, ..build(|i| css_color(value(i)), Color32::BLACK) })
+}
+
+fn build(c: impl Fn(usize) -> Color32, swatch: Color32) -> SteamTheme {
+    SteamTheme {
+        right: c(0),
+        left: c(1),
+        background: c(2),
+        background_right: c(3),
+        background_left: c(4),
+        swatch,
+        showcase_header: c(5),
+        showcase_header_left: c(6),
+        button: c(7),
+        frosted: false,
+    }
 }
 
 const SWATCH: &[(&str, &str)] = &[
@@ -170,6 +218,29 @@ fn circle_mesh(center: egui::Pos2, radius: f32, base: Color32, glows: &[Glow]) -
 }
 
 impl SteamTheme {
+    /// A panel's fill. Game profiles often make `--gradient-background` fully
+    /// see-through, but Steam's panels still darken the background behind
+    /// them, so the theme color is laid over a translucent black.
+    pub(crate) fn panel_fill(&self) -> Color32 {
+        const MIN_ALPHA: u8 = 150;
+        // Over a game profile's blur only the theme's own color, no black box.
+        if self.frosted || self.background.a() >= MIN_ALPHA {
+            return self.background;
+        }
+        blend(Color32::from_black_alpha(MIN_ALPHA), self.background)
+    }
+
+    /// The page column behind header and panels (Steam paints the theme's
+    /// background there, a shade lighter than the panels sit on).
+    pub(crate) fn column_fill(&self) -> Color32 {
+        blend(Color32::from_black_alpha(90), self.background.gamma_multiply(0.55))
+    }
+
+    /// The tint over a game profile's frosted (blurred) content area.
+    pub(crate) fn frost_tint(&self) -> Color32 {
+        blend(Color32::from_black_alpha(60), self.background)
+    }
+
     fn picker_glows(&self, box_: egui::Rect, size: f32) -> ([Glow; 2], Color32) {
         let k = box_.width() / size;
         let at = |x: f32, y: f32| box_.min + egui::vec2(x, y) * k;
@@ -194,16 +265,8 @@ impl SteamTheme {
 pub(crate) fn get(id: &str) -> Option<SteamTheme> {
     let id = if id.is_empty() { "Default" } else { id.trim_end_matches("Theme") };
     let (_, v) = CSS.iter().find(|(name, _)| name.eq_ignore_ascii_case(id))?;
-    let c = |i: usize| css_color(v[i]);
     let swatch = SWATCH.iter().find(|(n, _)| n.eq_ignore_ascii_case(id)).map(|(_, h)| css_color(h)).unwrap_or(Color32::BLACK);
-    Some(SteamTheme {
-        right: c(0),
-        left: c(1),
-        background: c(2),
-        background_right: c(3),
-        background_left: c(4),
-        swatch,
-    })
+    Some(build(|i| css_color(v[i]), swatch))
 }
 
 pub(crate) fn name(id: &str, title: &str) -> String {
@@ -244,5 +307,16 @@ mod tests {
         assert!(super::get("Summer").is_some() && super::get("DarkModeTheme").is_some() && super::get("").is_some());
         assert!(super::get("NoSuchTheme").is_none());
         assert_eq!(super::name("GoldBurgundy", "#ProfileTheme_GoldBurgundy"), "Gold Burgundy");
+        // A game profile's own colors, with Steam's default for the rest.
+        let game = super::from_vars(&[("--color-showcase-header".into(), "rgb(120, 20, 40)".into()), ("--gradient-background".into(), "rgba(255, 255, 255, 0)".into())]).unwrap();
+        assert_eq!(game.showcase_header, Color32::from_rgb(120, 20, 40));
+        assert_eq!(game.background.a(), 0);
+        // …and sits on the blurred background, so its panels add no black box;
+        // other themes' panels never turn fully see-through.
+        assert!(game.frosted && game.panel_fill().a() == 0);
+        let clear = super::SteamTheme { background: Color32::TRANSPARENT, ..super::get("Summer").unwrap() };
+        assert!(clear.panel_fill().a() >= 150);
+        assert_eq!(game.button, Color32::from_rgb(43, 52, 68));
+        assert!(super::from_vars(&[]).is_none());
     }
 }

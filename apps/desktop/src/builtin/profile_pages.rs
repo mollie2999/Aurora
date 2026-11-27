@@ -27,7 +27,7 @@ impl Profile {
         panel(ui, t, |ui| match section {
             Section::Badges => self.badges_list(ui, t, ctx, id, name, mine),
             Section::Reviews => self.reviews_list(ui, t, ctx, id, name, mine),
-            Section::Groups => self.groups_list(ui, t, ctx, id, name, mine),
+            Section::Groups | Section::CommonGroups => self.groups_list(ui, t, ctx, id, name, mine),
             Section::Cards => self.card_set(ui, t, ctx, id),
             Section::Profile | Section::Games | Section::Edit => {}
         });
@@ -205,10 +205,13 @@ impl Profile {
         if self.lists_requested.insert((id, Section::Groups, 0)) {
             ctx.send(Command::LoadGroups { steam_id: id });
         }
-        let title = if mine { t!("Your groups").to_string() } else { t!("{name}'s groups", name = name) };
+        let common = self.section == Section::CommonGroups;
+        let title = if common { t!("Groups in Common").to_string() } else if mine { t!("Your groups").to_string() } else { t!("{name}'s groups", name = name) };
         ui.label(w::text_bold(title, 24.0, t.text));
-        let groups = match ctx.state.groups.get(&id).cloned() {
+        let data = if common { self.page_data(ctx, id).and_then(|p| p.ok()).and_then(|p| p.common_groups) } else { ctx.state.groups.get(&id).cloned() };
+        let groups = match data {
             None => return skeleton_rows(ui, t, 64.0),
+            Some(Err(e)) if common => { ui.label(w::text(t!("Could not load groups in common"), 14.0, t.text)); ui.label(w::text(&e, 12.5, t.text_dim)); return; }
             Some(Err(e)) => return hidden(ui, t, &e, t!("These groups are hidden")),
             Some(Ok(g)) => g,
         };

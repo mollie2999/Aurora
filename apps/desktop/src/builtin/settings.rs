@@ -104,6 +104,7 @@ pub struct AppFlags {
     pub fps_high_contrast: bool,
     /// Show the "What's new" news shelf on the library home.
     pub show_whats_new: bool,
+    pub steam_profile_ui: bool,
 }
 
 pub type SharedFlags = std::sync::Arc<std::sync::Mutex<AppFlags>>;
@@ -216,7 +217,7 @@ impl Extension for Settings {
                     Section::Family => self.acct.family(ui, &t, ctx),
                     Section::Security => security(ui, &t, ctx, &mut self.acct),
                     Section::Notifications => notifications(ui, &t, &self.flags),
-                    Section::Library => library(ui, &t, ctx),
+                    Section::Library => library(ui, &t, ctx, &self.flags),
                     Section::Downloads => downloads(ui, &t, ctx, &self.flags),
                     Section::Cloud => cloud(ui, &t, &self.flags),
                     Section::Accessibility => accessibility(ui, &t, ctx, &self.flags),
@@ -424,8 +425,17 @@ fn notifications(ui: &mut Ui, t: &Theme, flags: &SharedFlags) {
     *flags.lock().unwrap() = f;
 }
 
-fn library(ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+fn library(ui: &mut Ui, t: &Theme, ctx: &mut Ctx, flags: &SharedFlags) {
     w::page_title(ui, t, t!("Library"), None);
+    let mut steam_profile_ui = flags.lock().unwrap().steam_profile_ui;
+    switch(
+        ui,
+        t,
+        t!("Steam-style profile page"),
+        t!("Use the new Steam-style profile layout instead of Aurora's classic profile view."),
+        &mut steam_profile_ui,
+    );
+    flags.lock().unwrap().steam_profile_ui = steam_profile_ui;
     ctx.settings_for("library", ui);
     if info_row(ui, t, t!("Add a non-Steam game"), "", Some(t!("Open library"))) {
         ctx.navigate("library", None);

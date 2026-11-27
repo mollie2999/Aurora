@@ -303,7 +303,13 @@ impl BytesLoader for ImageCache {
                 }
             }
             match req.send().await {
-                Ok(resp) if !is_trusted_https_steam_cdn_url(resp.url()) && resp.remote_addr().is_some_and(|a| !is_public_ip(a.ip())) => {
+                Ok(resp) if resp.remote_addr().is_some_and(|a| {
+                    if is_trusted_https_steam_cdn_url(resp.url()) {
+                        !is_allowed_trusted_cdn_ip(a.ip())
+                    } else {
+                        !is_public_ip(a.ip())
+                    }
+                }) => {
                     if let Some(addr) = resp.remote_addr() {
                         tracing::warn!("image_cache: blocked response from non-public IP {addr} for {uri}");
                     }
@@ -546,6 +552,33 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+fn is_allowed_trusted_cdn_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, _, _, _] = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || a == 0
+        || a >= 240)
+}
+
+fn is_allowed_trusted_cdn_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_allowed_trusted_cdn_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                return is_allowed_trusted_cdn_ipv4(v4);
+            }
+            let segs = v6.segments();
+            (segs[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
 fn validate_parsed_image_url(url: &reqwest::Url) -> Result<(), String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err("unsupported image scheme".into());
@@ -601,7 +634,14 @@ fn resolve_trusted_cdn_addrs(host: &str) -> Result<Vec<std::net::SocketAddr>, St
         return resolve_public_addrs(host);
     }
     use std::net::ToSocketAddrs;
-    let out: Vec<std::net::SocketAddr> = (host, 0).to_socket_addrs().map_err(|e| e.to_string())?.collect();
+    let mut out = Vec::new();
+    for addr in (host, 0).to_socket_addrs().map_err(|e| e.to_string())? {
+        if !is_allowed_trusted_cdn_ip(addr.ip()) {
+            tracing::warn!("image_cache: blocked disallowed DNS resolution for trusted CDN {host} -> {}", addr.ip());
+            return Err("blocked disallowed DNS resolution".into());
+        }
+        out.push(addr);
+    }
     if out.is_empty() {
         return Err("DNS returned no addresses".into());
     }
@@ -642,7 +682,7 @@ impl reqwest::dns::Resolve for TrustedSteamCdnDnsResolver {
 
 fn is_trusted_steam_cdn_host(host: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
-    if h.is_empty() || h.starts_with('.') {
+    if h.is_empty() || h.starts_with('.') || h.contains("..") {
         return false;
     }
     matches!(
@@ -660,7 +700,9 @@ fn is_trusted_steam_cdn_host(host: &str) -> bool {
 }
 
 fn is_trusted_https_steam_cdn_url(url: &reqwest::Url) -> bool {
-    url.scheme() == "https" && url.host_str().is_some_and(is_trusted_steam_cdn_host)
+    url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.host_str().is_some_and(is_trusted_steam_cdn_host)
 }
 
 fn build_http_client() -> reqwest::Client {
@@ -850,6 +892,7 @@ mod tests {
     fn trusted_https_steam_cdn_classification() {
         for trusted in [
             "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/440/header.jpg",
+            "https://shared.fastly.steamstatic.com:443/store_item_assets/steam/apps/440/header.jpg",
             "https://avatars.fastly.steamstatic.com/abc_medium.jpg",
             "https://images.steamusercontent.com/ugc/1/shot.png",
             "https://steamuserimages-a.akamaihd.net/ugc/1/shot.png",
@@ -862,6 +905,7 @@ mod tests {
         }
         for untrusted in [
             "http://shared.fastly.steamstatic.com/header.jpg",
+            "https://shared.fastly.steamstatic.com:8443/header.jpg",
             "https://evil-steamstatic.com/header.jpg",
             "https://steamstatic.com.evil.com/header.jpg",
             "https://example.com/header.jpg",
@@ -872,6 +916,16 @@ mod tests {
             assert!(!is_trusted_https_steam_cdn_url(&url), "must not treat as trusted HTTPS Steam CDN: {untrusted}");
         }
         assert!(!is_trusted_steam_cdn_host(".steamstatic.com"));
+        assert!(!is_trusted_steam_cdn_host("foo..steamstatic.com"));
         assert!(!is_trusted_steam_cdn_host(""));
+
+        for allowed_ip in ["1.1.1.1", "198.18.0.1", "100.64.0.1", "10.0.0.1", "192.168.1.1", "fc00::1", "fd12::1"] {
+            let ip: std::net::IpAddr = allowed_ip.parse().unwrap();
+            assert!(is_allowed_trusted_cdn_ip(ip), "expected allowed trusted CDN IP: {allowed_ip}");
+        }
+        for blocked_ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1", "169.254.169.254", "fe80::1", "0.0.0.0", "::", "224.0.0.1", "255.255.255.255"] {
+            let ip: std::net::IpAddr = blocked_ip.parse().unwrap();
+            assert!(!is_allowed_trusted_cdn_ip(ip), "must reject disallowed trusted CDN IP: {blocked_ip}");
+        }
     }
 }

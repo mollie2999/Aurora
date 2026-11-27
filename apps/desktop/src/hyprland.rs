@@ -6,10 +6,30 @@ use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 const IPC_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_IPC_REPLY_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchSyntax {
+    Legacy = 0,
+    Lua = 1,
+}
+
+static DISPATCH_SYNTAX: AtomicU8 = AtomicU8::new(DispatchSyntax::Legacy as u8);
+
+fn load_dispatch_syntax() -> DispatchSyntax {
+    match DISPATCH_SYNTAX.load(Ordering::Relaxed) {
+        1 => DispatchSyntax::Lua,
+        _ => DispatchSyntax::Legacy,
+    }
+}
+
+fn store_dispatch_syntax(syntax: DispatchSyntax) {
+    DISPATCH_SYNTAX.store(syntax as u8, Ordering::Relaxed);
+}
 
 /// Currently focused Hyprland window metadata from `j/activewindow`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -479,41 +499,100 @@ pub fn workspace_selector(ws_id: i64, ws_name: &str) -> Option<String> {
     }
 }
 
+fn lua_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn is_lua_dispatch_error(reply: &str) -> bool {
+    reply.contains("dispatch in lua is a shorthand") || reply.contains("return hl.dispatch(")
+}
+
 /// Build the commands for preparing a window that can be focused over fullscreen.
-fn prepare_overlay_commands(p: &OverlayPlacement<'_>) -> Result<Vec<String>, String> {
+fn prepare_overlay_commands(
+    p: &OverlayPlacement<'_>,
+    syntax: DispatchSyntax,
+) -> Result<Vec<String>, String> {
     if !is_valid_address(p.overlay_addr) {
         return Err("invalid hyprland overlay window address".into());
     }
     let ws = workspace_selector(p.ws_id, p.ws_name)
         .ok_or_else(|| "invalid hyprland target workspace".to_string())?;
     let address = format!("address:{}", p.overlay_addr);
-    let mut commands = vec![
-        format!("dispatch setfloating {address}"),
-        format!("dispatch movetoworkspacesilent {ws},{address}"),
-    ];
+    let mut commands = match syntax {
+        DispatchSyntax::Legacy => vec![
+            format!("dispatch setfloating {address}"),
+            format!("dispatch movetoworkspacesilent {ws},{address}"),
+        ],
+        DispatchSyntax::Lua => {
+            let win = lua_string(&address);
+            let ws_lua = lua_string(&ws);
+            vec![
+                format!("dispatch hl.dsp.window.float({{ action = \"enable\", window = {win} }})"),
+                format!(
+                    "dispatch hl.dsp.window.move({{ workspace = {ws_lua}, follow = false, window = {win} }})"
+                ),
+            ]
+        }
+    };
     if let Some([x, y, w, h]) = p.monitor_geom {
         if w > 0 && h > 0 {
-            commands.push(format!(
-                "dispatch resizewindowpixel exact {w} {h},{address}"
-            ));
-            commands.push(format!("dispatch movewindowpixel exact {x} {y},{address}"));
+            match syntax {
+                DispatchSyntax::Legacy => {
+                    commands.push(format!(
+                        "dispatch resizewindowpixel exact {w} {h},{address}"
+                    ));
+                    commands.push(format!("dispatch movewindowpixel exact {x} {y},{address}"));
+                }
+                DispatchSyntax::Lua => {
+                    let win = lua_string(&address);
+                    commands.push(format!(
+                        "dispatch hl.dsp.window.resize({{ x = {w}, y = {h}, relative = false, window = {win} }})"
+                    ));
+                    commands.push(format!(
+                        "dispatch hl.dsp.window.move({{ x = {x}, y = {y}, relative = false, window = {win} }})"
+                    ));
+                }
+            }
         }
     }
     Ok(commands)
 }
 
-fn focus_command(addr: &str) -> Result<String, String> {
+fn focus_command(addr: &str, syntax: DispatchSyntax) -> Result<String, String> {
     if !is_valid_address(addr) {
         return Err("invalid hyprland window address".into());
     }
-    Ok(format!("dispatch focuswindow address:{addr}"))
+    let address = format!("address:{addr}");
+    Ok(match syntax {
+        DispatchSyntax::Legacy => format!("dispatch focuswindow {address}"),
+        DispatchSyntax::Lua => {
+            format!("dispatch hl.dsp.focus({{ window = {} }})", lua_string(&address))
+        }
+    })
 }
 
-fn raise_command(addr: &str) -> Result<String, String> {
+fn raise_command(addr: &str, syntax: DispatchSyntax) -> Result<String, String> {
     if !is_valid_address(addr) {
         return Err("invalid hyprland window address".into());
     }
-    Ok(format!("dispatch alterzorder top,address:{addr}"))
+    let address = format!("address:{addr}");
+    Ok(match syntax {
+        DispatchSyntax::Legacy => format!("dispatch alterzorder top,{address}"),
+        DispatchSyntax::Lua => format!(
+            "dispatch hl.dsp.window.alter_zorder({{ mode = \"top\", window = {} }})",
+            lua_string(&address)
+        ),
+    })
 }
 
 fn check_dispatch_ok(reply: &str, expected_replies: usize) -> Result<(), String> {
@@ -529,13 +608,46 @@ fn check_dispatch_ok(reply: &str, expected_replies: usize) -> Result<(), String>
     }
 }
 
+fn dispatch_batch_with_fallback(
+    syntax: &mut DispatchSyntax,
+    build: impl Fn(DispatchSyntax) -> Result<Vec<String>, String>,
+    query: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    let commands = build(*syntax)?;
+    let batch = format!("[[BATCH]]{}", commands.join(";"));
+    let reply = query(&batch)?;
+    if *syntax == DispatchSyntax::Legacy && is_lua_dispatch_error(&reply) {
+        *syntax = DispatchSyntax::Lua;
+        let lua_commands = build(DispatchSyntax::Lua)?;
+        let lua_batch = format!("[[BATCH]]{}", lua_commands.join(";"));
+        let lua_reply = query(&lua_batch)?;
+        return check_dispatch_ok(&lua_reply, lua_commands.len());
+    }
+    check_dispatch_ok(&reply, commands.len())
+}
+
+fn dispatch_one_with_fallback(
+    syntax: &mut DispatchSyntax,
+    build: impl Fn(DispatchSyntax) -> Result<String, String>,
+    query: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    let command = build(*syntax)?;
+    let reply = query(&command)?;
+    if *syntax == DispatchSyntax::Legacy && is_lua_dispatch_error(&reply) {
+        *syntax = DispatchSyntax::Lua;
+        let lua_command = build(DispatchSyntax::Lua)?;
+        let lua_reply = query(&lua_command)?;
+        return check_dispatch_ok(&lua_reply, 1);
+    }
+    check_dispatch_ok(&reply, 1)
+}
+
 fn place_overlay_with(
     p: &OverlayPlacement<'_>,
+    syntax: &mut DispatchSyntax,
     mut query: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<(), String> {
-    let commands = prepare_overlay_commands(p)?;
-    let batch = format!("[[BATCH]]{}", commands.join(";"));
-    check_dispatch_ok(&query(&batch)?, commands.len())?;
+    dispatch_batch_with_fallback(syntax, |s| prepare_overlay_commands(p, s), &mut query)?;
 
     // Focusing a floating window on a fullscreen workspace enables Hyprland's
     // above-fullscreen rendering and fade. Focusing a tiled window can transfer
@@ -553,25 +665,32 @@ fn place_overlay_with(
             "hyprland overlay is not a mapped floating window on the target workspace".into(),
         );
     }
-    check_dispatch_ok(&query(&focus_command(p.overlay_addr)?)?, 1)?;
-    check_dispatch_ok(&query(&raise_command(p.overlay_addr)?)?, 1)
+    dispatch_one_with_fallback(syntax, |s| focus_command(p.overlay_addr, s), &mut query)?;
+    dispatch_one_with_fallback(syntax, |s| raise_command(p.overlay_addr, s), &mut query)
 }
 
 /// Place Aurora's overlay above the game without changing the game's fullscreen mode.
 pub fn place_overlay_on_workspace(p: &OverlayPlacement<'_>) -> Result<(), String> {
-    place_overlay_with(p, ipc_query)
+    let mut syntax = load_dispatch_syntax();
+    let res = place_overlay_with(p, &mut syntax, ipc_query);
+    store_dispatch_syntax(syntax);
+    res
 }
 
 fn focus_game_with(
     game_addr: &str,
     overlay_addr: Option<&str>,
+    syntax: &mut DispatchSyntax,
     mut query: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<(), String> {
-    let focus = focus_command(game_addr)?;
-    let raise = overlay_addr.map(raise_command).transpose()?;
-    check_dispatch_ok(&query(&focus)?, 1)?;
-    if let Some(raise) = raise {
-        check_dispatch_ok(&query(&raise)?, 1)?;
+    // Validate both addresses up front before sending any IPC command.
+    let _ = focus_command(game_addr, *syntax)?;
+    if let Some(addr) = overlay_addr {
+        let _ = raise_command(addr, *syntax)?;
+    }
+    dispatch_one_with_fallback(syntax, |s| focus_command(game_addr, s), &mut query)?;
+    if let Some(addr) = overlay_addr {
+        dispatch_one_with_fallback(syntax, |s| raise_command(addr, s), &mut query)?;
     }
     Ok(())
 }
@@ -581,7 +700,10 @@ pub fn focus_game_keeping_overlay_top(
     game_addr: &str,
     overlay_addr: Option<&str>,
 ) -> Result<(), String> {
-    focus_game_with(game_addr, overlay_addr, ipc_query)
+    let mut syntax = load_dispatch_syntax();
+    let res = focus_game_with(game_addr, overlay_addr, &mut syntax, ipc_query);
+    store_dispatch_syntax(syntax);
+    res
 }
 
 #[cfg(test)]
@@ -806,7 +928,8 @@ mod tests {
     fn floating_overlay_raises_without_changing_game_fullscreen() {
         for mode in [0, 1, 2, 3] {
             let mut requests = Vec::new();
-            place_overlay_with(&placement(), |command| {
+            let mut syntax = DispatchSyntax::Legacy;
+            place_overlay_with(&placement(), &mut syntax, |command| {
                 requests.push(command.to_string());
                 Ok(match command {
                     "j/clients" => format!(
@@ -821,6 +944,7 @@ mod tests {
                 })
             })
             .unwrap();
+            assert_eq!(syntax, DispatchSyntax::Legacy);
             assert_eq!(
                 requests,
                 [
@@ -839,9 +963,66 @@ mod tests {
     }
 
     #[test]
+    fn lua_ipc_fallback_places_and_restores_focus() {
+        const LUA_ERR: &str = "error: 3 [string \"return hl.dispatch(setfloating address:0x123\"]:1: ')' expected near 'address'\n\n → Note: dispatch in lua is a shorthand for hl.dispatch(...), your syntax might need to be updated.";
+        let mut requests = Vec::new();
+        let mut syntax = DispatchSyntax::Legacy;
+        place_overlay_with(&placement(), &mut syntax, |command| {
+            requests.push(command.to_string());
+            Ok(if command == "j/clients" {
+                r#"[{"address":"0x123","mapped":true,"floating":true,"workspace":{"id":2}}]"#.into()
+            } else if command.contains("setfloating") {
+                LUA_ERR.into()
+            } else if command.starts_with("[[BATCH]]") {
+                PREPARE_OK.into()
+            } else {
+                "ok".into()
+            })
+        })
+        .unwrap();
+        assert_eq!(syntax, DispatchSyntax::Lua);
+        assert_eq!(
+            requests,
+            [
+                concat!(
+                    "[[BATCH]]dispatch setfloating address:0x123;",
+                    "dispatch movetoworkspacesilent 2,address:0x123;",
+                    "dispatch resizewindowpixel exact 1920 1080,address:0x123;",
+                    "dispatch movewindowpixel exact 1920 0,address:0x123"
+                ),
+                concat!(
+                    "[[BATCH]]dispatch hl.dsp.window.float({ action = \"enable\", window = \"address:0x123\" });",
+                    "dispatch hl.dsp.window.move({ workspace = \"2\", follow = false, window = \"address:0x123\" });",
+                    "dispatch hl.dsp.window.resize({ x = 1920, y = 1080, relative = false, window = \"address:0x123\" });",
+                    "dispatch hl.dsp.window.move({ x = 1920, y = 0, relative = false, window = \"address:0x123\" })"
+                ),
+                "j/clients",
+                "dispatch hl.dsp.focus({ window = \"address:0x123\" })",
+                "dispatch hl.dsp.window.alter_zorder({ mode = \"top\", window = \"address:0x123\" })",
+            ]
+        );
+
+        // Once switched to Lua, focus restore goes straight to Lua without retrying legacy.
+        let mut close_requests = Vec::new();
+        focus_game_with("0x456", Some("0x123"), &mut syntax, |command| {
+            close_requests.push(command.to_string());
+            Ok("ok".into())
+        })
+        .unwrap();
+        assert_eq!(
+            close_requests,
+            [
+                "dispatch hl.dsp.focus({ window = \"address:0x456\" })",
+                "dispatch hl.dsp.window.alter_zorder({ mode = \"top\", window = \"address:0x123\" })",
+            ]
+        );
+    }
+
+    #[test]
     fn placement_never_focuses_a_tiled_fullscreen_or_misplaced_overlay() {
         for (floating, fullscreen, workspace) in [(false, 0, 2), (true, 2, 2), (true, 0, 3)] {
-            let result = place_overlay_with(&placement(), |command| {
+            let mut syntax = DispatchSyntax::Legacy;
+            let result = place_overlay_with(&placement(), &mut syntax, |command| {
                 Ok(if command == "j/clients" {
                     format!(
                         r#"[{{"address":"0x123","mapped":true,"floating":{floating},
@@ -859,17 +1040,24 @@ mod tests {
     #[test]
     fn placement_rejects_invalid_input_and_incomplete_dispatches() {
         let mut p = placement();
+        let mut syntax = DispatchSyntax::Legacy;
         p.overlay_addr = "0x123;dispatch";
-        assert!(place_overlay_with(&p, |_| panic!("invalid address reached IPC")).is_err());
+        assert!(
+            place_overlay_with(&p, &mut syntax, |_| panic!("invalid address reached IPC")).is_err()
+        );
         p.overlay_addr = "0x123";
         p.ws_id = 0;
         p.ws_name = "ws[;dispatch";
-        assert!(place_overlay_with(&p, |_| panic!("invalid workspace reached IPC")).is_err());
+        assert!(
+            place_overlay_with(&p, &mut syntax, |_| panic!("invalid workspace reached IPC"))
+                .is_err()
+        );
         p.ws_id = -98;
         p.ws_name = "special:game";
         p.monitor_geom = None;
         for reply in ["", "ok", "ok\n\n\nWindow not found"] {
-            let result = place_overlay_with(&p, |command| {
+            let mut syntax = DispatchSyntax::Legacy;
+            let result = place_overlay_with(&p, &mut syntax, |command| {
                 assert_eq!(
                     command,
                     "[[BATCH]]dispatch setfloating address:0x123;dispatch movetoworkspacesilent special:game,address:0x123"
@@ -884,7 +1072,8 @@ mod tests {
     fn close_restores_game_focus_and_raises_pinned_overlay_when_present() {
         for overlay in [None, Some("0x123")] {
             let mut requests = Vec::new();
-            focus_game_with("0x456", overlay, |command| {
+            let mut syntax = DispatchSyntax::Legacy;
+            focus_game_with("0x456", overlay, &mut syntax, |command| {
                 requests.push(command.to_string());
                 Ok("ok".into())
             })
@@ -895,14 +1084,15 @@ mod tests {
             }
             assert_eq!(requests, expected);
         }
+        let mut syntax = DispatchSyntax::Legacy;
         assert!(
-            focus_game_with("0x456", Some("bad"), |_| panic!(
+            focus_game_with("0x456", Some("bad"), &mut syntax, |_| panic!(
                 "invalid address reached IPC"
             ))
             .is_err()
         );
         assert!(
-            focus_game_with("0x456", Some("0x123"), |command| {
+            focus_game_with("0x456", Some("0x123"), &mut syntax, |command| {
                 assert_eq!(command, "dispatch focuswindow address:0x456");
                 Ok("Window not found".into())
             })

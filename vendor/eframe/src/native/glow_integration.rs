@@ -1088,6 +1088,7 @@ impl GlowWinitRunning<'_> {
                 }
             }
 
+            let mut recreate_surface = false;
             {
                 // vsync - don't count as frame-time:
                 frame_timer.pause();
@@ -1103,8 +1104,27 @@ impl GlowWinitRunning<'_> {
                 // swap with interval 0 on Wayland (see `GlutinWindowContext::new`).
                 // egui-wgpu does the same. A no-op on other platforms.
                 window.pre_present_notify();
-                gl_surface.swap_buffers(context)?;
+                if let Err(err) = gl_surface.swap_buffers(context) {
+                    if err.error_kind() == glutin::error::ErrorKind::BadSurface {
+                        log::warn!(
+                            "swap_buffers returned BadSurface for viewport {viewport_id:?}; recreating surface: {err}"
+                        );
+                        recreate_surface = true;
+                    } else {
+                        return Err(err.into());
+                    }
+                }
                 frame_timer.resume();
+            }
+
+            if recreate_surface {
+                glutin.unbind_surface_before_drop(viewport_id, Some(&viewport_output));
+                if let Some(viewport) = glutin.viewports.get_mut(&viewport_id) {
+                    viewport.gl_surface = None;
+                }
+                if viewport_output.contains_key(&viewport_id) {
+                    integration.egui_ctx.request_repaint_of(viewport_id);
+                }
             }
 
             // give it time to settle:
@@ -2046,6 +2066,52 @@ impl GlutinWindowContext {
         self.gl_config.display().get_proc_address(addr)
     }
 
+    /// Unbind `dying` before its `gl_surface` / native Wayland window are dropped,
+    /// so `eglDestroySurface` is never deferred past `wl_surface_destroy`.
+    fn unbind_surface_before_drop(
+        &mut self,
+        dying: ViewportId,
+        keep: Option<&OrderedViewportIdMap<ViewportOutput>>,
+    ) {
+        if self.current_viewport != Some(dying) {
+            return;
+        }
+        self.current_viewport = None;
+
+        if let Some(context) = &self.current_gl_context {
+            let preferred = (dying != ViewportId::ROOT
+                && keep.is_none_or(|out| out.contains_key(&ViewportId::ROOT)))
+            .then_some(ViewportId::ROOT);
+            for id in preferred.into_iter().chain(
+                self.viewports
+                    .keys()
+                    .copied()
+                    .filter(|id| *id != dying && keep.is_none_or(|out| out.contains_key(id))),
+            ) {
+                if let Some(surface) = self
+                    .viewports
+                    .get(&id)
+                    .and_then(|vp| vp.gl_surface.as_ref())
+                    && context.make_current(surface).is_ok()
+                {
+                    self.current_viewport = Some(id);
+                    return;
+                }
+            }
+        }
+
+        if self.wayland_root.is_some() && self.bind_offscreen_context() {
+            return;
+        }
+
+        if let Some(current) = self.current_gl_context.take() {
+            match current.make_not_current() {
+                Ok(not_current) => self.not_current_gl_context = Some(not_current),
+                Err(err) => log::warn!("Failed to unbind GL context before dropping viewport: {err}"),
+            }
+        }
+    }
+
     pub(crate) fn remove_viewports_not_in(
         &mut self,
         viewport_output: &OrderedViewportIdMap<ViewportOutput>,
@@ -2053,8 +2119,7 @@ impl GlutinWindowContext {
         if let Some(current_viewport) = self.current_viewport
             && !viewport_output.contains_key(&current_viewport)
         {
-            // The context is still current, but on a surface we are about to drop.
-            self.current_viewport = None;
+            self.unbind_surface_before_drop(current_viewport, Some(viewport_output));
         }
 
         // GC old viewports
@@ -2226,9 +2291,9 @@ fn initialize_or_update_viewport<'a>(
                     ids.this,
                     viewport.builder.title
                 );
-                viewport.window = None;
-                viewport.egui_winit = None;
                 viewport.gl_surface = None;
+                viewport.egui_winit = None;
+                viewport.window = None;
                 if *current_viewport == Some(ids.this) {
                     *current_viewport = None;
                 }

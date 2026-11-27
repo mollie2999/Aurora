@@ -369,7 +369,14 @@ fn safe_manifest_child(dir: &std::path::Path, rel: &str) -> Option<std::path::Pa
     if rel.is_empty() {
         return None;
     }
-    let rel_path = std::path::Path::new(rel);
+    let normalized;
+    let rel_str = if cfg!(not(windows)) && rel.contains('\\') {
+        normalized = rel.replace('\\', "/");
+        normalized.as_str()
+    } else {
+        rel
+    };
+    let rel_path = std::path::Path::new(rel_str);
     if rel_path.is_absolute()
         || !rel_path.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
     {
@@ -380,9 +387,61 @@ fn safe_manifest_child(dir: &std::path::Path, rel: &str) -> Option<std::path::Pa
     canon_child.starts_with(&canon_dir).then_some(canon_child)
 }
 
+fn manifest_controller_rank(ctype: &str) -> usize {
+    match ctype.to_ascii_lowercase().as_str() {
+        "controller_xboxone" => 0,
+        "controller_xbox360" => 1,
+        "controller_xboxelite" => 2,
+        "controller_generic" => 3,
+        "controller_ps4" | "controller_ps5" => 4,
+        "controller_switch_pro" | "controller_switch_joycon_pair" => 5,
+        _ => 6,
+    }
+}
+
+fn collect_manifest_candidates(
+    dir: &std::path::Path,
+    cfg: &vdf::Obj,
+    candidates: &mut Vec<(usize, std::path::PathBuf)>,
+) {
+    for (key, v) in cfg.iter() {
+        if let Some(o) = v.as_obj() {
+            if let Some(rel) = o.str("path") {
+                let ctype = o.str("controller_type").unwrap_or(key);
+                if let Some(child) = safe_manifest_child(dir, rel) {
+                    candidates.push((manifest_controller_rank(ctype), child));
+                }
+            } else {
+                // Valve's documented `"Action Manifest"` -> `"configurations"` format nests
+                // numbered entries under each controller type:
+                // `"controller_xboxone" { "0" { "path" "xbox.vdf" } }`.
+                for (_, sub) in o.iter() {
+                    if let Some(so) = sub.as_obj() {
+                        if let Some(rel) = so.str("path")
+                            && let Some(child) = safe_manifest_child(dir, rel)
+                        {
+                            let ctype = so.str("controller_type").unwrap_or(key);
+                            candidates.push((manifest_controller_rank(ctype), child));
+                        }
+                    } else if let Some(rel) = sub.as_str()
+                        && let Some(child) = safe_manifest_child(dir, rel)
+                    {
+                        candidates.push((manifest_controller_rank(key), child));
+                    }
+                }
+            }
+        } else if let Some(rel) = v.as_str()
+            && let Some(child) = safe_manifest_child(dir, rel)
+        {
+            candidates.push((manifest_controller_rank(key), child));
+        }
+    }
+}
+
 /// Try to load an Xbox-compatible `controller_mappings` VDF referenced by a
 /// game's `SetInputActionManifestFilePath` (either directly or from its
-/// `configuration` / `default_bindings` entries in the same directory).
+/// `configurations` / `configuration` / `default_bindings` entries in the same
+/// directory).
 fn load_bindings_from_manifest(manifest_path: &str) -> Option<Bindings> {
     let path = std::path::Path::new(manifest_path);
     let text = read_bounded_text(path, MAX_MANIFEST_BYTES)?;
@@ -391,28 +450,14 @@ fn load_bindings_from_manifest(manifest_path: &str) -> Option<Bindings> {
     }
     let dir = path.parent()?;
     let doc = vdf::parse(&text).ok()?;
-    let root = doc.obj("In Game Actions").or_else(|| doc.obj("actions"))?;
+    let root = doc
+        .obj("Action Manifest")
+        .or_else(|| doc.obj("In Game Actions"))
+        .or_else(|| doc.obj("actions"))?;
     let mut candidates: Vec<(usize, std::path::PathBuf)> = Vec::new();
-    if let Some(cfg) = root.obj("configuration").or_else(|| root.obj("default_bindings")) {
-        for (_, v) in cfg.iter() {
-            if let Some(o) = v.as_obj() {
-                let ctype = o.str("controller_type").unwrap_or_default();
-                let rel = o.str("path").unwrap_or_default();
-                let Some(child) = safe_manifest_child(dir, rel) else { continue };
-                let rank = match ctype {
-                    "controller_xboxone" => 0,
-                    "controller_xbox360" => 1,
-                    "controller_xboxelite" => 2,
-                    "controller_generic" => 3,
-                    "controller_ps4" | "controller_ps5" => 4,
-                    _ => 5,
-                };
-                candidates.push((rank, child));
-            } else if let Some(rel) = v.as_str()
-                && let Some(child) = safe_manifest_child(dir, rel)
-            {
-                candidates.push((5, child));
-            }
+    for section in ["configurations", "configuration", "default_bindings"] {
+        if let Some(cfg) = root.obj(section) {
+            collect_manifest_candidates(dir, cfg, &mut candidates);
         }
     }
     candidates.sort_by_key(|(r, _)| *r);
@@ -952,6 +997,25 @@ mod tests {
     }
 
     #[test]
+    fn action_manifest_loads_numbered_controller_configurations() {
+        let dir = std::env::temp_dir().join(format!("aurora-action-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("switch.vdf"), CONFIG).unwrap();
+        let manifest = dir.join("steam_input_manifest.vdf");
+        std::fs::write(&manifest, r#""Action Manifest" {
+            "configurations" {
+                "controller_switch_pro" {
+                    "0" { "path" "missing.vdf" }
+                    "1" { "path" "switch.vdf" }
+                }
+            }
+        }"#).unwrap();
+        let bindings = load_bindings_from_manifest(manifest.to_str().unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(bindings.is_some_and(|b| !b.active("InGame", &[]).is_empty()));
+    }
+
+    #[test]
     fn manifest_path_loads_adjacent_xbox_bindings() {
         let dir = std::env::temp_dir().join(format!("aurora-input-manifest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -972,6 +1036,53 @@ mod tests {
         .unwrap();
         let loaded = load_bindings_from_manifest(manifest.to_str().unwrap()).expect("should load xbox.vdf from manifest");
         assert!(!loaded.presets.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn action_manifest_prefers_xbox_over_other_controllers_and_blocks_traversal() {
+        let dir = std::env::temp_dir().join(format!("aurora-action-manifest-rank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("configs")).unwrap();
+        let xbox_cfg = CONFIG.replace("InGame", "XboxSet");
+        let ps4_cfg = CONFIG.replace("InGame", "Ps4Set");
+        std::fs::write(dir.join("configs").join("xbox.vdf"), &xbox_cfg).unwrap();
+        std::fs::write(dir.join("ps4.vdf"), &ps4_cfg).unwrap();
+
+        let manifest = dir.join("steam_input_manifest.vdf");
+        std::fs::write(
+            &manifest,
+            r#""Action Manifest" {
+                "configurations" {
+                    "controller_ps4" {
+                        "0" { "path" "ps4.vdf" }
+                    }
+                    "controller_xboxone" {
+                        "0" { "path" "../escape.vdf" }
+                        "1" { "path" "configs\\xbox.vdf" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let bindings = load_bindings_from_manifest(manifest.to_str().unwrap()).expect("should load ranked xbox config");
+        assert!(bindings.presets.contains_key("XboxSet"));
+        assert!(!bindings.presets.contains_key("Ps4Set"));
+
+        // Traversal-only manifest must be rejected.
+        let bad_manifest = dir.join("bad_manifest.vdf");
+        std::fs::write(
+            &bad_manifest,
+            r#""Action Manifest" {
+                "configurations" {
+                    "controller_xboxone" {
+                        "0" { "path" "../escape.vdf" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(load_bindings_from_manifest(bad_manifest.to_str().unwrap()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

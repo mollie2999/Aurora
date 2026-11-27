@@ -3100,24 +3100,36 @@ impl Online {
                 let overlay: Option<(u16, String)> = None;
                 let needs_vpad = launch::needs_aurora_input_route(app_id, args.controller);
                 let ctrl_override = crate::pads::effective_controller_override(app_id, args.controller);
-                let include_xbox = ctrl_override == 1
-                    || crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
-                let vpad_started = if needs_vpad {
+                let families = crate::pads::settings().families;
+                let has_custom = crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+                let include_xbox = ctrl_override == 1 || has_custom;
+                let monitor_vpad = crate::pads::should_monitor_virtual_pads(ctrl_override, &families, has_custom);
+                let vpad_started = if needs_vpad || monitor_vpad {
                     if crate::pads::start_virtual_pads(include_xbox) {
                         self.vpad_users.insert(app_id, include_xbox);
-                        tracing::info!(
-                            "controllers: HeadlessHost launch for {} using {} virtual Xbox 360 pad",
-                            app.name,
-                            crate::pads::virtual_pad_backend()
-                        );
+                        if needs_vpad {
+                            tracing::info!(
+                                "controllers: HeadlessHost launch for {} using {} virtual Xbox 360 pad",
+                                app.name,
+                                crate::pads::virtual_pad_backend()
+                            );
+                        } else {
+                            tracing::info!(
+                                "controllers: HeadlessHost launch for {} monitoring hot-plug for {} virtual Xbox 360 pad",
+                                app.name,
+                                crate::pads::virtual_pad_backend()
+                            );
+                        }
                         true
                     } else {
-                        tracing::warn!(
-                            "controllers: HeadlessHost launch for {} needs controller translation, but {} is unavailable ({})",
-                            app.name,
-                            crate::pads::virtual_pad_backend(),
-                            crate::pads::virtual_pad_hint()
-                        );
+                        if needs_vpad {
+                            tracing::warn!(
+                                "controllers: HeadlessHost launch for {} needs controller translation, but {} is unavailable ({})",
+                                app.name,
+                                crate::pads::virtual_pad_backend(),
+                                crate::pads::virtual_pad_hint()
+                            );
+                        }
                         false
                     }
                 } else {
@@ -3159,11 +3171,13 @@ impl Online {
                     .flatten();
                 #[cfg(not(windows))]
                 let (vpad_started, vpad_include_xbox) = {
-                    let include_xbox = ctrl_override == 1
-                        || crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+                    let families = crate::pads::settings().families;
+                    let has_custom = crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+                    let include_xbox = ctrl_override == 1 || has_custom;
                     let ok = swapped.is_ok()
                         && input_decision.enabled
-                        && launch::needs_aurora_input_route(app_id, args.controller)
+                        && (launch::needs_aurora_input_route(app_id, args.controller)
+                            || crate::pads::should_monitor_virtual_pads(ctrl_override, &families, has_custom))
                         && crate::pads::start_virtual_pads(include_xbox);
                     (ok, include_xbox)
                 };

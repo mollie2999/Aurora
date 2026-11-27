@@ -193,6 +193,24 @@ pub fn resolve_steam_input(app_override: u8, global: &FamilyToggles) -> SteamInp
     }
 }
 
+/// Whether a launch that relies on OS virtual Xbox 360 pads (`HeadlessHost`, or
+/// Linux `uinput`) should arm virtual-pad monitoring so controllers plugged in
+/// (or first scanned) after launch are still translated. Virtual pads are only
+/// created for matching enabled controllers.
+pub fn should_monitor_virtual_pads(
+    app_override: u8,
+    families: &FamilyToggles,
+    has_custom_binding: bool,
+) -> bool {
+    if !resolve_steam_input(app_override, families).enabled {
+        return false;
+    }
+    app_override == 1
+        || has_custom_binding
+        || families.any_non_xbox()
+        || (cfg!(windows) && families.xbox)
+}
+
 /// Decide whether an SDL-detected controller should be published into Windows
 /// shared memory. Non-Xbox families are always published when enabled; Xbox-
 /// classified controllers backed by native XInput (no HID path) are skipped up
@@ -1446,7 +1464,13 @@ mod platform {
                     note: None,
                 };
             }
-            let interval = if game_active || virtual_on { 2 } else if pads.is_empty() { 100 } else { 12 };
+            let interval = if pads.is_empty() {
+                if game_active { 16 } else { 100 }
+            } else if game_active || virtual_on {
+                2
+            } else {
+                12
+            };
             std::thread::sleep(Duration::from_millis(interval));
         }
     }
@@ -2004,7 +2028,7 @@ mod platform {
                     note: None,
                 };
             }
-            let interval = if virtual_on { 2 } else if pads.is_empty() { 100 } else { 12 };
+            let interval = if pads.is_empty() { 100 } else if virtual_on { 2 } else { 12 };
             std::thread::sleep(Duration::from_millis(interval));
         }
     }
@@ -2726,6 +2750,27 @@ mod tests {
         };
         assert!(switch_pad.needs_translation(0, &all, false));
         assert!(!switch_pad.needs_translation(2, &all, true));
+    }
+
+    #[test]
+    fn virtual_pad_monitoring_arms_for_hotplug_when_steam_input_enabled() {
+        let all = FamilyToggles::default();
+        let none = FamilyToggles { xbox: false, playstation: false, switch_pro: false, generic: false };
+        let xbox_only = FamilyToggles { xbox: true, playstation: false, switch_pro: false, generic: false };
+        let switch_only = FamilyToggles { xbox: false, playstation: false, switch_pro: true, generic: false };
+
+        // Default families enabled -> monitor for hot-plug even before any pad is seen.
+        assert!(should_monitor_virtual_pads(0, &all, false));
+        assert!(should_monitor_virtual_pads(0, &switch_only, false));
+        // Per-game Disable or all families off -> never arm.
+        assert!(!should_monitor_virtual_pads(2, &all, true));
+        assert!(!should_monitor_virtual_pads(0, &none, false));
+        assert!(!should_monitor_virtual_pads(1, &none, true));
+        // Xbox-only with explicit Enable or custom binding -> arm on all platforms.
+        assert!(should_monitor_virtual_pads(1, &xbox_only, false));
+        assert!(should_monitor_virtual_pads(0, &xbox_only, true));
+        // Xbox-only with Default + Auto -> armed on Windows (for HID-path third-party Xbox pads), off on Linux.
+        assert_eq!(should_monitor_virtual_pads(0, &xbox_only, false), cfg!(windows));
     }
 
     #[cfg(not(windows))]

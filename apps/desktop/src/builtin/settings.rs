@@ -446,6 +446,57 @@ fn library(ui: &mut Ui, t: &Theme, ctx: &mut Ctx, flags: &SharedFlags) {
     }
     #[cfg(not(windows))]
     proton_version(ui, t);
+    #[cfg(target_os = "freebsd")]
+    freebsd_requirements_card(ui, t);
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_requirements_card(ui: &mut Ui, t: &Theme) {
+    let id = egui::Id::new("settings-freebsd-env-report");
+    let mut report: local::freebsd_env::Report = ui
+        .ctx()
+        .data_mut(|d| d.get_temp_mut_or_insert_with(id, local::freebsd_env::check).clone());
+
+    ui.add_space(12.0);
+    w::card(t).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(w::text_semibold(t!("FreeBSD dependencies & requirements"), 15.0, t.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if w::button(ui, t, None, t!("Recheck"), w::Kind::Secondary, w::Size::Sm).clicked() {
+                    report = local::freebsd_env::check();
+                    ui.ctx().data_mut(|d| d.insert_temp(id, report.clone()));
+                }
+                let all = report.all_commands();
+                if !all.is_empty()
+                    && w::button(ui, t, None, t!("Copy commands"), w::Kind::Secondary, w::Size::Sm).clicked()
+                {
+                    ui.ctx().copy_text(all);
+                }
+            });
+        });
+        ui.add_space(4.0);
+        if report.is_empty() {
+            ui.label(w::text(t!("All FreeBSD dependencies and kernel requirements are satisfied."), 12.5, t.play));
+        } else {
+            for issue in &report.issues {
+                ui.add_space(4.0);
+                ui.label(w::text_medium(&issue.title, 13.0, t.danger));
+                ui.add(egui::Label::new(w::text(&issue.detail, 12.0, t.text_dim)).wrap());
+                if !issue.commands.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(issue.commands.join("\n"))
+                                .font(egui::FontId::monospace(11.5))
+                                .color(t.text),
+                        )
+                        .selectable(true)
+                        .wrap(),
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Linux: pick which Proton Aurora runs Windows games with.

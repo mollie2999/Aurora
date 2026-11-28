@@ -8,6 +8,7 @@ pub mod manage;
 pub mod servers;
 
 pub mod compat;
+pub mod freebsd_env;
 pub mod steam_settings;
 
 use model::{AppId, InstallState, InstalledGame, LocalAccount};

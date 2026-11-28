@@ -1980,6 +1980,23 @@ fn apply_freebsd_runtime_env_with(cmd: &mut Command, runtime_dirs: &[PathBuf]) {
 }
 
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn apply_freebsd_mesa_env_with(cmd: &mut Command, dri_dirs: &[PathBuf], has_dri_device: bool) {
+    let existing_dri: Vec<&Path> = dri_dirs.iter().map(PathBuf::as_path).filter(|d| d.is_dir()).collect();
+    if !existing_dri.is_empty() {
+        let val = append_colon_paths(existing_cmd_env(cmd, "LIBGL_DRIVERS_PATH").as_deref(), &existing_dri);
+        if !val.is_empty() {
+            cmd.env("LIBGL_DRIVERS_PATH", val);
+        }
+    }
+    if !has_dri_device
+        && existing_cmd_env(cmd, "LIBGL_ALWAYS_SOFTWARE").is_none()
+        && std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none()
+    {
+        cmd.env("LIBGL_ALWAYS_SOFTWARE", "1");
+    }
+}
+
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
 fn freebsd_lsu_chroot_command(
     lsu_runner: &Path,
     runtime_dir: &Path,
@@ -2025,6 +2042,23 @@ fn apply_freebsd_runtime_env(cmd: &mut Command, install_dir: &Path) {
         tracing::debug!(count = dirs.len(), "augmenting LD_LIBRARY_PATH with Scout/Linuxulator paths on FreeBSD");
     }
     apply_freebsd_runtime_env_with(cmd, &dirs);
+
+    let emul_root = std::process::Command::new("/sbin/sysctl")
+        .args(["-nq", "compat.linux.emul_path"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/compat/linux"));
+    let dri_dirs = [
+        emul_root.join("usr/lib64/dri"),
+        emul_root.join("usr/lib/dri"),
+        emul_root.join("lib64/dri"),
+        emul_root.join("lib/dri"),
+    ];
+    let has_dri_device = Path::new("/dev/dri/card0").exists() || Path::new("/dev/dri/renderD128").exists();
+    apply_freebsd_mesa_env_with(cmd, &dri_dirs, has_dri_device);
 }
 
 #[cfg(target_os = "linux")]
@@ -2705,7 +2739,7 @@ fn setup_wine_client(wine: &Path, prefix: &Path, account_id: u32, dlls: [Option<
     let mut cmd = Command::new(wine);
     let filename = format!(r"Z:{}", reg.path().display().to_string().replace('/', r"\"));
     cmd.env("WINEPREFIX", prefix).args(["reg", "import", &filename]);
-    run_quietly(&mut cmd, Duration::from_secs(180)).map_err(|e| format!("Wine registry setup: {e}"))?;
+    run_with_diagnostics(&mut cmd, Duration::from_secs(180)).map_err(|e| format!("Wine registry setup: {e}"))?;
     std::fs::create_dir_all(&steam).map_err(|e| format!("create Wine Steam directory: {e}"))?;
     for (src, file) in clients {
         let mut staged = tempfile::NamedTempFile::new_in(&steam).map_err(|e| e.to_string())?;
@@ -2713,6 +2747,49 @@ fn setup_wine_client(wine: &Path, prefix: &Path, account_id: u32, dlls: [Option<
         staged.persist(steam.join(file)).map_err(|e| format!("install {file}: {e}"))?;
     }
     Ok(())
+}
+
+/// Run a helper to the end, capturing output to a temporary file so large
+/// stderr/stdout never blocks, and include the first diagnostic lines on error.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn run_with_diagnostics(cmd: &mut Command, limit: Duration) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::process::Stdio;
+    let Ok(mut log) = tempfile::tempfile() else {
+        return run_quietly(cmd, limit);
+    };
+    let stdout = log.try_clone().map(Stdio::from).unwrap_or_else(|_| Stdio::null());
+    let stderr = log.try_clone().map(Stdio::from).unwrap_or_else(|_| Stdio::null());
+    let mut child = cmd.stdin(Stdio::null()).stdout(stdout).stderr(stderr).spawn().map_err(|e| e.to_string())?;
+    let end = Instant::now() + limit;
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(s) if s.success() => return Ok(()),
+            Some(s) => {
+                let mut text = String::new();
+                let _ = log.seek(SeekFrom::Start(0));
+                let _ = log.take(2048).read_to_string(&mut text);
+                let snippet: String = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" — ");
+                return if snippet.is_empty() {
+                    Err(format!("exited with {s}"))
+                } else {
+                    Err(format!("exited with {s}: {snippet}"))
+                };
+            }
+            None if Instant::now() > end => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("still running after {}s, stopped", limit.as_secs()));
+            }
+            None => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
 }
 
 /// Run a helper to the end with its output dropped; killed after `limit`.

@@ -273,6 +273,9 @@ pub struct SteamApp {
     links: std::sync::mpsc::Receiver<crate::links::LinkRequest>,
     pub launch_popup: Option<crate::launch_popup::LaunchPopup>,
     anti_cheat_notices: VecDeque<AntiCheatNotice>,
+    /// FreeBSD: missing runtime dependencies / kernel requirements shown on startup.
+    freebsd_report: Option<local::freebsd_env::Report>,
+    freebsd_notice_dismissed: bool,
     /// Links waiting for sign-in to finish.
     pending_links: Vec<String>,
     /// Main window is hidden in the tray.
@@ -485,6 +488,14 @@ impl SteamApp {
             links: crate::links::listen(cc.egui_ctx.clone()),
             launch_popup: None,
             anti_cheat_notices: VecDeque::new(),
+            #[cfg(target_os = "freebsd")]
+            freebsd_report: {
+                let r = local::freebsd_env::check();
+                (!r.is_empty()).then_some(r)
+            },
+            #[cfg(not(target_os = "freebsd"))]
+            freebsd_report: None,
+            freebsd_notice_dismissed: false,
             pending_links: link.into_iter().collect(),
             hidden: false,
             tray_restore_retry_at: None,
@@ -1035,6 +1046,126 @@ impl SteamApp {
             } else {
                 Command::Launch { app_id, install_dir, args }
             });
+        }
+    }
+
+    fn freebsd_env_notice(&mut self, ctx: &egui::Context) {
+        use i18n::t;
+        use ui::{icons, widgets as w};
+
+        if self.freebsd_notice_dismissed {
+            return;
+        }
+        let Some(report) = self.freebsd_report.as_ref() else {
+            return;
+        };
+        if report.is_empty() {
+            self.freebsd_report = None;
+            return;
+        }
+        let theme = &self.prefs.theme;
+        let mut dismiss = false;
+        let mut recheck = false;
+        let mut copy_cmds: Option<String> = None;
+
+        let modal = w::modal(ctx, egui::Id::new("freebsd-env-notice")).show(ctx, |ui| {
+            ui.set_width(560.0);
+            ui.horizontal(|ui| {
+                ui.label(w::text(icons::WARNING, 26.0, theme.danger));
+                ui.label(w::text_bold(t!("FreeBSD setup required"), 20.0, theme.text));
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(w::text(
+                    t!("Some dependencies or FreeBSD system requirements are missing. Games may fail to launch until these are configured."),
+                    13.5,
+                    theme.text_dim,
+                ))
+                .wrap(),
+            );
+            ui.add_space(10.0);
+
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                let deps: Vec<_> = report.dependencies().collect();
+                let reqs: Vec<_> = report.requirements().collect();
+                for (heading, items) in [
+                    (t!("Missing dependencies"), deps),
+                    (t!("System requirements"), reqs),
+                ] {
+                    if items.is_empty() {
+                        continue;
+                    }
+                    ui.label(w::text_semibold(heading, 14.5, theme.text));
+                    ui.add_space(4.0);
+                    for issue in items {
+                        w::card(theme).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(w::text_semibold(&issue.title, 13.5, theme.text));
+                            ui.add(egui::Label::new(w::text(&issue.detail, 12.5, theme.text_dim)).wrap());
+                            if !issue.commands.is_empty() {
+                                ui.add_space(4.0);
+                                let block = issue.commands.join("\n");
+                                egui::Frame::NONE
+                                    .fill(theme.bg)
+                                    .corner_radius(4.0)
+                                    .inner_margin(egui::Margin::symmetric(8, 6))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(block)
+                                                    .font(egui::FontId::monospace(12.0))
+                                                    .color(theme.text),
+                                            )
+                                            .selectable(true)
+                                            .wrap(),
+                                        );
+                                    });
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if w::button(ui, theme, None, t!("Dismiss"), w::Kind::Secondary, w::Size::Md).clicked() {
+                    dismiss = true;
+                }
+                if w::button(ui, theme, None, t!("Recheck"), w::Kind::Secondary, w::Size::Md).clicked() {
+                    recheck = true;
+                }
+                let all = report.all_commands();
+                if !all.is_empty()
+                    && w::button(ui, theme, None, t!("Copy commands"), w::Kind::Primary, w::Size::Md).clicked()
+                {
+                    copy_cmds = Some(all);
+                }
+            });
+        });
+
+        if let Some(text) = copy_cmds {
+            ctx.copy_text(text);
+            let now = ctx.input(|i| i.time);
+            self.toast(now, t!("Copied to clipboard"), "");
+        }
+        if recheck {
+            #[cfg(target_os = "freebsd")]
+            {
+                let fresh = local::freebsd_env::check();
+                if fresh.is_empty() {
+                    self.freebsd_report = None;
+                    let now = ctx.input(|i| i.time);
+                    self.toast(now, t!("All FreeBSD requirements satisfied"), "");
+                } else {
+                    self.freebsd_report = Some(fresh);
+                }
+            }
+        }
+        if dismiss || modal.should_close() {
+            self.freebsd_notice_dismissed = true;
         }
     }
 
@@ -1677,6 +1808,7 @@ impl eframe::App for SteamApp {
         if signed_in {
             self.registry.with_ext::<crate::builtin::library::Library, _>("library", env, |lib, cx| lib.background_dialogs(ui, cx));
             self.anti_cheat_notice(&ctx);
+            self.freebsd_env_notice(&ctx);
         }
         let env = Env {
             state: &self.state, local: &self.local, theme: &self.prefs.theme,

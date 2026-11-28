@@ -42,7 +42,7 @@ pub fn tool_root() -> Option<PathBuf> {
 }
 
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
-fn discover_wine(port_root: &Path, path: &[PathBuf]) -> Vec<CompatTool> {
+pub(crate) fn discover_wine(port_root: &Path, path: &[PathBuf]) -> Vec<CompatTool> {
     use std::os::unix::fs::PermissionsExt;
     let mut tools = Vec::new();
     for (name, display) in [("wine-proton", "Wine Proton"), ("wine", "Wine"), ("wine-devel", "Wine Development")] {

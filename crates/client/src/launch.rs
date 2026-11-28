@@ -40,28 +40,37 @@ pub(crate) fn mode_for_launch(app: &OwnedApp, install_dir: &Path, controller: u8
 
 pub(crate) fn mode_with_host(app: &OwnedApp, install_dir: &Path, controller: u8, host_ready: bool) -> LaunchMode {
     #[cfg(not(windows))]
-    let _ = controller;
-    #[cfg(not(windows))]
     let force_official = prefer_official();
     #[cfg(windows)]
     let force_official = false;
 
     let executable = launch_exe(app, install_dir).filter(|path| path.is_file());
     let use_host = host_ready && !force_official && executable.is_some();
+    let ac = anti_cheat(app, install_dir);
     if !use_host {
-        if let Some(ac) = anti_cheat(app, install_dir) {
+        if let Some(ac) = ac {
             return LaunchMode::OfficialSteam { anti_cheat: ac };
         }
     }
     let steam_drm = steam_drm_marked(app.app_id) || executable.is_some_and(|exe| has_steam_drm(&exe));
     if use_host {
-        #[cfg(windows)]
-        if steam_drm {
-            // The headless host has no Steam Input frontend. Let Steam
-            // start DRM games that need its controller configuration.
-            let input = crate::pads::effective_controller_override(app.app_id, controller);
-            if crate::pads::needs_steam_input_client(input) && steam_exe().is_some() {
-                return LaunchMode::OfficialSteam { anti_cheat: STEAM_DRM.into() };
+        // Demand-driven hybrid routing (without OfficialSteam):
+        // Keep HeadlessHost as default when no controller translation/custom
+        // layout is needed, or whenever Steam DRM or anti-cheat requires Valve's
+        // engine (those launches use our external OS virtual gamepad instead).
+        // For non-DRM, non-anti-cheat Windows/Proton games that actively need
+        // Steam Input translation or custom bindings, route to Aurora's
+        // steamclient so ISteamInput + layouts + XInput SHM run natively.
+        if !steam_drm && ac.is_none() && needs_aurora_input_route(app.app_id, controller) {
+            #[cfg(windows)]
+            if windows_mode(app, install_dir) == LaunchMode::Aurora {
+                return LaunchMode::Aurora;
+            }
+            #[cfg(not(windows))]
+            if let Ok(p) = linux::plan(app, install_dir)
+                && linux::client_dll(&p, install_dir).is_some()
+            {
+                return LaunchMode::Aurora;
             }
         }
         return LaunchMode::HeadlessHost { steam_drm };
@@ -82,6 +91,16 @@ pub(crate) fn mode_with_host(app: &OwnedApp, install_dir: &Path, controller: u8,
     }
     #[cfg(windows)]
     return windows_mode(app, install_dir);
+}
+
+/// Whether this launch actively needs controller translation / Steam Input
+/// (non-Xbox enabled pad connected, custom layout chosen, or per-game Enable).
+pub(crate) fn needs_aurora_input_route(app_id: AppId, controller: u8) -> bool {
+    let eff = crate::pads::effective_controller_override(app_id, controller);
+    let families = crate::pads::settings().families;
+    let has_custom = crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+    let summary = crate::pads::connected_summary();
+    summary.needs_translation(eff, &families, has_custom)
 }
 
 /// Windows: our steamclient DLL when it can serve the game.
@@ -449,10 +468,45 @@ pub(crate) fn steam_input_env_vars(
     env
 }
 
+/// Pass Aurora's SDL3 controller mappings (`SDL_GAMECONTROLLERCONFIG`) and,
+/// when an external OS virtual Xbox 360 pad is translating non-Xbox controllers,
+/// suppress raw physical non-Xbox VID:PIDs in SDL games (`SDL_GAMECONTROLLER_IGNORE_DEVICES`)
+/// to prevent double input without any DLL injection.
+fn apply_sdl_controller_env(cmd: &mut Command, ignore_translated_physical: bool) {
+    let summary = crate::pads::connected_summary();
+    if !summary.sdl_mappings.is_empty() {
+        let mut lines: Vec<String> = std::env::var("SDL_GAMECONTROLLERCONFIG")
+            .ok()
+            .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+            .unwrap_or_default();
+        for m in &summary.sdl_mappings {
+            if !lines.iter().any(|existing| existing == m) {
+                lines.push(m.clone());
+            }
+        }
+        cmd.env("SDL_GAMECONTROLLERCONFIG", lines.join("\n"));
+    }
+    if ignore_translated_physical && !summary.non_xbox_vid_pids.is_empty() {
+        let mut entries: Vec<String> = std::env::var("SDL_GAMECONTROLLER_IGNORE_DEVICES")
+            .ok()
+            .map(|s| s.split(',').map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+            .unwrap_or_default();
+        for (vid, pid) in &summary.non_xbox_vid_pids {
+            let item = format!("0x{vid:04X}/0x{pid:04X}");
+            if !entries.iter().any(|e| e.eq_ignore_ascii_case(&item)) {
+                entries.push(item);
+            }
+        }
+        if !entries.is_empty() {
+            cmd.env("SDL_GAMECONTROLLER_IGNORE_DEVICES", entries.join(","));
+        }
+    }
+}
+
 /// Start a game with our steamclient: environment like a Steam launch, plus
 /// the pipe and token for the DLL. The registry swap must be in place.
 /// `pads` names the shared memory with the controllers XInput can't see.
-pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchArgs, ipc_env: &str, account: &str, pads: Option<&str>, overlay: Option<(u16, &str)>) -> Result<Child, String> {
+pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchArgs, ipc_env: &str, account: &str, pads: Option<&str>, overlay: Option<(u16, &str)>, ignore_physical_pads: bool) -> Result<Child, String> {
     let connect = safe_connect_args(&args.connect)?;
     let opts = UserOptions::parse(&args.user);
     let mut cmd = command(app, install_dir, &opts, &connect)?;
@@ -495,6 +549,7 @@ pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchA
         }
     }
     let mut cmd = finish(app, install_dir, &opts, cmd);
+    apply_sdl_controller_env(&mut cmd, ignore_physical_pads);
     #[cfg(target_os = "linux")]
     apply_vk_overlay_env(&mut cmd, overlay, overlay_on);
     #[cfg(not(target_os = "linux"))]
@@ -1415,9 +1470,10 @@ pub fn run_through_host(
     token: &str,
     steam_id: u64,
     overlay: Option<(u16, &str)>,
+    ignore_physical_pads: bool,
     started: impl FnOnce(),
 ) -> Result<(), String> {
-    run_through_host_cancellable(app, install_dir, args, account, token, steam_id, overlay, None, started)
+    run_through_host_cancellable(app, install_dir, args, account, token, steam_id, overlay, ignore_physical_pads, None, started)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1429,6 +1485,7 @@ pub(crate) fn run_through_host_cancellable(
     token: &str,
     steam_id: u64,
     overlay: Option<(u16, &str)>,
+    ignore_physical_pads: bool,
     stop: Option<&std::sync::atomic::AtomicBool>,
     started: impl FnOnce(),
 ) -> Result<(), String> {
@@ -1534,7 +1591,7 @@ pub(crate) fn run_through_host_cancellable(
         Some(mask) => tracing::info!("controllers: headless launch, native XInput slot mask {mask:#06b} (bit 0 = player 1)"),
         None => tracing::warn!("controllers: headless launch, XInputGetState unavailable"),
     }
-    let game = spawn_for_host(app, install_dir, &args.user, &connect, account, overlay);
+    let game = spawn_for_host(app, install_dir, &args.user, &connect, account, overlay, ignore_physical_pads);
     let child = match game {
         Ok(c) => c,
         Err(e) => {
@@ -1579,6 +1636,7 @@ fn spawn_for_host(
     connect: &[String],
     account: &str,
     overlay: Option<(u16, &str)>,
+    ignore_physical_pads: bool,
 ) -> Result<Child, String> {
     let opts = UserOptions::parse(user_args);
     let mut cmd = command(app, install_dir, &opts, connect)?;
@@ -1589,6 +1647,7 @@ fn spawn_for_host(
         .env("SteamAppUser", account)
         .env("SteamUser", account);
     let mut cmd = finish(app, install_dir, &opts, cmd);
+    apply_sdl_controller_env(&mut cmd, ignore_physical_pads);
     #[cfg(target_os = "linux")]
     {
         apply_vk_overlay_env(&mut cmd, overlay, app_overlay_enabled(app.app_id));
@@ -3363,14 +3422,14 @@ mod tests {
             launch: vec![model::LaunchOption { executable: "game.exe".into(), os_list: "windows".into(), arguments: String::new(), working_dir: String::new(), description: String::new() }],
             ..Default::default()
         };
-        let steam = LaunchMode::OfficialSteam { anti_cheat: STEAM_DRM.into() };
-        assert_eq!(mode(&app, &dir), if connected { steam.clone() } else { LaunchMode::HeadlessHost { steam_drm: true } });
-        assert_eq!(mode_for_launch(&app, &dir, 1), steam);
+        assert_eq!(mode(&app, &dir), LaunchMode::HeadlessHost { steam_drm: true });
+        assert_eq!(mode_for_launch(&app, &dir, 1), LaunchMode::HeadlessHost { steam_drm: true });
         assert_eq!(mode_for_launch(&app, &dir, 2), LaunchMode::HeadlessHost { steam_drm: true });
         crate::pads::set_app_controller(app.app_id, 1);
-        assert_eq!(mode(&app, &dir), steam);
+        assert_eq!(mode(&app, &dir), LaunchMode::HeadlessHost { steam_drm: true });
         assert_eq!(mode_for_launch(&app, &dir, 2), LaunchMode::HeadlessHost { steam_drm: true });
         crate::pads::set_app_controller(app.app_id, 0);
+        let _ = connected;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3725,9 +3784,9 @@ mod tests {
         ] {
             let args = LaunchArgs { user: "-novid".into(), connect: payload.clone(), controller: 0 };
             assert!(spawn(&test_app, &dir, &args, None).is_err(), "spawn must fail closed for {payload}");
-            assert!(spawn_with_steamclient(&test_app, &dir, &args, "127.0.0.1:1:tok", "acct", None, None).is_err());
+            assert!(spawn_with_steamclient(&test_app, &dir, &args, "127.0.0.1:1:tok", "acct", None, None, false).is_err());
             assert!(run_through_steam(480, &args, 1, false, || {}).unwrap_err().contains("refusing launch"));
-            assert!(run_through_host(&test_app, &dir, &args, "acct", "tok", 1, None, || {}).unwrap_err().contains("refusing launch"));
+            assert!(run_through_host(&test_app, &dir, &args, "acct", "tok", 1, None, false, || {}).unwrap_err().contains("refusing launch"));
             assert!(!pwned.exists(), "evil wrapper executed!");
             assert!(!out.exists(), "game started despite unsafe connect!");
         }

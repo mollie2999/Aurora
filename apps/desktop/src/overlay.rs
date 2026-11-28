@@ -227,13 +227,13 @@ impl Overlay {
     }
 
     pub fn set_controller_route(&mut self, app_id: AppId, enabled: bool) {
-        if self.game.is_some_and(|(id, _)| id == app_id) {
+        if self.game.is_none() || self.game.is_some_and(|(id, _)| id == app_id) {
             self.controller_route_enabled = Some(enabled);
         }
     }
 
     pub fn set_controller_applied(&mut self, app_id: AppId, source: String) {
-        if self.game.is_some_and(|(id, _)| id == app_id) {
+        if self.game.is_none() || self.game.is_some_and(|(id, _)| id == app_id) {
             self.controller_applied_source = Some(source);
         }
     }
@@ -243,6 +243,7 @@ impl Overlay {
     /// and the overlay never pops up over other apps.
     pub fn game_started(&mut self, app_id: AppId, enabled: bool) {
         self.flush_notes();
+        let same_app = self.game.is_some_and(|(id, _)| id == app_id);
         self.game = Some((app_id, Instant::now()));
         self.asked = false;
         self.enabled = enabled;
@@ -264,8 +265,10 @@ impl Overlay {
         self.notes_app = Some(app_id);
         self.notes_dirty = None;
         self.notes = std::fs::read_to_string(notes_path(app_id)).unwrap_or_default();
-        self.controller_route_enabled = None;
-        self.controller_applied_source = None;
+        if !same_app {
+            // Preserve a ControllerLayoutRoute event that arrived right before GameStarted.
+            self.controller_applied_source = None;
+        }
     }
 
     /// Register Shift+Tab only while the game is the focused window (or the

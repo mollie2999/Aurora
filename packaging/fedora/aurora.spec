@@ -26,6 +26,9 @@ and chat, and game launching with Steam features.
 %install
 install -d "%{buildroot}/opt/aurora" "%{buildroot}%{_bindir}"
 install -pm755 aurora steamhost libVkLayer_aurora_overlay.so libaurora_htmlsurface.so "%{buildroot}/opt/aurora/"
+if [ -f libSDL3.so.0 ]; then
+    install -pm755 libSDL3.so.0 "%{buildroot}/opt/aurora/"
+fi
 for dll in steamclient64.dll steamclient32.dll; do
     if [ -f "$dll" ]; then
         install -pm644 "$dll" "%{buildroot}/opt/aurora/"

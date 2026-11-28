@@ -161,6 +161,12 @@ impl ControllerPage {
                 if !snapshot.backend.is_empty() {
                     w::pill(ui, snapshot.backend, t.text_dim, t.raised);
                 }
+                let vpad_name = client::virtual_pad_backend();
+                if client::virtual_pad_available() {
+                    w::pill(ui, &format!("{vpad_name} virtual pad"), t.play, t.play.gamma_multiply(0.14));
+                } else if vpad_name != "unsupported" {
+                    w::pill(ui, &format!("{vpad_name} unavailable"), t.away, t.away.gamma_multiply(0.14));
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if w::button(ui, t, Some(icons::REFRESH), t!("Refresh"), w::Kind::Secondary, w::Size::Sm).clicked() {
                         client::refresh_controllers();

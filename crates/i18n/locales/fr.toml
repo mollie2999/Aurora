@@ -2535,6 +2535,12 @@
 "Wallet balance" = "Solde du porte-monnaie"
 "{n} files in the cloud" = "{n} fichiers dans le cloud"
 "Saving…" = "Enregistrement…"
+"Adjust" = "Ajuster"
+"Button hints" = "Indications des boutons"
+"Detected" = "Détecté"
+"Not detected" = "Non détecté"
+"Switch section" = "Changer de section"
+"Touchscreen" = "Écran tactile"
 # Steam Family: shared copy and preferred copy
 "Steam Family details are unavailable." = "Les détails de la famille Steam sont indisponibles."
 "Some DLC details are unavailable." = "Certains détails sur les DLC sont indisponibles."
@@ -2687,3 +2693,5 @@
 "Smooth scrolling" = "Défilement fluide"
 "Glide each mouse wheel step over a few frames. Off: the page jumps the whole step at once." = "Fait glisser chaque cran de la molette sur quelques images. Désactivé : la page saute tout le cran d'un coup."
 "Sort by recent activity" = "Trier par activité récente"
+"Keyboard touchpad haptics" = "Retour haptique des pavés tactiles du clavier"
+"Subtle vibration when moving across on-screen keyboard keys with touchpads." = "Légère vibration lors du passage sur les touches du clavier virtuel avec les pavés tactiles."

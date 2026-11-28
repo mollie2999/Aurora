@@ -544,6 +544,8 @@ struct Online {
     launch_layouts: HashMap<AppId, std::sync::Arc<tokio::sync::Mutex<crate::input_config::LaunchLayout>>>,
     /// Games we read non-Xbox controllers for (see pads.rs).
     pad_users: HashSet<AppId>,
+    /// Games backed by OS virtual Xbox 360 pads (`app_id -> include_xbox`).
+    vpad_users: HashMap<AppId, bool>,
     /// Games the official Steam client runs (anti-cheat), by install folder.
     official: HashMap<AppId, std::path::PathBuf>,
     /// Games stopped because their Steam DRM refused our steamclient: Play
@@ -679,6 +681,7 @@ async fn online(
         launch_tokens: HashMap::new(),
         launch_layouts: HashMap::new(),
         pad_users: HashSet::new(),
+        vpad_users: HashMap::new(),
         official: HashMap::new(),
         drm_relaunch: Default::default(),
         country: String::new(),
@@ -1872,6 +1875,9 @@ async fn online(
                 st.official.remove(&app_id);
                 if st.pad_users.remove(&app_id) {
                     crate::pads::stop();
+                }
+                if let Some(include_xbox) = st.vpad_users.remove(&app_id) {
+                    crate::pads::stop_virtual_pads(include_xbox);
                 }
                 if let Some(token) = st.launch_tokens.remove(&app_id) {
                     launch::swap_exited(&token);
@@ -3206,11 +3212,37 @@ impl Online {
                 };
                 #[cfg(windows)]
                 let overlay: Option<(u16, String)> = None;
+                let needs_vpad = launch::needs_aurora_input_route(app_id, args.controller);
+                let ctrl_override = crate::pads::effective_controller_override(app_id, args.controller);
+                let include_xbox = ctrl_override == 1
+                    || crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+                let vpad_started = if needs_vpad {
+                    if crate::pads::start_virtual_pads(include_xbox) {
+                        self.vpad_users.insert(app_id, include_xbox);
+                        tracing::info!(
+                            "controllers: HeadlessHost launch for {} using {} virtual Xbox 360 pad",
+                            app.name,
+                            crate::pads::virtual_pad_backend()
+                        );
+                        true
+                    } else {
+                        tracing::warn!(
+                            "controllers: HeadlessHost launch for {} needs controller translation, but {} is unavailable ({})",
+                            app.name,
+                            crate::pads::virtual_pad_backend(),
+                            crate::pads::virtual_pad_hint()
+                        );
+                        false
+                    }
+                } else {
+                    false
+                };
+                sink(Event::ControllerLayoutRoute { app_id, enabled: false });
                 let (tx, sink, args, dir2) = (exit_tx.clone(), sink.clone(), args.clone(), dir.to_path_buf());
                 tokio::task::spawn_blocking(move || {
                     let started = || sink(Event::GameStarted { app_id });
                     let ov = overlay.as_ref().map(|(p, t)| (*p, t.as_str()));
-                    let cloud_dir = match launch::run_through_host_cancellable(&app, &dir2, &args, &account, &token, me, ov, Some(&stop_flag), started) {
+                    let cloud_dir = match launch::run_through_host_cancellable(&app, &dir2, &args, &account, &token, me, ov, vpad_started, Some(&stop_flag), started) {
                         Ok(()) if !steam_drm => Some(dir2),
                         Ok(()) => None,
                         Err(e) => {
@@ -3239,6 +3271,18 @@ impl Online {
                 let pads = (swapped.is_ok() && input_decision.enabled && input_decision.use_shm_bridge)
                     .then(crate::pads::start)
                     .flatten();
+                #[cfg(not(windows))]
+                let (vpad_started, vpad_include_xbox) = {
+                    let include_xbox = ctrl_override == 1
+                        || crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+                    let ok = swapped.is_ok()
+                        && input_decision.enabled
+                        && launch::needs_aurora_input_route(app_id, args.controller)
+                        && crate::pads::start_virtual_pads(include_xbox);
+                    (ok, include_xbox)
+                };
+                #[cfg(windows)]
+                let (vpad_started, vpad_include_xbox) = (false, false);
                 #[cfg(target_os = "linux")]
                 let overlay = if launch::app_overlay_enabled(app_id) {
                     self.ipc.overlay_port().map(|port| (port, token.clone()))
@@ -3249,15 +3293,23 @@ impl Online {
                 let overlay: Option<(u16, String)> = None;
                 let started = swapped.and_then(|_| {
                     let ov = overlay.as_ref().map(|(p, t)| (*p, t.as_str()));
-                    launch::spawn_with_steamclient(app, dir, args, &self.ipc.env_value(&token), &self.account, pads.as_deref(), ov)
+                    launch::spawn_with_steamclient(app, dir, args, &self.ipc.env_value(&token), &self.account, pads.as_deref(), ov, vpad_started)
                 });
-                if started.is_err() && pads.is_some() {
-                    crate::pads::stop();
+                if started.is_err() {
+                    if pads.is_some() {
+                        crate::pads::stop();
+                    }
+                    if vpad_started {
+                        crate::pads::stop_virtual_pads(vpad_include_xbox);
+                    }
                 }
                 match started {
                     Ok(child) => {
                         if pads.is_some() {
                             self.pad_users.insert(app_id);
+                        }
+                        if vpad_started {
+                            self.vpad_users.insert(app_id, vpad_include_xbox);
                         }
                         self.launch_tokens.insert(app_id, token.clone());
                         if input_decision.enabled {

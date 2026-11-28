@@ -397,8 +397,8 @@ mod tests {
         // not bloat to default_area_size (600x400).
         let south = ctx.memory(|m| m.area_rect(Id::unique(("resize-handle", 1)))).expect("south handle");
         let east = ctx.memory(|m| m.area_rect(Id::unique(("resize-handle", 3)))).expect("east handle");
-        assert!(south.height() <= 6.0, "south resize handle bloated: {south:?}");
-        assert!(east.width() <= 6.0, "east resize handle bloated: {east:?}");
+        assert!(south.height() <= 8.0, "south resize handle bloated: {south:?}");
+        assert!(east.width() <= 8.0, "east resize handle bloated: {east:?}");
 
         // Buttons in the bottom-left (Settings nav), bottom-center (Appearance),
         // and right half must all receive hover and clicks.

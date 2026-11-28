@@ -322,6 +322,85 @@ pub struct DetectionSnapshot {
     pub note: Option<String>,
 }
 
+/// Normalized single-finger touchpad contact for a handheld/controller trackpad (`0.0..=1.0`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TouchpadFinger {
+    pub down: bool,
+    pub click: bool,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Normalized gamepad snapshot streamed to Aurora's launcher / Big Picture UI.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LauncherPadSample {
+    pub id: u32,
+    /// XInput button bitmask (plus `0x0400` for Guide).
+    pub buttons: u16,
+    /// Dedicated misc / Share / Steam Deck Quick Access (`⋯`) button.
+    pub misc: bool,
+    /// Left stick in `[-1.0, 1.0]` (`+Y` is up).
+    pub lx: f32,
+    pub ly: f32,
+    /// Right stick in `[-1.0, 1.0]` (`+Y` is up).
+    pub rx: f32,
+    pub ry: f32,
+    /// Triggers in `[0.0, 1.0]`.
+    pub lt: f32,
+    pub rt: f32,
+    /// Up to 2 trackpad contacts (`[left, right]` on dual-pad controllers like Steam Deck; `[0]` on DualSense).
+    pub touchpads: [TouchpadFinger; 2],
+}
+
+/// One controller state frame emitted by Aurora's unified SDL3 host reader.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LauncherPadFrame {
+    pub connected: usize,
+    pub pads: Vec<LauncherPadSample>,
+}
+
+/// Live inventory of connected controllers used by launch routing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectedPadSummary {
+    pub total: usize,
+    pub xbox_enabled: usize,
+    pub non_xbox_enabled: usize,
+    /// Physical `(vendor_id, product_id)` pairs of enabled non-Xbox controllers.
+    pub non_xbox_vid_pids: Vec<(u16, u16)>,
+    /// SDL3 mapping strings for connected controllers (`SDL_GAMECONTROLLERCONFIG`).
+    pub sdl_mappings: Vec<String>,
+    pub sdl_active: bool,
+}
+
+impl ConnectedPadSummary {
+    /// Whether this launch needs Aurora's controller translation (either a
+    /// non-Xbox enabled pad is connected, a custom layout is selected, or
+    /// Steam Input was explicitly forced on for the game).
+    pub fn needs_translation(
+        &self,
+        app_override: u8,
+        families: &FamilyToggles,
+        has_custom_binding: bool,
+    ) -> bool {
+        if !resolve_steam_input(app_override, families).enabled {
+            return false;
+        }
+        app_override == 1 || has_custom_binding || self.non_xbox_enabled > 0
+    }
+}
+
+pub fn virtual_pad_available() -> bool {
+    crate::vpad::is_available()
+}
+
+pub fn virtual_pad_backend() -> &'static str {
+    crate::vpad::backend_name()
+}
+
+pub fn virtual_pad_hint() -> &'static str {
+    crate::vpad::unavailable_hint()
+}
+
 /// Build a [`LiveInput`] from raw normalized axes + XInput buttons and apply [`PadCalibration`].
 #[allow(clippy::too_many_arguments)]
 fn build_live_input(
@@ -415,6 +494,16 @@ mod sdl_dyn {
         pub connection_state: Option<unsafe extern "C" fn(Gp) -> i32>,
         pub power_info: Option<unsafe extern "C" fn(Gp, *mut i32) -> i32>,
         pub get_path: Option<unsafe extern "C" fn(Gp) -> *const c_char>,
+        pub add_mappings_from_file: Option<unsafe extern "C" fn(*const c_char) -> i32>,
+        pub add_mapping: Option<unsafe extern "C" fn(*const c_char) -> i32>,
+        pub get_mapping_for_id: Option<unsafe extern "C" fn(u32) -> *mut c_char>,
+        pub get_joysticks: Option<unsafe extern "C" fn(*mut i32) -> *mut u32>,
+        pub joystick_name_for_id: Option<unsafe extern "C" fn(u32) -> *const c_char>,
+        pub joystick_vendor_for_id: Option<unsafe extern "C" fn(u32) -> u16>,
+        pub joystick_product_for_id: Option<unsafe extern "C" fn(u32) -> u16>,
+        pub num_touchpads: Option<unsafe extern "C" fn(Gp) -> i32>,
+        pub num_touchpad_fingers: Option<unsafe extern "C" fn(Gp, i32) -> i32>,
+        pub touchpad_finger: Option<unsafe extern "C" fn(Gp, i32, i32, *mut bool, *mut f32, *mut f32, *mut f32) -> bool>,
     }
 
     unsafe impl Send for Sdl {}
@@ -427,17 +516,27 @@ mod sdl_dyn {
             fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
         }
         const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
-        let path = std::env::current_exe().ok()?.parent()?.join("SDL3.dll");
-        if !path.is_file() {
-            tracing::info!("controllers: no SDL3.dll next to the app; using XInput only");
-            return None;
+        let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        let mut candidates = vec![exe_dir.join("SDL3.dll")];
+        if cfg!(debug_assertions) {
+            let mut cur = exe_dir.as_path();
+            for _ in 0..4 {
+                candidates.push(cur.join("vendor").join("sdl3").join("SDL3.dll"));
+                let Some(parent) = cur.parent() else { break };
+                cur = parent;
+            }
         }
+        let Some(path) = candidates.into_iter().find(|p| p.is_file()) else {
+            tracing::warn!("controllers: SDL3.dll not found next to the app; falling back to XInput only");
+            return None;
+        };
         let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain([0]).collect();
         let m = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH) };
         if m.is_null() {
             tracing::warn!("controllers: couldn't load {}", path.display());
             return None;
         }
+        tracing::info!("controllers: loaded {}", path.display());
         Some(m)
     }
 
@@ -529,7 +628,95 @@ mod sdl_dyn {
             connection_state: opt!("SDL_GetGamepadConnectionState"),
             power_info: opt!("SDL_GetGamepadPowerInfo"),
             get_path: opt!("SDL_GetGamepadPath"),
+            add_mappings_from_file: opt!("SDL_AddGamepadMappingsFromFile"),
+            add_mapping: opt!("SDL_AddGamepadMapping"),
+            get_mapping_for_id: opt!("SDL_GetGamepadMappingForID"),
+            get_joysticks: opt!("SDL_GetJoysticks"),
+            joystick_name_for_id: opt!("SDL_GetJoystickNameForID"),
+            joystick_vendor_for_id: opt!("SDL_GetJoystickVendorForID"),
+            joystick_product_for_id: opt!("SDL_GetJoystickProductForID"),
+            num_touchpads: opt!("SDL_GetNumGamepadTouchpads"),
+            num_touchpad_fingers: opt!("SDL_GetNumGamepadTouchpadFingers"),
+            touchpad_finger: opt!("SDL_GetGamepadTouchpadFinger"),
         })
+    }
+
+    /// Load optional user-supplied SDL gamepad mappings from
+    /// `<config_dir>/gamecontrollerdb.txt`, `SDL_GAMECONTROLLERCONFIG_FILE`,
+    /// and `SDL_GAMECONTROLLERCONFIG`.
+    pub fn load_user_mappings(sdl: &Sdl) {
+        use std::ffi::CString;
+        if let Some(add_file) = sdl.add_mappings_from_file {
+            let mut paths = vec![crate::store::config_dir().join("gamecontrollerdb.txt")];
+            if let Some(env_file) = std::env::var_os("SDL_GAMECONTROLLERCONFIG_FILE") {
+                paths.push(std::path::PathBuf::from(env_file));
+            }
+            for path in paths {
+                if !path.is_file() {
+                    continue;
+                }
+                if let Ok(cpath) = CString::new(path.to_string_lossy().as_bytes()) {
+                    let added = unsafe { add_file(cpath.as_ptr()) };
+                    if added >= 0 {
+                        tracing::info!("controllers: loaded {added} SDL mapping(s) from {}", path.display());
+                    } else {
+                        tracing::warn!("controllers: failed loading mappings from {}: {}", path.display(), cstr_lossy(unsafe { (sdl.get_error)() }));
+                    }
+                }
+            }
+        }
+        if let Some(add_one) = sdl.add_mapping
+            && let Ok(env_cfg) = std::env::var("SDL_GAMECONTROLLERCONFIG")
+        {
+            let mut count = 0usize;
+            for line in env_cfg.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+                if let Ok(c) = CString::new(line)
+                    && unsafe { add_one(c.as_ptr()) } >= 0
+                {
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                tracing::info!("controllers: loaded {count} SDL mapping(s) from SDL_GAMECONTROLLERCONFIG");
+            }
+        }
+    }
+
+    pub fn mapping_for_id(sdl: &Sdl, id: u32) -> Option<String> {
+        let f = sdl.get_mapping_for_id?;
+        let p = unsafe { f(id) };
+        if p.is_null() {
+            return None;
+        }
+        let s = cstr_lossy(p);
+        unsafe { (sdl.free)(p.cast()) };
+        (!s.is_empty()).then_some(s)
+    }
+
+    /// Log any connected raw SDL joystick that did not match a gamepad mapping
+    /// so users/maintainers can see exact VID:PID details in `aurora.log`.
+    pub fn log_unmapped_joysticks(sdl: &Sdl, mapped_ids: &[u32], seen: &mut std::collections::HashSet<u32>) {
+        let Some(get_joys) = sdl.get_joysticks else { return };
+        let mut n = 0;
+        let ids = unsafe { get_joys(&mut n) };
+        if ids.is_null() {
+            return;
+        }
+        let list: Vec<u32> = unsafe { std::slice::from_raw_parts(ids, n.max(0) as usize) }.to_vec();
+        unsafe { (sdl.free)(ids.cast()) };
+        seen.retain(|id| list.contains(id));
+        for id in list {
+            if mapped_ids.contains(&id) || !seen.insert(id) {
+                continue;
+            }
+            let name = sdl.joystick_name_for_id.map(|f| cstr_lossy(unsafe { f(id) })).unwrap_or_default();
+            let vid = sdl.joystick_vendor_for_id.map_or(0, |f| unsafe { f(id) });
+            let pid = sdl.joystick_product_for_id.map_or(0, |f| unsafe { f(id) });
+            tracing::warn!(
+                "controllers: unmapped joystick \"{name}\" (VID:PID {vid:04x}:{pid:04x}, id={id}) — add an SDL mapping to {}",
+                crate::store::config_dir().join("gamecontrollerdb.txt").display()
+            );
+        }
     }
 
     pub fn sdl() -> Option<&'static Sdl> {
@@ -587,6 +774,36 @@ mod sdl_dyn {
         (buttons, misc, touchpad, paddles, sticks, triggers, motion)
     }
 
+    pub fn read_touchpads(sdl: &Sdl, gp: Gp, touchpad_btn: bool) -> [super::TouchpadFinger; 2] {
+        let mut out = [super::TouchpadFinger::default(); 2];
+        let (Some(n_pads), Some(n_fingers), Some(get_finger)) =
+            (sdl.num_touchpads, sdl.num_touchpad_fingers, sdl.touchpad_finger)
+        else {
+            return out;
+        };
+        let count = unsafe { n_pads(gp) }.clamp(0, 2) as usize;
+        for (pad_idx, slot) in out.iter_mut().take(count).enumerate() {
+            let fingers = unsafe { n_fingers(gp, pad_idx as i32) };
+            for f_idx in 0..fingers {
+                let (mut down, mut x, mut y, mut pressure) = (false, 0.0f32, 0.0f32, 0.0f32);
+                if unsafe { get_finger(gp, pad_idx as i32, f_idx, &mut down, &mut x, &mut y, &mut pressure) } && down {
+                    slot.down = true;
+                    slot.x = x.clamp(0.0, 1.0);
+                    slot.y = y.clamp(0.0, 1.0);
+                    break;
+                }
+            }
+        }
+        // SDL3's HIDAPI Steam Deck driver maps left pad click to `SDL_GAMEPAD_BUTTON_TOUCHPAD`
+        // (index 20) and right pad click to `SDL_GAMEPAD_BUTTON_MISC2` (index 21).
+        let right_btn = unsafe { (sdl.button)(gp, 21) };
+        out[0].click = touchpad_btn && (out[0].down || !out[1].down || right_btn);
+        if count >= 2 {
+            out[1].click = right_btn || (touchpad_btn && out[1].down && !out[0].down);
+        }
+        out
+    }
+
     pub fn enable_sensors(sdl: &Sdl, gp: Gp) -> bool {
         let (Some(has), Some(enable)) = (sdl.has_sensor, sdl.set_sensor_enabled) else {
             return false;
@@ -618,19 +835,116 @@ mod sdl_dyn {
     }
 }
 
-// ------------------------------------------------------------ Shared UI polling state
+// ------------------------------------------------------------ Shared UI, launcher & virtual pad state
 
 static SNAPSHOT: OnceLock<Mutex<DetectionSnapshot>> = OnceLock::new();
+static SUMMARY: OnceLock<Mutex<ConnectedPadSummary>> = OnceLock::new();
 static UI_LAST_POLL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FORCE_RESCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TEST_RUMBLE_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LAUNCHER_SUB: OnceLock<Mutex<Option<std::sync::mpsc::Sender<LauncherPadFrame>>>> = OnceLock::new();
+static VPAD_USERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static VPAD_INCLUDE_XBOX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn snapshot_lock() -> &'static Mutex<DetectionSnapshot> {
     SNAPSHOT.get_or_init(|| Mutex::new(DetectionSnapshot::default()))
 }
 
+fn summary_lock() -> &'static Mutex<ConnectedPadSummary> {
+    SUMMARY.get_or_init(|| Mutex::new(ConnectedPadSummary::default()))
+}
+
 fn rumble_lock() -> &'static Mutex<Option<String>> {
     TEST_RUMBLE_ID.get_or_init(|| Mutex::new(None))
+}
+
+fn launcher_sub_lock() -> &'static Mutex<Option<std::sync::mpsc::Sender<LauncherPadFrame>>> {
+    LAUNCHER_SUB.get_or_init(|| Mutex::new(None))
+}
+
+fn has_launcher_subscriber() -> bool {
+    launcher_sub_lock().lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+fn emit_launcher_frame(last: &mut Option<LauncherPadFrame>, frame: LauncherPadFrame) {
+    if last.as_ref() == Some(&frame) {
+        return;
+    }
+    let mut guard = launcher_sub_lock().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = guard.as_ref() {
+        if tx.send(frame.clone()).is_err() {
+            *guard = None;
+            return;
+        }
+    }
+    *last = Some(frame);
+}
+
+fn publish_summary(next: ConnectedPadSummary) {
+    *summary_lock().lock().unwrap_or_else(|e| e.into_inner()) = next;
+}
+
+pub fn connected_summary() -> ConnectedPadSummary {
+    summary_lock().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Subscribe to normalized gamepad frames from Aurora's single SDL3 host reader.
+pub fn subscribe_launcher_pads() -> std::sync::mpsc::Receiver<LauncherPadFrame> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    *launcher_sub_lock().lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    platform::ensure_ui_reader();
+    rx
+}
+
+fn vpad_active() -> bool {
+    VPAD_USERS.load(std::sync::atomic::Ordering::Acquire) > 0
+}
+
+fn vpad_include_xbox() -> bool {
+    VPAD_INCLUDE_XBOX.load(std::sync::atomic::Ordering::Acquire) > 0
+}
+
+/// Start forwarding translated physical controllers to OS virtual Xbox 360 pads
+/// (`uinput` on Linux, optional `ViGEmBus` on Windows) for the duration of a launch.
+pub(crate) fn start_virtual_pads(include_xbox: bool) -> bool {
+    if !crate::vpad::is_available() {
+        return false;
+    }
+    VPAD_USERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if include_xbox {
+        VPAD_INCLUDE_XBOX.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    platform::ensure_ui_reader();
+    true
+}
+
+pub(crate) fn stop_virtual_pads(include_xbox: bool) {
+    let mut n = VPAD_USERS.load(std::sync::atomic::Ordering::Acquire);
+    while n > 0 {
+        match VPAD_USERS.compare_exchange_weak(
+            n,
+            n - 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(now) => n = now,
+        }
+    }
+    if include_xbox {
+        let mut x = VPAD_INCLUDE_XBOX.load(std::sync::atomic::Ordering::Acquire);
+        while x > 0 {
+            match VPAD_INCLUDE_XBOX.compare_exchange_weak(
+                x,
+                x - 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => x = now,
+            }
+        }
+    }
 }
 
 fn ui_active() -> bool {
@@ -650,6 +964,100 @@ pub fn refresh_ui() {
     platform::ensure_ui_reader();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HapticSide {
+    Left,
+    Right,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchpadHaptic {
+    /// Light tick when a finger crosses into a new OSK key (optional setting).
+    KeyCross,
+    /// Firm click feedback when a touchpad is pressed to activate a key (always on).
+    PressClick,
+    /// Distinct pulse when a long-press triggers a secondary symbol.
+    LongPress,
+}
+
+impl TouchpadHaptic {
+    fn pulse(self, side: HapticSide) -> (u16, u16, u32) {
+        let (strength, ms) = match self {
+            Self::KeyCross => (0x3000, 14),
+            Self::PressClick => (0x8500, 28),
+            Self::LongPress => (0xB000, 42),
+        };
+        match side {
+            HapticSide::Left => (strength, 0, ms),
+            HapticSide::Right => (0, strength, ms),
+            HapticSide::Both => (strength, strength, ms),
+        }
+    }
+}
+
+#[derive(Default)]
+struct HapticQueue {
+    pending: std::collections::VecDeque<(HapticSide, TouchpadHaptic)>,
+    last_cross: [Option<std::time::Instant>; 2],
+}
+
+impl HapticQueue {
+    fn push(&mut self, mut side: HapticSide, kind: TouchpadHaptic, now: std::time::Instant) {
+        if kind == TouchpadHaptic::KeyCross {
+            let ready = |i: usize| self.last_cross[i].is_none_or(|last| now.duration_since(last).as_millis() >= 28);
+            side = match (side != HapticSide::Right && ready(0), side != HapticSide::Left && ready(1)) {
+                (true, true) => HapticSide::Both,
+                (true, false) => HapticSide::Left,
+                (false, true) => HapticSide::Right,
+                (false, false) => return,
+            };
+            if self.pending.len() == 16 || self.pending.contains(&(side, kind)) {
+                return;
+            }
+            if side != HapticSide::Right { self.last_cross[0] = Some(now); }
+            if side != HapticSide::Left { self.last_cross[1] = Some(now); }
+        } else if self.pending.len() == 16 {
+            let oldest_cross = self.pending.iter().position(|(_, k)| *k == TouchpadHaptic::KeyCross);
+            self.pending.remove(oldest_cross.unwrap_or(0));
+        }
+        self.pending.push_back((side, kind));
+    }
+}
+
+static HAPTICS: std::sync::LazyLock<Mutex<HapticQueue>> = std::sync::LazyLock::new(Default::default);
+
+/// Queue feedback for the controller reader. Device I/O stays on its polling thread.
+pub fn trigger_touchpad_haptic(side: HapticSide, kind: TouchpadHaptic) {
+    HAPTICS.lock().unwrap_or_else(|e| e.into_inner()).push(side, kind, std::time::Instant::now());
+    UI_LAST_POLL_MS.store(shm::now_ms(), std::sync::atomic::Ordering::Relaxed);
+    platform::ensure_ui_reader();
+}
+
+fn next_haptic() -> Option<(HapticSide, TouchpadHaptic)> {
+    HAPTICS.lock().unwrap_or_else(|e| e.into_inner()).pending.pop_front()
+}
+
+fn dispatch_sdl_haptic(sdl: &sdl_dyn::Sdl, pads: impl Iterator<Item = (sdl_dyn::Gp, u16)> + Clone) {
+    let Some((side, kind)) = next_haptic() else { return };
+    let preferred = |(gp, vendor): &(sdl_dyn::Gp, u16)| {
+        *vendor == 0x28de || sdl.num_touchpads.is_some_and(|count| unsafe { count(*gp) > 0 })
+    };
+    let has_preferred = pads.clone().any(|pad| preferred(&pad));
+    let (low, high, ms) = kind.pulse(side);
+    let mut delivered = false;
+    let mut deck_failed = false;
+    for (gp, vendor) in pads.filter(|pad| !has_preferred || preferred(pad)) {
+        let ok = unsafe { (sdl.rumble)(gp, low, high, ms) };
+        delivered |= ok;
+        deck_failed |= vendor == 0x28de && !ok;
+    }
+    if deck_failed || !delivered {
+        #[cfg(target_os = "linux")]
+        platform::hidraw_haptic(side, kind);
+    }
+}
+
 pub fn trigger_test_rumble(controller_id: &str) {
     *rumble_lock().lock().unwrap_or_else(|e| e.into_inner()) = Some(controller_id.to_string());
 }
@@ -665,18 +1073,18 @@ pub fn stop() {}
 #[cfg(windows)]
 pub use platform::{start, stop};
 #[cfg(windows)]
-pub(crate) use platform::{native_xinput_slots, needs_steam_input_client};
-#[cfg(windows)]
-pub use platform::listen_for_controller_guide;
+pub(crate) use platform::native_xinput_slots;
 
 #[cfg(windows)]
 mod platform {
     use super::shm::{self, Shared, State};
     use super::{
-        ConnectionKind, ControllerFamily, DetectedController, DetectionSnapshot, FORCE_RESCAN,
-        PadCalibration, build_live_input, rumble_lock, sdl_dyn::{self, Gp, Sdl}, settings, snapshot_lock,
-        ui_active,
+        ConnectedPadSummary, ConnectionKind, ControllerFamily, DetectedController, DetectionSnapshot, FORCE_RESCAN,
+        LauncherPadFrame, LauncherPadSample, build_live_input, emit_launcher_frame, has_launcher_subscriber,
+        publish_summary, rumble_lock, sdl_dyn::{self, Gp, Sdl}, settings, snapshot_lock, ui_active, vpad_active,
+        vpad_include_xbox,
     };
+    use std::collections::HashSet;
     use std::ffi::{c_char, c_void};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -698,29 +1106,9 @@ mod platform {
 
     static USERS: AtomicUsize = AtomicUsize::new(0);
     static RUNNING: Mutex<bool> = Mutex::new(false);
-    type GuideListener = Box<dyn Fn() -> bool + Send>;
-    static GUIDE_LISTENER: Mutex<Option<GuideListener>> = Mutex::new(None);
-
-    /// Keep the desktop Guide shortcut available even outside Controller Settings.
-    pub fn listen_for_controller_guide(on_press: impl Fn() -> bool + Send + 'static) {
-        *GUIDE_LISTENER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(on_press));
-        ensure_ui_reader();
-    }
 
     fn reader_needed() -> bool {
-        USERS.load(Ordering::Acquire) != 0 || ui_active()
-            || GUIDE_LISTENER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-    }
-
-    fn update_guide(was_down: &mut bool, buttons: u16) {
-        let down = buttons & shm::GUIDE != 0;
-        if down && !*was_down {
-            let mut listener = GUIDE_LISTENER.lock().unwrap_or_else(|e| e.into_inner());
-            if listener.as_ref().is_some_and(|notify| !notify()) {
-                *listener = None;
-            }
-        }
-        *was_down = down;
+        USERS.load(Ordering::Acquire) != 0 || ui_active() || has_launcher_subscriber() || vpad_active()
     }
 
     pub fn ensure_ui_reader() {
@@ -765,11 +1153,12 @@ mod platform {
         has_hid_path: bool,
         vendor: u16,
         product: u16,
+        mapping: Option<String>,
         has_gyro: bool,
-        guide_down: bool,
         last_shm: State,
         rumble: (u16, u16),
         rumbled: Instant,
+        vpad: Option<crate::vpad::VirtualXboxPad>,
     }
 
     fn read_loop(has_shm_user: bool) {
@@ -818,37 +1207,13 @@ mod platform {
         Some(slots)
     }
 
-    pub(crate) fn needs_steam_input_client(app_override: u8) -> bool {
-        let families = settings().families;
-        if !super::resolve_steam_input(app_override, &families).enabled {
-            return false;
-        }
-        if app_override == 1 || (families.xbox && native_xinput_slots().is_some_and(|slots| slots != 0)) {
-            return true;
-        }
-        // WinMM can see OEM controllers whose drivers expose no XInput slot.
-        // Its position API does not identify a family, so only use this
-        // fallback when every family is enabled.
-        if families.bitmask() != shm::FAMILY_ALL {
-            return false;
-        }
-        #[link(name = "winmm")]
-        unsafe extern "system" {
-            fn joyGetNumDevs() -> u32;
-            fn joyGetPosEx(id: u32, info: *mut [u32; 13]) -> u32;
-        }
-        (0..unsafe { joyGetNumDevs() }).any(|id| {
-            // JOYINFOEX has thirteen DWORDs, starting with dwSize and dwFlags.
-            let mut info = [0u32; 13];
-            info[0] = size_of_val(&info) as u32;
-            info[1] = 1; // JOY_RETURNX
-            unsafe { joyGetPosEx(id, &mut info) == 0 }
-        })
-    }
-
     fn run_sdl_loop(sdl: &'static Sdl, shared: Option<&'static Shared>) {
         unsafe {
-            for (k, v) in [(c"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", c"1"), (c"SDL_JOYSTICK_THREAD", c"1")] {
+            for (k, v) in [
+                (c"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", c"1"),
+                (c"SDL_JOYSTICK_THREAD", c"1"),
+                (c"SDL_JOYSTICK_HIDAPI_STEAMDECK", c"1"),
+            ] {
                 (sdl.set_hint)(k.as_ptr(), v.as_ptr());
             }
         }
@@ -862,8 +1227,11 @@ mod platform {
             (sdl.set_joystick_events)(false);
             (sdl.set_gamepad_events)(false);
         }
-        tracing::info!("controllers: SDL3 pad reader active");
+        sdl_dyn::load_user_mappings(sdl);
+        tracing::info!("controllers: SDL3 unified host reader active (Windows)");
         let mut pads: Vec<OpenPad> = Vec::new();
+        let mut seen_unmapped: HashSet<u32> = HashSet::new();
+        let mut last_launcher: Option<LauncherPadFrame> = None;
         let mut scanned: Option<Instant> = None;
         let mut real_xinput_count = 0usize;
         loop {
@@ -871,6 +1239,7 @@ mod platform {
                 let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
                 if !reader_needed() {
                     for o in pads.drain(..) {
+                        drop(o.vpad);
                         unsafe { (sdl.close)(o.gp) };
                     }
                     if let Some(s) = shared {
@@ -884,50 +1253,79 @@ mod platform {
                     return;
                 }
             }
+            if let Some(pump) = sdl.pump_events {
+                unsafe { pump() };
+            }
             unsafe { (sdl.update)() };
             let force = FORCE_RESCAN.swap(false, Ordering::AcqRel);
+            if force {
+                sdl_dyn::load_user_mappings(sdl);
+            }
             if force || scanned.is_none_or(|t| t.elapsed() > Duration::from_millis(500)) {
                 scanned = Some(Instant::now());
                 real_xinput_count = native_xinput_slots().unwrap_or_default().count_ones() as usize;
                 let mut n = 0;
                 let ids = unsafe { (sdl.get_gamepads)(&mut n) };
-                if !ids.is_null() {
-                    let list: Vec<u32> = unsafe { std::slice::from_raw_parts(ids, n.max(0) as usize) }.to_vec();
+                let list: Vec<u32> = if !ids.is_null() {
+                    let v = unsafe { std::slice::from_raw_parts(ids, n.max(0) as usize) }.to_vec();
                     unsafe { (sdl.free)(ids.cast()) };
-                    for id in list {
-                        if pads.iter().any(|o| o.id == id) {
-                            continue;
-                        }
-                        let gp = unsafe { (sdl.open)(id) };
-                        if gp.is_null() {
-                            continue;
-                        }
-                        let name = sdl_dyn::cstr_lossy(unsafe { (sdl.name_for_id)(id) });
-                        let kind = unsafe { (sdl.type_for_id)(id) };
-                        let vendor = unsafe { (sdl.vendor_for_id)(id) };
-                        let product = sdl.product_for_id.map_or(0, |f| unsafe { f(id) });
-                        let family = ControllerFamily::classify(kind, vendor, &name);
-                        let has_hid_path = sdl.get_path.is_some_and(|f| {
-                            let s = sdl_dyn::cstr_lossy(unsafe { f(gp) }).to_ascii_lowercase();
-                            s.contains("hid#") || s.contains("usb#") || s.contains("bthenum#")
-                        });
-                        let has_gyro = sdl_dyn::enable_sensors(sdl, gp);
-                        tracing::info!("controllers: detected {} ({}, hid_path={})", name, family.label(), has_hid_path);
-                        pads.push(OpenPad {
-                            id,
-                            gp,
-                            name,
-                            family,
-                            has_hid_path,
-                            vendor,
-                            product,
-                            has_gyro,
-                            guide_down: false,
-                            last_shm: State::default(),
-                            rumble: (0, 0),
-                            rumbled: Instant::now(),
-                        });
+                    v
+                } else {
+                    Vec::new()
+                };
+                sdl_dyn::log_unmapped_joysticks(sdl, &list, &mut seen_unmapped);
+                for id in list {
+                    if pads.iter().any(|o| o.id == id) {
+                        continue;
                     }
+                    let gp = unsafe { (sdl.open)(id) };
+                    if gp.is_null() {
+                        continue;
+                    }
+                    let name = sdl_dyn::cstr_lossy(unsafe { (sdl.name_for_id)(id) });
+                    let kind = unsafe { (sdl.type_for_id)(id) };
+                    let vendor = unsafe { (sdl.vendor_for_id)(id) };
+                    let product = sdl.product_for_id.map_or(0, |f| unsafe { f(id) });
+                    // Skip newly-appeared ViGEmBus virtual Xbox 360 pads created by Aurora
+                    // while virtual pad forwarding is active so we never re-read our own output.
+                    if vpad_active()
+                        && pads.iter().any(|p| p.vpad.is_some())
+                        && vendor == 0x045e
+                        && product == 0x028e
+                    {
+                        unsafe { (sdl.close)(gp) };
+                        continue;
+                    }
+                    let family = ControllerFamily::classify(kind, vendor, &name);
+                    let mapping = sdl_dyn::mapping_for_id(sdl, id);
+                    let has_hid_path = sdl.get_path.is_some_and(|f| {
+                        let s = sdl_dyn::cstr_lossy(unsafe { f(gp) }).to_ascii_lowercase();
+                        s.contains("hid#") || s.contains("usb#") || s.contains("bthenum#")
+                    });
+                    let has_gyro = sdl_dyn::enable_sensors(sdl, gp);
+                    tracing::info!(
+                        "controllers: detected \"{}\" ({}, vid={:04x}, pid={:04x}, hid_path={})",
+                        name,
+                        family.label(),
+                        vendor,
+                        product,
+                        has_hid_path
+                    );
+                    pads.push(OpenPad {
+                        id,
+                        gp,
+                        name,
+                        family,
+                        has_hid_path,
+                        vendor,
+                        product,
+                        mapping,
+                        has_gyro,
+                        last_shm: State::default(),
+                        rumble: (0, 0),
+                        rumbled: Instant::now(),
+                        vpad: None,
+                    });
                 }
             }
 
@@ -935,18 +1333,63 @@ mod platform {
             let cal = cfg.calibration;
             let rumble_target = rumble_lock().lock().unwrap_or_else(|e| e.into_inner()).take();
             let game_active = USERS.load(Ordering::Acquire) > 0;
+            let virtual_on = vpad_active();
+            let virtual_include_xbox = vpad_include_xbox();
             let mut ui_list = Vec::with_capacity(pads.len());
+            let mut launcher_pads = Vec::with_capacity(pads.len());
+            let mut summary = ConnectedPadSummary { sdl_active: true, ..Default::default() };
             let mut shm_idx = 0usize;
+            let mut vpad_idx = 0usize;
             let mut xbox_skipped = 0usize;
 
             pads.retain_mut(|o| {
                 if !unsafe { (sdl.connected)(o.gp) } {
                     tracing::info!("controllers: {} disconnected", o.name);
+                    drop(o.vpad.take());
                     unsafe { (sdl.close)(o.gp) };
                     return false;
                 }
                 let (buttons, misc, touchpad, paddles, sticks, triggers, motion) = sdl_dyn::read_raw(sdl, o.gp);
-                update_guide(&mut o.guide_down, buttons);
+                let lx_f = sticks[0] as f32 / 32767.0;
+                let ly_f = sticks[1] as f32 / 32767.0;
+                let rx_f = sticks[2] as f32 / 32767.0;
+                let ry_f = sticks[3] as f32 / 32767.0;
+                let lt_f = triggers[0].max(0) as f32 / 32767.0;
+                let rt_f = triggers[1].max(0) as f32 / 32767.0;
+                let touchpads = sdl_dyn::read_touchpads(sdl, o.gp, touchpad);
+                launcher_pads.push(LauncherPadSample {
+                    id: o.id,
+                    buttons,
+                    misc,
+                    lx: lx_f.clamp(-1.0, 1.0),
+                    ly: ly_f.clamp(-1.0, 1.0),
+                    rx: rx_f.clamp(-1.0, 1.0),
+                    ry: ry_f.clamp(-1.0, 1.0),
+                    lt: lt_f.clamp(0.0, 1.0),
+                    rt: rt_f.clamp(0.0, 1.0),
+                    touchpads,
+                });
+
+                summary.total += 1;
+                if let Some(m) = &o.mapping {
+                    if !summary.sdl_mappings.contains(m) {
+                        summary.sdl_mappings.push(m.clone());
+                    }
+                }
+                if cfg.families.is_enabled(o.family) {
+                    if o.family == ControllerFamily::Xbox && !o.has_hid_path {
+                        summary.xbox_enabled += 1;
+                    } else {
+                        summary.non_xbox_enabled += 1;
+                        if o.vendor != 0 || o.product != 0 {
+                            let vp = (o.vendor, o.product);
+                            if !summary.non_xbox_vid_pids.contains(&vp) {
+                                summary.non_xbox_vid_pids.push(vp);
+                            }
+                        }
+                    }
+                }
+
                 let raw_state = {
                     let mut st = State {
                         packet: 0,
@@ -959,6 +1402,7 @@ mod platform {
                         lt: sdl_dyn::trigger_u8(triggers[0]),
                         rt: sdl_dyn::trigger_u8(triggers[1]),
                         family: o.family.slot_family(),
+                        device_id: o.id,
                         ..Default::default()
                     };
                     if let Some((accel, gyro)) = motion {
@@ -974,10 +1418,10 @@ mod platform {
 
                 // Publish enabled controllers not already backed by a native XInput slot.
                 let mut assigned_slot = None;
-                if game_active
+                let want_shm = game_active
                     && shm_idx < shm::SLOTS
-                    && super::should_publish_to_shm(o.family, o.has_hid_path, &cfg.families, real_xinput_count, &mut xbox_skipped)
-                {
+                    && super::should_publish_to_shm(o.family, o.has_hid_path, &cfg.families, real_xinput_count, &mut xbox_skipped);
+                if want_shm {
                     if let Some(s) = shared {
                         let mut calibrated = cal.apply_to_state(raw_state);
                         calibrated.packet = o.last_shm.packet;
@@ -998,6 +1442,46 @@ mod platform {
                     }
                 }
 
+                // Optional OS virtual Xbox 360 gamepad (ViGEmBus) for HeadlessHost launches.
+                let want_vpad = virtual_on
+                    && !game_active
+                    && vpad_idx < 4
+                    && cfg.families.is_enabled(o.family)
+                    && (virtual_include_xbox || o.family != ControllerFamily::Xbox || o.has_hid_path);
+                if want_vpad {
+                    if o.vpad.is_none() {
+                        match crate::vpad::VirtualXboxPad::create(&o.name) {
+                            Ok(vp) => {
+                                tracing::info!("controllers: created {} virtual Xbox pad for {}", crate::vpad::backend_name(), o.name);
+                                o.vpad = Some(vp);
+                            }
+                            Err(e) => tracing::warn!("controllers: virtual pad for {} failed: {e}", o.name),
+                        }
+                    }
+                    if let Some(vp) = o.vpad.as_mut() {
+                        let calibrated = cal.apply_to_state(raw_state);
+                        let _ = vp.update(crate::vpad::VirtualPadState {
+                            buttons: calibrated.buttons,
+                            lx: calibrated.lx,
+                            ly: calibrated.ly,
+                            rx: calibrated.rx,
+                            ry: calibrated.ry,
+                            lt: calibrated.lt,
+                            rt: calibrated.rt,
+                        });
+                        if let Some((low, high)) = vp.poll_rumble() {
+                            if cal.rumble_enabled {
+                                let ms = if low == 0 && high == 0 { 0 } else { 30_000 };
+                                unsafe { (sdl.rumble)(o.gp, low, high, ms) };
+                            }
+                        }
+                        assigned_slot = Some(vpad_idx);
+                        vpad_idx += 1;
+                    }
+                } else if o.vpad.is_some() {
+                    o.vpad = None;
+                }
+
                 if ui_active() {
                     let (conn, batt) = sdl_dyn::connection_and_battery(sdl, o.gp);
                     let (accel, gyro, has_m) = match motion {
@@ -1009,12 +1493,12 @@ mod platform {
                         misc,
                         touchpad,
                         paddles,
-                        sticks[0] as f32 / 32767.0,
-                        sticks[1] as f32 / 32767.0,
-                        sticks[2] as f32 / 32767.0,
-                        sticks[3] as f32 / 32767.0,
-                        triggers[0].max(0) as f32 / 32767.0,
-                        triggers[1].max(0) as f32 / 32767.0,
+                        lx_f,
+                        ly_f,
+                        rx_f,
+                        ry_f,
+                        lt_f,
+                        rt_f,
                         accel,
                         gyro,
                         has_m,
@@ -1038,6 +1522,10 @@ mod platform {
                 true
             });
 
+            super::dispatch_sdl_haptic(sdl, pads.iter().map(|pad| (pad.gp, pad.vendor)));
+            publish_summary(summary);
+            emit_launcher_frame(&mut last_launcher, LauncherPadFrame { connected: launcher_pads.len(), pads: launcher_pads });
+
             if let Some(s) = shared {
                 for slot in shm_idx..shm::SLOTS {
                     s.slots[slot].write(None);
@@ -1053,12 +1541,12 @@ mod platform {
                     note: None,
                 };
             }
-            let interval = if game_active { 2 } else if pads.is_empty() { 100 } else { 12 };
+            let interval = if game_active || virtual_on { 2 } else if pads.is_empty() { 100 } else { 12 };
             std::thread::sleep(Duration::from_millis(interval));
         }
     }
 
-    /// Fallback when `SDL3.dll` is not next to Aurora on Windows: expose Xbox XInput pads to Settings.
+    /// Fallback when `SDL3.dll` is missing next to Aurora on Windows: expose Xbox XInput pads.
     fn run_xinput_ui_loop() {
         #[repr(C)]
         #[derive(Clone, Copy, Default)]
@@ -1099,7 +1587,7 @@ mod platform {
                 break;
             }
         }
-        let mut guide_down = [false; 4];
+        let mut last_launcher: Option<LauncherPadFrame> = None;
         loop {
             if !reader_needed() {
                 let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1108,14 +1596,33 @@ mod platform {
                     return;
                 }
             }
-            let cal = settings().calibration;
+            let cfg = settings();
+            let cal = cfg.calibration;
             let rumble_target = rumble_lock().lock().unwrap_or_else(|e| e.into_inner()).take();
             let mut list = Vec::new();
+            let mut launcher_pads = Vec::new();
             if let Some((get, set)) = funcs {
-                for (i, guide) in guide_down.iter_mut().enumerate() {
+                for i in 0..4usize {
                     let mut xp = XPad::default();
                     if unsafe { get(i as u32, &mut xp) } == 0 {
-                        update_guide(guide, xp.buttons);
+                        let lx_f = (xp.lx as f32 / 32767.0).clamp(-1.0, 1.0);
+                        let ly_f = (xp.ly as f32 / 32767.0).clamp(-1.0, 1.0);
+                        let rx_f = (xp.rx as f32 / 32767.0).clamp(-1.0, 1.0);
+                        let ry_f = (xp.ry as f32 / 32767.0).clamp(-1.0, 1.0);
+                        let lt_f = (xp.lt as f32 / 255.0).clamp(0.0, 1.0);
+                        let rt_f = (xp.rt as f32 / 255.0).clamp(0.0, 1.0);
+                        launcher_pads.push(LauncherPadSample {
+                            id: i as u32 + 1,
+                            buttons: xp.buttons,
+                            misc: false,
+                            lx: lx_f,
+                            ly: ly_f,
+                            rx: rx_f,
+                            ry: ry_f,
+                            lt: lt_f,
+                            rt: rt_f,
+                            touchpads: Default::default(),
+                        });
                         let id = format!("xinput-{i}");
                         if rumble_target.as_deref() == Some(id.as_str()) && cal.rumble_enabled
                             && let Some(set_fn) = set
@@ -1123,42 +1630,52 @@ mod platform {
                             let mut v = [0x5000u16, 0x9000u16];
                             unsafe { set_fn(i as u32, &mut v) };
                         }
-                        let live = build_live_input(
-                            xp.buttons,
-                            false,
-                            false,
-                            [false; 4],
-                            xp.lx as f32 / 32767.0,
-                            xp.ly as f32 / 32767.0,
-                            xp.rx as f32 / 32767.0,
-                            xp.ry as f32 / 32767.0,
-                            xp.lt as f32 / 255.0,
-                            xp.rt as f32 / 255.0,
-                            [0.0; 3],
-                            [0.0; 3],
-                            false,
-                            &cal,
-                        );
-                        list.push(DetectedController {
-                            id,
-                            name: format!("Xbox Controller #{}", i + 1),
-                            family: ControllerFamily::Xbox,
-                            vendor_id: 0x045e,
-                            product_id: 0,
-                            connection: ConnectionKind::Unknown,
-                            slot: Some(i),
-                            battery_percent: None,
-                            backend: "XInput",
-                            has_rumble: set.is_some(),
-                            has_gyro: false,
-                            live,
-                        });
-                    } else {
-                        *guide = false;
+                        if ui_active() {
+                            let live = build_live_input(
+                                xp.buttons,
+                                false,
+                                false,
+                                [false; 4],
+                                lx_f,
+                                ly_f,
+                                rx_f,
+                                ry_f,
+                                lt_f,
+                                rt_f,
+                                [0.0; 3],
+                                [0.0; 3],
+                                false,
+                                &cal,
+                            );
+                            list.push(DetectedController {
+                                id,
+                                name: format!("Xbox Controller #{}", i + 1),
+                                family: ControllerFamily::Xbox,
+                                vendor_id: 0x045e,
+                                product_id: 0,
+                                connection: ConnectionKind::Unknown,
+                                slot: Some(i),
+                                battery_percent: None,
+                                backend: "XInput",
+                                has_rumble: set.is_some(),
+                                has_gyro: false,
+                                live,
+                            });
+                        }
                     }
                 }
             }
-            let interval = if list.is_empty() { 100 } else { 16 };
+            let total = launcher_pads.len();
+            publish_summary(ConnectedPadSummary {
+                total,
+                xbox_enabled: if cfg.families.xbox { total } else { 0 },
+                non_xbox_enabled: 0,
+                non_xbox_vid_pids: Vec::new(),
+                sdl_mappings: Vec::new(),
+                sdl_active: false,
+            });
+            emit_launcher_frame(&mut last_launcher, LauncherPadFrame { connected: total, pads: launcher_pads });
+            let interval = if total == 0 { 100 } else { 16 };
             if ui_active() {
                 *snapshot_lock().lock().unwrap_or_else(|e| e.into_inner()) = DetectionSnapshot {
                     backend: "XInput",
@@ -1173,11 +1690,14 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
+    use super::shm::State;
     use super::{
-        ConnectionKind, ControllerFamily, DetectedController, DetectionSnapshot, FORCE_RESCAN, LiveInput,
-        build_live_input, rumble_lock, sdl_dyn::{self, Gp, Sdl}, settings, snapshot_lock, ui_active,
+        ConnectedPadSummary, ConnectionKind, ControllerFamily, DetectedController, DetectionSnapshot, FORCE_RESCAN,
+        LauncherPadFrame, LauncherPadSample, LiveInput, build_live_input, emit_launcher_frame, has_launcher_subscriber,
+        publish_summary, rumble_lock, sdl_dyn::{self, Gp, Sdl}, settings, snapshot_lock, ui_active, vpad_active,
+        vpad_include_xbox,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs::File;
     use std::io::Read;
     use std::os::fd::AsRawFd;
@@ -1188,6 +1708,10 @@ mod platform {
     use std::time::{Duration, Instant};
 
     static RUNNING: Mutex<bool> = Mutex::new(false);
+
+    fn reader_needed() -> bool {
+        ui_active() || has_launcher_subscriber() || vpad_active()
+    }
 
     pub fn ensure_ui_reader() {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1205,13 +1729,19 @@ mod platform {
         family: ControllerFamily,
         vendor: u16,
         product: u16,
+        mapping: Option<String>,
         has_gyro: bool,
+        vpad: Option<crate::vpad::VirtualXboxPad>,
     }
 
     fn read_loop() {
         if let Some(sdl) = sdl_dyn::sdl() {
             unsafe {
-                for (k, v) in [(c"SDL_NO_SIGNAL_HANDLERS", c"1"), (c"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", c"1")] {
+                for (k, v) in [
+                    (c"SDL_NO_SIGNAL_HANDLERS", c"1"),
+                    (c"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", c"1"),
+                    (c"SDL_JOYSTICK_HIDAPI_STEAMDECK", c"1"),
+                ] {
                     (sdl.set_hint)(k.as_ptr(), v.as_ptr());
                 }
             }
@@ -1308,15 +1838,19 @@ mod platform {
     }
 
     fn run_sdl_linux(sdl: &'static Sdl) {
+        sdl_dyn::load_user_mappings(sdl);
+        tracing::info!("controllers: SDL3 unified host reader active (Linux)");
         let mut pads: Vec<SdlPad> = Vec::new();
+        let mut seen_unmapped: HashSet<u32> = HashSet::new();
+        let mut last_launcher: Option<LauncherPadFrame> = None;
         let mut scanned: Option<Instant> = None;
-        let mut last_reinit = Instant::now();
         let init_flags = sdl_dyn::INIT_GAMEPAD | sdl_dyn::INIT_HAPTIC;
         loop {
-            if !ui_active() {
+            if !reader_needed() {
                 let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-                if !ui_active() {
+                if !reader_needed() {
                     for o in pads.drain(..) {
+                        drop(o.vpad);
                         unsafe { (sdl.close)(o.gp) };
                     }
                     unsafe { (sdl.quit_subsystem)(init_flags) };
@@ -1329,12 +1863,9 @@ mod platform {
             }
             unsafe { (sdl.update)() };
             let force = FORCE_RESCAN.swap(false, Ordering::AcqRel);
-            let need_bt_reinit = pads.is_empty()
-                && last_reinit.elapsed() > Duration::from_secs(2)
-                && !discover_sysfs_pads(Path::new("/sys/class/input"), Path::new("/dev/input")).is_empty();
-            if force || need_bt_reinit {
-                last_reinit = Instant::now();
+            if force {
                 for o in pads.drain(..) {
+                    drop(o.vpad);
                     unsafe { (sdl.close)(o.gp) };
                 }
                 unsafe {
@@ -1351,39 +1882,67 @@ mod platform {
                     }
                     (sdl.update)();
                 }
+                sdl_dyn::load_user_mappings(sdl);
                 scanned = None;
             }
             if force || scanned.is_none_or(|t| t.elapsed() > Duration::from_millis(500)) {
                 scanned = Some(Instant::now());
                 let mut n = 0;
                 let ids = unsafe { (sdl.get_gamepads)(&mut n) };
-                if !ids.is_null() {
-                    let list: Vec<u32> = unsafe { std::slice::from_raw_parts(ids, n.max(0) as usize) }.to_vec();
+                let list: Vec<u32> = if !ids.is_null() {
+                    let v = unsafe { std::slice::from_raw_parts(ids, n.max(0) as usize) }.to_vec();
                     unsafe { (sdl.free)(ids.cast()) };
-                    for id in list {
-                        if pads.iter().any(|o| o.id == id) {
-                            continue;
-                        }
-                        let gp = unsafe { (sdl.open)(id) };
-                        if gp.is_null() {
-                            continue;
-                        }
-                        let name = sdl_dyn::cstr_lossy(unsafe { (sdl.name_for_id)(id) });
-                        let kind = unsafe { (sdl.type_for_id)(id) };
-                        let vendor = unsafe { (sdl.vendor_for_id)(id) };
-                        let product = sdl.product_for_id.map_or(0, |f| unsafe { f(id) });
-                        let family = ControllerFamily::classify(kind, vendor, &name);
-                        let has_gyro = sdl_dyn::enable_sensors(sdl, gp);
-                        pads.push(SdlPad { id, gp, name, family, vendor, product, has_gyro });
+                    v
+                } else {
+                    Vec::new()
+                };
+                sdl_dyn::log_unmapped_joysticks(sdl, &list, &mut seen_unmapped);
+                for id in list {
+                    if pads.iter().any(|o| o.id == id) {
+                        continue;
                     }
+                    let gp = unsafe { (sdl.open)(id) };
+                    if gp.is_null() {
+                        continue;
+                    }
+                    let name = sdl_dyn::cstr_lossy(unsafe { (sdl.name_for_id)(id) });
+                    // Skip Aurora's own virtual Xbox 360 pads (identified by sysfs phys prefix
+                    // `aurora-vpad/`) so physical Xbox 360 controllers are never filtered out.
+                    let path_str = sdl.get_path.map(|f| sdl_dyn::cstr_lossy(unsafe { f(gp) })).unwrap_or_default();
+                    if is_aurora_virtual_event_node(&path_str) {
+                        unsafe { (sdl.close)(gp) };
+                        continue;
+                    }
+                    let kind = unsafe { (sdl.type_for_id)(id) };
+                    let vendor = unsafe { (sdl.vendor_for_id)(id) };
+                    let product = sdl.product_for_id.map_or(0, |f| unsafe { f(id) });
+                    let family = ControllerFamily::classify(kind, vendor, &name);
+                    let mapping = sdl_dyn::mapping_for_id(sdl, id);
+                    let has_gyro = sdl_dyn::enable_sensors(sdl, gp);
+                    tracing::info!(
+                        "controllers: detected \"{}\" ({}, vid={:04x}, pid={:04x})",
+                        name,
+                        family.label(),
+                        vendor,
+                        product
+                    );
+                    pads.push(SdlPad { id, gp, name, family, vendor, product, mapping, has_gyro, vpad: None });
                 }
             }
-            let cal = settings().calibration;
+            let cfg = settings();
+            let cal = cfg.calibration;
             let rumble_target = rumble_lock().lock().unwrap_or_else(|e| e.into_inner()).take();
+            let virtual_on = vpad_active();
+            let virtual_include_xbox = vpad_include_xbox();
             let mut ui_list = Vec::with_capacity(pads.len());
+            let mut launcher_pads = Vec::with_capacity(pads.len());
+            let mut summary = ConnectedPadSummary { sdl_active: true, ..Default::default() };
             let mut slot_idx = 0usize;
-            pads.retain(|o| {
+            let mut vpad_idx = 0usize;
+            pads.retain_mut(|o| {
                 if !unsafe { (sdl.connected)(o.gp) } {
+                    tracing::info!("controllers: {} disconnected", o.name);
+                    drop(o.vpad.take());
                     unsafe { (sdl.close)(o.gp) };
                     return false;
                 }
@@ -1395,54 +1954,154 @@ mod platform {
                     }
                 }
                 let (buttons, misc, touchpad, paddles, sticks, triggers, motion) = sdl_dyn::read_raw(sdl, o.gp);
-                let (conn, batt) = sdl_dyn::connection_and_battery(sdl, o.gp);
-                let (accel, gyro, has_m) = match motion {
-                    Some((a, g)) => (a, g, true),
-                    None => ([0.0; 3], [0.0; 3], false),
-                };
-                let live = build_live_input(
+                let lx_f = (sticks[0] as f32 / 32767.0).clamp(-1.0, 1.0);
+                let ly_f = (sticks[1] as f32 / 32767.0).clamp(-1.0, 1.0);
+                let rx_f = (sticks[2] as f32 / 32767.0).clamp(-1.0, 1.0);
+                let ry_f = (sticks[3] as f32 / 32767.0).clamp(-1.0, 1.0);
+                let lt_f = (triggers[0].max(0) as f32 / 32767.0).clamp(0.0, 1.0);
+                let rt_f = (triggers[1].max(0) as f32 / 32767.0).clamp(0.0, 1.0);
+                let touchpads = sdl_dyn::read_touchpads(sdl, o.gp, touchpad);
+                launcher_pads.push(LauncherPadSample {
+                    id: o.id,
                     buttons,
                     misc,
-                    touchpad,
-                    paddles,
-                    sticks[0] as f32 / 32767.0,
-                    sticks[1] as f32 / 32767.0,
-                    sticks[2] as f32 / 32767.0,
-                    sticks[3] as f32 / 32767.0,
-                    triggers[0].max(0) as f32 / 32767.0,
-                    triggers[1].max(0) as f32 / 32767.0,
-                    accel,
-                    gyro,
-                    has_m,
-                    &cal,
-                );
-                let slot = (slot_idx < 4).then(|| {
-                    let s = slot_idx;
-                    slot_idx += 1;
-                    s
+                    lx: lx_f,
+                    ly: ly_f,
+                    rx: rx_f,
+                    ry: ry_f,
+                    lt: lt_f,
+                    rt: rt_f,
+                    touchpads,
                 });
-                ui_list.push(DetectedController {
-                    id: id_str,
-                    name: o.name.clone(),
-                    family: o.family,
-                    vendor_id: o.vendor,
-                    product_id: o.product,
-                    connection: conn,
-                    slot,
-                    battery_percent: batt,
-                    backend: "SDL3",
-                    has_rumble: true,
-                    has_gyro: o.has_gyro,
-                    live,
-                });
+
+                summary.total += 1;
+                if let Some(m) = &o.mapping {
+                    if !summary.sdl_mappings.contains(m) {
+                        summary.sdl_mappings.push(m.clone());
+                    }
+                }
+                if cfg.families.is_enabled(o.family) {
+                    if o.family == ControllerFamily::Xbox {
+                        summary.xbox_enabled += 1;
+                    } else {
+                        summary.non_xbox_enabled += 1;
+                        if o.vendor != 0 || o.product != 0 {
+                            let vp = (o.vendor, o.product);
+                            if !summary.non_xbox_vid_pids.contains(&vp) {
+                                summary.non_xbox_vid_pids.push(vp);
+                            }
+                        }
+                    }
+                }
+
+                // Drive /dev/uinput virtual Xbox 360 gamepad when active for a game launch.
+                let want_vpad = virtual_on
+                    && vpad_idx < 4
+                    && cfg.families.is_enabled(o.family)
+                    && (virtual_include_xbox || o.family != ControllerFamily::Xbox);
+                if want_vpad {
+                    if o.vpad.is_none() {
+                        match crate::vpad::VirtualXboxPad::create(&o.name) {
+                            Ok(vp) => {
+                                tracing::info!("controllers: created {} virtual Xbox pad for {}", crate::vpad::backend_name(), o.name);
+                                o.vpad = Some(vp);
+                            }
+                            Err(e) => tracing::warn!("controllers: virtual pad for {} failed: {e}", o.name),
+                        }
+                    }
+                    if let Some(vp) = o.vpad.as_mut() {
+                        let raw_state = State {
+                            buttons,
+                            lx: sticks[0],
+                            ly: sticks[1],
+                            rx: sticks[2],
+                            ry: sticks[3],
+                            lt: sdl_dyn::trigger_u8(triggers[0]),
+                            rt: sdl_dyn::trigger_u8(triggers[1]),
+                            family: o.family.slot_family(),
+                            ..Default::default()
+                        };
+                        let calibrated = cal.apply_to_state(raw_state);
+                        let _ = vp.update(crate::vpad::VirtualPadState {
+                            buttons: calibrated.buttons,
+                            lx: calibrated.lx,
+                            ly: calibrated.ly,
+                            rx: calibrated.rx,
+                            ry: calibrated.ry,
+                            lt: calibrated.lt,
+                            rt: calibrated.rt,
+                        });
+                        if let Some((low, high)) = vp.poll_rumble() {
+                            if cal.rumble_enabled {
+                                let ms = if low == 0 && high == 0 { 0 } else { 30_000 };
+                                let ok = unsafe { (sdl.rumble)(o.gp, low, high, ms) };
+                                if !ok && (low != 0 || high != 0) {
+                                    evdev_rumble_fallback(o.vendor, o.product);
+                                }
+                            }
+                        }
+                        vpad_idx += 1;
+                    }
+                } else if o.vpad.is_some() {
+                    o.vpad = None;
+                }
+
+                if ui_active() {
+                    let (conn, batt) = sdl_dyn::connection_and_battery(sdl, o.gp);
+                    let (accel, gyro, has_m) = match motion {
+                        Some((a, g)) => (a, g, true),
+                        None => ([0.0; 3], [0.0; 3], false),
+                    };
+                    let live = build_live_input(
+                        buttons,
+                        misc,
+                        touchpad,
+                        paddles,
+                        lx_f,
+                        ly_f,
+                        rx_f,
+                        ry_f,
+                        lt_f,
+                        rt_f,
+                        accel,
+                        gyro,
+                        has_m,
+                        &cal,
+                    );
+                    let slot = (slot_idx < 4).then(|| {
+                        let s = slot_idx;
+                        slot_idx += 1;
+                        s
+                    });
+                    ui_list.push(DetectedController {
+                        id: id_str,
+                        name: o.name.clone(),
+                        family: o.family,
+                        vendor_id: o.vendor,
+                        product_id: o.product,
+                        connection: conn,
+                        slot,
+                        battery_percent: batt,
+                        backend: "SDL3",
+                        has_rumble: true,
+                        has_gyro: o.has_gyro,
+                        live,
+                    });
+                }
                 true
             });
-            *snapshot_lock().lock().unwrap_or_else(|e| e.into_inner()) = DetectionSnapshot {
-                backend: "SDL3",
-                controllers: ui_list,
-                note: None,
-            };
-            std::thread::sleep(Duration::from_millis(16));
+            super::dispatch_sdl_haptic(sdl, pads.iter().map(|pad| (pad.gp, pad.vendor)));
+            publish_summary(summary);
+            emit_launcher_frame(&mut last_launcher, LauncherPadFrame { connected: launcher_pads.len(), pads: launcher_pads });
+            if ui_active() {
+                *snapshot_lock().lock().unwrap_or_else(|e| e.into_inner()) = DetectionSnapshot {
+                    backend: "SDL3",
+                    controllers: ui_list,
+                    note: None,
+                };
+            }
+            let interval = if virtual_on { 2 } else if pads.is_empty() { 100 } else { 12 };
+            std::thread::sleep(Duration::from_millis(interval));
         }
     }
 
@@ -1486,6 +2145,18 @@ mod platform {
         std::fs::read_to_string(path).ok().and_then(|s| u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0)
     }
 
+    fn is_aurora_virtual_phys(phys: &str) -> bool {
+        phys.trim().starts_with("aurora-vpad/")
+    }
+
+    fn is_aurora_virtual_event_node(dev_path: &str) -> bool {
+        let Some(fname) = Path::new(dev_path).file_name().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        let phys_path = Path::new("/sys/class/input").join(fname).join("device/phys");
+        std::fs::read_to_string(phys_path).is_ok_and(|p| is_aurora_virtual_phys(&p))
+    }
+
     pub(super) fn discover_sysfs_pads(sys_class_input: &Path, dev_input: &Path) -> Vec<SysfsPad> {
         let Ok(rd) = std::fs::read_dir(sys_class_input) else {
             return Vec::new();
@@ -1508,6 +2179,9 @@ mod platform {
         let mut out = Vec::new();
         for (fname, path) in events {
             let dev_dir = path.join("device");
+            if std::fs::read_to_string(dev_dir.join("phys")).is_ok_and(|p| is_aurora_virtual_phys(&p)) {
+                continue;
+            }
             let key_caps = std::fs::read_to_string(dev_dir.join("capabilities/key")).unwrap_or_default();
             let props = std::fs::read_to_string(dev_dir.join("properties")).unwrap_or_default();
             if !is_gamepad_caps(&key_caps, &props) {
@@ -1559,28 +2233,33 @@ mod platform {
     }
 
     #[derive(Default)]
-    struct RawLinuxState {
-        buttons: u16,
-        misc: bool,
-        lx: f32,
-        ly: f32,
-        rx: f32,
-        ry: f32,
-        lt: f32,
-        rt: f32,
+    pub(super) struct RawLinuxState {
+        pub(super) buttons: u16,
+        pub(super) misc: bool,
+        pub(super) lx: f32,
+        pub(super) ly: f32,
+        pub(super) rx: f32,
+        pub(super) ry: f32,
+        pub(super) lt: f32,
+        pub(super) rt: f32,
         hat_x: i32,
         hat_y: i32,
+        pub(super) touchpads: [super::TouchpadFinger; 2],
+    }
+
+    pub(super) fn is_steam_deck_evdev(vendor_id: u16, product_id: u16, name: &str) -> bool {
+        vendor_id == 0x28de && (product_id == 0x1205 || name.to_ascii_lowercase().contains("steam deck"))
     }
 
     enum OpenNode {
-        Evdev { file: File, bounds: HashMap<u16, (i32, i32)>, raw: RawLinuxState },
+        Evdev { file: File, bounds: HashMap<u16, (i32, i32)>, raw: RawLinuxState, is_deck: bool },
         Js { file: File, raw: RawLinuxState },
         MetadataOnly,
     }
 
     fn query_abs_bounds(fd: i32) -> HashMap<u16, (i32, i32)> {
         let mut map = HashMap::new();
-        for code in [0u16, 1, 2, 3, 4, 5, 16, 17] {
+        for code in [0u16, 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 21] {
             let mut info = [0i32; 6];
             let req = ((2u32 << 30) | (24u32 << 16) | ((b'E' as u32) << 8) | (0x40 + code as u32)) as libc::Ioctl;
             if unsafe { libc::ioctl(fd, req, info.as_mut_ptr()) } >= 0 {
@@ -1618,7 +2297,8 @@ mod platform {
             && let Ok(f) = File::options().read(true).custom_flags(libc::O_NONBLOCK).open(ev)
         {
             let bounds = query_abs_bounds(f.as_raw_fd());
-            return OpenNode::Evdev { file: f, bounds, raw: RawLinuxState::default() };
+            let is_deck = is_steam_deck_evdev(p.vendor_id, p.product_id, &p.name);
+            return OpenNode::Evdev { file: f, bounds, raw: RawLinuxState::default(), is_deck };
         }
         if let Some(js) = &p.js_node
             && let Ok(f) = File::options().read(true).custom_flags(libc::O_NONBLOCK).open(js)
@@ -1628,9 +2308,80 @@ mod platform {
         OpenNode::MetadataOnly
     }
 
+    pub(super) fn apply_evdev_event(
+        bounds: &HashMap<u16, (i32, i32)>,
+        raw: &mut RawLinuxState,
+        is_deck: bool,
+        kind: u16,
+        code: u16,
+        value: i32,
+    ) {
+        match kind {
+            0x01 => {
+                let down = value != 0;
+                match code {
+                    0x100 => raw.misc = down,                           // BTN_MISC (Deck Quick Access `⋯`)
+                    0x121 if is_deck => raw.touchpads[0].click = down,  // BTN_THUMB (Deck left pad click)
+                    0x122 if is_deck => raw.touchpads[1].click = down,  // BTN_THUMB2 (Deck right pad click)
+                    0x126 if is_deck => raw.touchpads[0].down = down,   // BTN_BASE (Deck left pad touch)
+                    0x127 if is_deck => raw.touchpads[1].down = down,   // BTN_BASE2 (Deck right pad touch)
+                    0x130 => set_bit(&mut raw.buttons, 0x1000, down),   // BTN_SOUTH
+                    0x131 => set_bit(&mut raw.buttons, 0x2000, down),   // BTN_EAST
+                    0x134 => set_bit(&mut raw.buttons, 0x4000, down),   // BTN_WEST (X)
+                    0x133 => set_bit(&mut raw.buttons, 0x8000, down),   // BTN_NORTH (Y)
+                    0x136 => set_bit(&mut raw.buttons, 0x0100, down),   // BTN_TL
+                    0x137 => set_bit(&mut raw.buttons, 0x0200, down),   // BTN_TR
+                    0x13a => set_bit(&mut raw.buttons, 0x0020, down),   // BTN_SELECT
+                    0x13b => set_bit(&mut raw.buttons, 0x0010, down),   // BTN_START
+                    0x13c => set_bit(&mut raw.buttons, super::shm::GUIDE, down), // BTN_MODE
+                    0x13d => set_bit(&mut raw.buttons, 0x0040, down),   // BTN_THUMBL
+                    0x13e => set_bit(&mut raw.buttons, 0x0080, down),   // BTN_THUMBR
+                    0x220 => set_bit(&mut raw.buttons, 0x0001, down),   // DPAD_UP
+                    0x221 => set_bit(&mut raw.buttons, 0x0002, down),   // DPAD_DOWN
+                    0x222 => set_bit(&mut raw.buttons, 0x0004, down),   // DPAD_LEFT
+                    0x223 => set_bit(&mut raw.buttons, 0x0008, down),   // DPAD_RIGHT
+                    0x138 => raw.lt = if down { 1.0 } else { 0.0 },     // BTN_TL2
+                    0x139 => raw.rt = if down { 1.0 } else { 0.0 },     // BTN_TR2
+                    _ => {}
+                }
+            }
+            0x03 => {
+                let (min, max) = bounds.get(&code).copied().unwrap_or((-32768, 32767));
+                match code {
+                    0x00 => raw.lx = norm_axis(value, min, max),
+                    0x01 => raw.ly = -norm_axis(value, min, max),
+                    0x03 => raw.rx = norm_axis(value, min, max),
+                    0x04 => raw.ry = -norm_axis(value, min, max),
+                    0x02 if !is_deck => raw.lt = norm_trigger(value, if min < 0 { 0 } else { min }, max),
+                    0x05 if !is_deck => raw.rt = norm_trigger(value, if min < 0 { 0 } else { min }, max),
+                    // Linux `hid-steam` maps Deck RT to ABS_HAT2X (0x14) and LT to ABS_HAT2Y (0x15),
+                    // and puts Left/Right Trackpad axes on ABS_HAT0X/Y (0x10/0x11) and ABS_HAT1X/Y (0x12/0x13).
+                    0x14 if is_deck => raw.rt = norm_trigger(value, if min < 0 { 0 } else { min }, max),
+                    0x15 if is_deck => raw.lt = norm_trigger(value, if min < 0 { 0 } else { min }, max),
+                    0x10 if is_deck => raw.touchpads[0].x = norm_trigger(value, min, max),
+                    0x11 if is_deck => raw.touchpads[0].y = norm_trigger(value, min, max),
+                    0x12 if is_deck => raw.touchpads[1].x = norm_trigger(value, min, max),
+                    0x13 if is_deck => raw.touchpads[1].y = norm_trigger(value, min, max),
+                    0x10 => {
+                        raw.hat_x = value;
+                        set_bit(&mut raw.buttons, 0x0004, value < 0);
+                        set_bit(&mut raw.buttons, 0x0008, value > 0);
+                    }
+                    0x11 => {
+                        raw.hat_y = value;
+                        set_bit(&mut raw.buttons, 0x0001, value < 0);
+                        set_bit(&mut raw.buttons, 0x0002, value > 0);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn poll_open_node(node: &mut OpenNode) {
         match node {
-            OpenNode::Evdev { file, bounds, raw } => {
+            OpenNode::Evdev { file, bounds, raw, is_deck } => {
                 let mut buf = [0u8; std::mem::size_of::<InputEvent>() * 16];
                 while let Ok(n) = file.read(&mut buf) {
                     let sz = std::mem::size_of::<InputEvent>();
@@ -1639,54 +2390,7 @@ mod platform {
                     }
                     for chunk in buf[..n].chunks_exact(sz) {
                         let ev = unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast::<InputEvent>()) };
-                        match ev.kind {
-                            0x01 => {
-                                let down = ev.value != 0;
-                                match ev.code {
-                                    0x130 => set_bit(&mut raw.buttons, 0x1000, down), // BTN_SOUTH
-                                    0x131 => set_bit(&mut raw.buttons, 0x2000, down), // BTN_EAST
-                                    0x134 => set_bit(&mut raw.buttons, 0x4000, down), // BTN_WEST (X)
-                                    0x133 => set_bit(&mut raw.buttons, 0x8000, down), // BTN_NORTH (Y)
-                                    0x136 => set_bit(&mut raw.buttons, 0x0100, down), // BTN_TL
-                                    0x137 => set_bit(&mut raw.buttons, 0x0200, down), // BTN_TR
-                                    0x13a => set_bit(&mut raw.buttons, 0x0020, down), // BTN_SELECT
-                                    0x13b => set_bit(&mut raw.buttons, 0x0010, down), // BTN_START
-                                    0x13c => set_bit(&mut raw.buttons, super::shm::GUIDE, down), // BTN_MODE
-                                    0x13d => set_bit(&mut raw.buttons, 0x0040, down), // BTN_THUMBL
-                                    0x13e => set_bit(&mut raw.buttons, 0x0080, down), // BTN_THUMBR
-                                    0x220 => set_bit(&mut raw.buttons, 0x0001, down), // DPAD_UP
-                                    0x221 => set_bit(&mut raw.buttons, 0x0002, down), // DPAD_DOWN
-                                    0x222 => set_bit(&mut raw.buttons, 0x0004, down), // DPAD_LEFT
-                                    0x223 => set_bit(&mut raw.buttons, 0x0008, down), // DPAD_RIGHT
-                                    0x138 => raw.lt = if down { 1.0 } else { 0.0 },   // BTN_TL2
-                                    0x139 => raw.rt = if down { 1.0 } else { 0.0 },   // BTN_TR2
-                                    _ => {}
-                                }
-                            }
-                            0x03 => {
-                                let (min, max) = bounds.get(&ev.code).copied().unwrap_or((-32768, 32767));
-                                match ev.code {
-                                    0x00 => raw.lx = norm_axis(ev.value, min, max),
-                                    0x01 => raw.ly = -norm_axis(ev.value, min, max),
-                                    0x03 => raw.rx = norm_axis(ev.value, min, max),
-                                    0x04 => raw.ry = -norm_axis(ev.value, min, max),
-                                    0x02 => raw.lt = norm_trigger(ev.value, if min < 0 { 0 } else { min }, max),
-                                    0x05 => raw.rt = norm_trigger(ev.value, if min < 0 { 0 } else { min }, max),
-                                    0x10 => {
-                                        raw.hat_x = ev.value;
-                                        set_bit(&mut raw.buttons, 0x0004, ev.value < 0);
-                                        set_bit(&mut raw.buttons, 0x0008, ev.value > 0);
-                                    }
-                                    0x11 => {
-                                        raw.hat_y = ev.value;
-                                        set_bit(&mut raw.buttons, 0x0001, ev.value < 0);
-                                        set_bit(&mut raw.buttons, 0x0002, ev.value > 0);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            _ => {}
-                        }
+                        apply_evdev_event(bounds, raw, *is_deck, ev.kind, ev.code, ev.value);
                     }
                 }
             }
@@ -1746,13 +2450,49 @@ mod platform {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn hidraw_haptic(side: super::HapticSide, kind: super::TouchpadHaptic) {
+        use super::{HapticSide, TouchpadHaptic};
+
+        // hid-steam's 0x8f feature report uses swapped pad indices, a pulse
+        // period in microseconds, repeat count and signed gain in dB.
+        let mut report = [0u8; 65];
+        report[1..4].copy_from_slice(&[0x8f, 8, match side {
+            HapticSide::Left => 1, HapticSide::Right => 0, HapticSide::Both => 2,
+        }]);
+        report[4..6].copy_from_slice(&500u16.to_le_bytes());
+        report[6..8].copy_from_slice(&500u16.to_le_bytes());
+        report[8..10].copy_from_slice(&(kind.pulse(side).2 as u16).to_le_bytes());
+        report[10] = match kind {
+            TouchpadHaptic::KeyCross => (-12i8) as u8,
+            TouchpadHaptic::PressClick => 0,
+            TouchpadHaptic::LongPress => 4,
+        };
+        let Ok(nodes) = std::fs::read_dir("/sys/class/hidraw") else { return };
+        for node in nodes.flatten() {
+            let Ok(info) = std::fs::read_to_string(node.path().join("device/uevent")) else { continue };
+            if !info.lines().filter_map(|line| line.strip_prefix("HID_ID=")).any(|id| {
+                matches!(id.split_once(':').map(|(_, ids)| ids), Some("000028DE:00001205" | "000028DE:00001206"))
+            }) {
+                continue;
+            }
+            let Ok(fd) = File::options().read(true).write(true).custom_flags(libc::O_NONBLOCK)
+                .open(Path::new("/dev").join(node.file_name())) else { continue };
+            let request = libc::_IOWR::<[u8; 65]>(u32::from(b'H'), 6);
+            if unsafe { libc::ioctl(fd.as_raw_fd(), request, report.as_mut_ptr()) } >= 0 {
+                return;
+            }
+        }
+    }
+
     fn run_native_linux() {
         let mut nodes: Vec<(SysfsPad, OpenNode)> = Vec::new();
         let mut scanned: Option<Instant> = None;
+        let mut last_launcher: Option<LauncherPadFrame> = None;
         loop {
-            if !ui_active() {
+            if !reader_needed() {
                 let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-                if !ui_active() {
+                if !reader_needed() {
                     *running = false;
                     return;
                 }
@@ -1768,14 +2508,29 @@ mod platform {
                         next.push((pad, existing_node));
                     } else {
                         let node = open_node(&pad);
+                        let kind = match node {
+                            OpenNode::Evdev { .. } => "evdev",
+                            OpenNode::Js { .. } => "js",
+                            OpenNode::MetadataOnly => "sysfs",
+                        };
+                        tracing::info!(
+                            "controllers: detected \"{}\" via fallback ({}, vid={:04x}, pid={:04x})",
+                            pad.name,
+                            kind,
+                            pad.vendor_id,
+                            pad.product_id
+                        );
                         next.push((pad, node));
                     }
                 }
                 nodes = next;
             }
 
-            let cal = settings().calibration;
+            let cfg = settings();
+            let cal = cfg.calibration;
             let mut list = Vec::with_capacity(nodes.len());
+            let mut launcher_pads = Vec::with_capacity(nodes.len());
+            let mut summary = ConnectedPadSummary { sdl_active: false, ..Default::default() };
             let mut any_readonly = false;
             for (idx, (pad, node)) in nodes.iter_mut().enumerate() {
                 poll_open_node(node);
@@ -1787,47 +2542,90 @@ mod platform {
                         "sysfs"
                     }
                 };
-                let live = match node {
-                    OpenNode::Evdev { raw, .. } | OpenNode::Js { raw, .. } => build_live_input(
-                        raw.buttons,
-                        raw.misc,
-                        false,
-                        [false; 4],
-                        raw.lx,
-                        raw.ly,
-                        raw.rx,
-                        raw.ry,
-                        raw.lt,
-                        raw.rt,
-                        [0.0; 3],
-                        [0.0; 3],
-                        false,
-                        &cal,
-                    ),
-                    OpenNode::MetadataOnly => LiveInput::default(),
-                };
-                list.push(DetectedController {
-                    id: pad.id.clone(),
-                    name: pad.name.clone(),
-                    family: pad.family,
-                    vendor_id: pad.vendor_id,
-                    product_id: pad.product_id,
-                    connection: pad.connection,
-                    slot: (idx < 4).then_some(idx),
-                    battery_percent: None,
-                    backend,
-                    has_rumble: false,
-                    has_gyro: false,
-                    live,
-                });
+                summary.total += 1;
+                if cfg.families.is_enabled(pad.family) {
+                    if pad.family == ControllerFamily::Xbox {
+                        summary.xbox_enabled += 1;
+                    } else {
+                        summary.non_xbox_enabled += 1;
+                        if pad.vendor_id != 0 || pad.product_id != 0 {
+                            let vp = (pad.vendor_id, pad.product_id);
+                            if !summary.non_xbox_vid_pids.contains(&vp) {
+                                summary.non_xbox_vid_pids.push(vp);
+                            }
+                        }
+                    }
+                }
+                if let OpenNode::Evdev { raw, .. } | OpenNode::Js { raw, .. } = node {
+                    launcher_pads.push(LauncherPadSample {
+                        id: idx as u32 + 1,
+                        buttons: raw.buttons,
+                        misc: raw.misc,
+                        lx: raw.lx,
+                        ly: raw.ly,
+                        rx: raw.rx,
+                        ry: raw.ry,
+                        lt: raw.lt,
+                        rt: raw.rt,
+                        touchpads: raw.touchpads,
+                    });
+                }
+                if ui_active() {
+                    let live = match node {
+                        OpenNode::Evdev { raw, .. } | OpenNode::Js { raw, .. } => build_live_input(
+                            raw.buttons,
+                            raw.misc,
+                            raw.touchpads[0].click || raw.touchpads[1].click,
+                            [false; 4],
+                            raw.lx,
+                            raw.ly,
+                            raw.rx,
+                            raw.ry,
+                            raw.lt,
+                            raw.rt,
+                            [0.0; 3],
+                            [0.0; 3],
+                            false,
+                            &cal,
+                        ),
+                        OpenNode::MetadataOnly => LiveInput::default(),
+                    };
+                    list.push(DetectedController {
+                        id: pad.id.clone(),
+                        name: pad.name.clone(),
+                        family: pad.family,
+                        vendor_id: pad.vendor_id,
+                        product_id: pad.product_id,
+                        connection: pad.connection,
+                        slot: (idx < 4).then_some(idx),
+                        battery_percent: None,
+                        backend,
+                        has_rumble: false,
+                        has_gyro: false,
+                        live,
+                    });
+                }
             }
-            let note = any_readonly.then(|| "Device permissions restrict live input reading; check udev / input group permissions.".to_string());
-            *snapshot_lock().lock().unwrap_or_else(|e| e.into_inner()) = DetectionSnapshot {
-                backend: "Linux evdev/js",
-                controllers: list,
-                note,
-            };
-            std::thread::sleep(Duration::from_millis(16));
+            #[cfg(target_os = "linux")]
+            if let Some((side, kind)) = super::next_haptic() {
+                hidraw_haptic(side, kind);
+            }
+            publish_summary(summary);
+            emit_launcher_frame(&mut last_launcher, LauncherPadFrame { connected: launcher_pads.len(), pads: launcher_pads });
+            if ui_active() {
+                let note = Some(if any_readonly {
+                    "libSDL3.so.0 not found and device permissions restrict evdev reading; check udev / input group permissions.".to_string()
+                } else {
+                    "libSDL3.so.0 not found next to Aurora; using basic Linux evdev/js fallback.".to_string()
+                });
+                *snapshot_lock().lock().unwrap_or_else(|e| e.into_inner()) = DetectionSnapshot {
+                    backend: "Linux evdev/js",
+                    controllers: list,
+                    note,
+                };
+            }
+            let interval = if nodes.is_empty() { 100 } else { 16 };
+            std::thread::sleep(Duration::from_millis(interval));
         }
     }
 }
@@ -1836,6 +2634,41 @@ mod platform {
 mod tests {
     use super::*;
     use shm::FAMILY_ALL;
+
+    #[test]
+    fn touchpad_pulse_routes_each_strength_to_requested_motors() {
+        for (kind, strength, ms) in [
+            (TouchpadHaptic::KeyCross, 0x3000, 14),
+            (TouchpadHaptic::PressClick, 0x8500, 28),
+            (TouchpadHaptic::LongPress, 0xB000, 42),
+        ] {
+            assert_eq!(kind.pulse(HapticSide::Left), (strength, 0, ms));
+            assert_eq!(kind.pulse(HapticSide::Right), (0, strength, ms));
+            assert_eq!(kind.pulse(HapticSide::Both), (strength, strength, ms));
+        }
+    }
+
+    #[test]
+    fn haptic_queue_coalesces_crossings_and_prioritizes_clicks() {
+        use HapticSide::*;
+        use TouchpadHaptic::*;
+        let mut q = HapticQueue::default();
+        let now = std::time::Instant::now();
+        q.push(Left, KeyCross, now);
+        q.push(Both, KeyCross, now);
+        q.push(Both, KeyCross, now);
+        q.push(Left, KeyCross, now + std::time::Duration::from_millis(28));
+        assert_eq!(q.pending.len(), 2);
+        assert_eq!(q.pending.pop_front(), Some((Left, KeyCross)));
+        assert_eq!(q.pending.pop_front(), Some((Right, KeyCross)));
+        q.push(Both, KeyCross, now + std::time::Duration::from_millis(29));
+        assert_eq!(q.pending.front(), Some(&(Both, KeyCross)));
+        for _ in 0..15 { q.push(Left, PressClick, now); }
+        q.push(Right, LongPress, now);
+        assert_eq!(q.pending.len(), 16);
+        assert_eq!(q.pending.front(), Some(&(Left, PressClick)));
+        assert_eq!(q.pending.back(), Some(&(Right, LongPress)));
+    }
 
     #[test]
     fn family_classification_handles_sdl_vendor_and_name() {
@@ -2037,5 +2870,71 @@ mod tests {
         let mut skipped_off = 0;
         assert!(!should_publish_to_shm(ControllerFamily::Xbox, true, &no_xbox, 0, &mut skipped_off));
         assert!(should_publish_to_shm(ControllerFamily::SwitchPro, true, &no_xbox, 0, &mut skipped_off));
+    }
+
+    #[test]
+    fn demand_driven_translation_only_triggers_when_needed() {
+        let all = FamilyToggles::default();
+        let xbox_only = ConnectedPadSummary {
+            total: 1,
+            xbox_enabled: 1,
+            non_xbox_enabled: 0,
+            ..Default::default()
+        };
+        // Native Xbox pad + default Auto layout stays on HeadlessHost (no translation needed).
+        assert!(!xbox_only.needs_translation(0, &all, false));
+        // Custom layout or explicit per-game Enable triggers translation.
+        assert!(xbox_only.needs_translation(0, &all, true));
+        assert!(xbox_only.needs_translation(1, &all, false));
+        // Per-game Disable suppresses translation even with a non-Xbox pad.
+        let switch_pad = ConnectedPadSummary {
+            total: 1,
+            xbox_enabled: 0,
+            non_xbox_enabled: 1,
+            non_xbox_vid_pids: vec![(0x057e, 0x2009)],
+            ..Default::default()
+        };
+        assert!(switch_pad.needs_translation(0, &all, false));
+        assert!(!switch_pad.needs_translation(2, &all, true));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn steam_deck_evdev_maps_triggers_touchpads_and_qam_without_dpad_collision() {
+        let mut bounds = std::collections::HashMap::new();
+        bounds.insert(0x10, (-32767, 32767));
+        bounds.insert(0x11, (-32767, 32767));
+        bounds.insert(0x12, (-32767, 32767));
+        bounds.insert(0x13, (-32767, 32767));
+        bounds.insert(0x14, (0, 32767));
+        bounds.insert(0x15, (0, 32767));
+
+        let mut raw = platform::RawLinuxState::default();
+        assert!(platform::is_steam_deck_evdev(0x28de, 0x1205, "Steam Deck"));
+        // ABS_HAT2Y (LT) and ABS_HAT2X (RT) drive triggers.
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x03, 0x15, 32767);
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x03, 0x14, 16384);
+        assert!((raw.lt - 1.0).abs() < 0.001);
+        assert!((raw.rt - 0.5).abs() < 0.01);
+        // ABS_HAT0X/Y drives left trackpad on Deck, NOT D-pad.
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x03, 0x10, -32767);
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x03, 0x11, 32767);
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x01, 0x126, 1);
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x01, 0x121, 1);
+        assert_eq!(raw.buttons, 0);
+        assert!(raw.touchpads[0].down && raw.touchpads[0].click);
+        assert!(raw.touchpads[0].x < 0.01 && raw.touchpads[0].y > 0.99);
+        // BTN_MISC maps QAM (`⋯`).
+        platform::apply_evdev_event(&bounds, &mut raw, true, 0x01, 0x100, 1);
+        assert!(raw.misc);
+
+        // Generic evdev controller still uses ABS_HAT0X/Y for D-pad and ABS_Z/RZ for LT/RT.
+        let mut generic = platform::RawLinuxState::default();
+        bounds.insert(0x02, (0, 255));
+        bounds.insert(0x05, (0, 255));
+        platform::apply_evdev_event(&bounds, &mut generic, false, 0x03, 0x10, -1);
+        platform::apply_evdev_event(&bounds, &mut generic, false, 0x03, 0x02, 255);
+        assert_eq!(generic.buttons & 0x0004, 0x0004);
+        assert!((generic.lt - 1.0).abs() < 0.001);
     }
 }

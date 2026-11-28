@@ -27,6 +27,9 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.0.0-rc6" date="2026-11-28" type="development">
+      <url type="details">https://github.com/mollie2999/Aurora/releases/tag/v1.0.0-rc6</url>
+    </release>
     <release version="1.0.0-rc5" date="2026-11-25" type="development">
       <url type="details">https://github.com/mollie2999/Aurora/releases/tag/v1.0.0-rc5</url>
     </release>

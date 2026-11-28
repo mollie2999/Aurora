@@ -8,9 +8,9 @@
 //!
 //! On headless or minimal Linux systems without a running Secret Service
 //! daemon, credentials gracefully fall back to a `0600` file
-//! (`credentials.json`) inside the `0700` config directory, and are
-//! automatically migrated to the OS credential store on load once one becomes
-//! available. Legacy tokens stored inline in `accounts.json` are also migrated
+//! (`credentials.json`) inside the `0700` config directory. Outside Game Mode,
+//! the first credential read tries to migrate that file to the OS store.
+//! Legacy tokens stored inline in `accounts.json` are also migrated
 //! automatically on first load.
 
 use model::SteamId;
@@ -160,9 +160,6 @@ fn load_with(dir: &Path, backend: &impl SecretBackend) -> Vec<SavedAccount> {
         }
         write_at(dir, &list);
     }
-    // If credentials were previously saved to the 0600 fallback file, migrate
-    // them into the OS credential store as soon as it becomes available.
-    migrate_fallback_with(dir, backend);
     list
 }
 
@@ -171,34 +168,26 @@ fn load_with(dir: &Path, backend: &impl SecretBackend) -> Vec<SavedAccount> {
 /// available). The token is empty when neither has it: the account needs its
 /// password again.
 pub fn credentials(account: &str) -> Option<SavedAccount> {
-    credentials_with(&config_dir(), &secrets::OsKeyring, account)
+    static MIGRATION: std::sync::Once = std::sync::Once::new();
+    let dir = config_dir();
+    MIGRATION.call_once(|| {
+        if std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_none() {
+            migrate_fallback_with(&dir, &secrets::OsKeyring);
+        }
+    });
+    credentials_with(&dir, &secrets::OsKeyring, account)
 }
 
 fn credentials_with(dir: &Path, backend: &impl SecretBackend, account: &str) -> Option<SavedAccount> {
     let mut acc = find_with(dir, backend, account)?;
-    match backend.load(&acc.account_name) {
-        Ok((Some(token), guard)) if !token.is_empty() => {
-            acc.refresh_token = token;
-            acc.guard_data = guard;
-            // Clean up any stale fallback entry for this account.
-            let _ = fallback_store::remove(dir, &acc.account_name);
-        }
-        Ok((token, guard)) => {
-            if let Some(fb) = fallback_store::get(dir, &acc.account_name) {
-                acc.refresh_token = fb.refresh_token;
-                acc.guard_data = fb.guard_data.or(guard);
-            } else {
-                acc.refresh_token = token.unwrap_or_default();
-                acc.guard_data = guard;
-            }
-        }
-        Err(e) => {
-            tracing::warn!("OS credential store unavailable for {account} ({e}); reading from 0600 fallback file");
-            if let Some(fb) = fallback_store::get(dir, &acc.account_name) {
-                acc.refresh_token = fb.refresh_token;
-                acc.guard_data = fb.guard_data;
-            }
-        }
+    // A fallback entry holds the last saved credentials, even if the keyring
+    // still contains an older token from before it became unavailable.
+    if let Some(fb) = fallback_store::get(dir, &acc.account_name) {
+        acc.refresh_token = fb.refresh_token;
+        acc.guard_data = fb.guard_data;
+    } else if let Ok((token, guard)) = backend.load(&acc.account_name) {
+        acc.refresh_token = token.unwrap_or_default();
+        acc.guard_data = guard;
     }
     Some(acc)
 }
@@ -222,8 +211,7 @@ fn save_secret_with(dir: &Path, backend: &impl SecretBackend, account: &str, ref
         Ok(()) => {
             let _ = fallback_store::remove(dir, account);
         }
-        Err(e) => {
-            tracing::warn!("OS credential store unavailable for {account} ({e}); storing credentials in 0600 fallback file");
+        Err(_) => {
             if let Err(fe) = fallback_store::set(dir, account, refresh_token, guard_data) {
                 tracing::error!("could not save fallback credentials for {account}: {fe}");
             }
@@ -367,11 +355,11 @@ pub fn upsert(acc: SavedAccount) {
 fn upsert_with(dir: &Path, backend: &impl SecretBackend, mut acc: SavedAccount) {
     if !acc.refresh_token.is_empty() {
         if acc.guard_data.is_none() {
-            acc.guard_data = backend
-                .load(&acc.account_name)
-                .ok()
-                .and_then(|(_, g)| g)
-                .or_else(|| fallback_store::get(dir, &acc.account_name).and_then(|fb| fb.guard_data));
+            acc.guard_data = match fallback_store::get(dir, &acc.account_name) {
+                Some(fb) => fb.guard_data,
+                None if backend.available() => backend.load(&acc.account_name).ok().and_then(|(_, guard)| guard),
+                None => None,
+            };
         }
         save_secret_with(dir, backend, &acc.account_name, &acc.refresh_token, acc.guard_data.as_deref());
         acc.refresh_token.clear();
@@ -421,6 +409,9 @@ fn remove_with(dir: &Path, backend: &impl SecretBackend, account: &str) {
 }
 
 trait SecretBackend {
+    fn available(&self) -> bool {
+        true
+    }
     fn load(&self, account: &str) -> Result<(Option<String>, Option<String>), String>;
     fn save(&self, account: &str, refresh_token: &str, guard_data: Option<&str>) -> Result<(), String>;
     fn delete(&self, account: &str) -> Result<(), String>;
@@ -458,21 +449,46 @@ mod secrets {
         }
     }
 
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static KEYRING_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+    static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn access<T>(operation: impl FnOnce() -> keyring::Result<T>) -> Result<T, String> {
+        // Concurrent first reads must share the outcome of a single unlock prompt.
+        let _access = ACCESS.lock().unwrap_or_else(|e| e.into_inner());
+        if KEYRING_UNAVAILABLE.load(Ordering::Acquire) {
+            return Err("keyring unavailable this session".into());
+        }
+        operation().map_err(|error| {
+            KEYRING_UNAVAILABLE.store(true, Ordering::Release);
+            tracing::debug!("OS credential store unavailable this session: {error}");
+            error.to_string()
+        })
+    }
+
     impl SecretBackend for OsKeyring {
+        fn available(&self) -> bool {
+            !KEYRING_UNAVAILABLE.load(Ordering::Acquire)
+        }
+
         fn load(&self, account: &str) -> Result<(Option<String>, Option<String>), String> {
-            let token = get("refresh-token", account).map_err(|e| e.to_string())?;
-            let guard = get("guard-data", account).map_err(|e| e.to_string())?;
-            Ok((token, guard))
+            access(|| Ok((get("refresh-token", account)?, get("guard-data", account)?)))
         }
 
         fn save(&self, account: &str, refresh_token: &str, guard_data: Option<&str>) -> Result<(), String> {
-            set("refresh-token", account, Some(refresh_token)).map_err(|e| e.to_string())?;
-            set("guard-data", account, guard_data).map_err(|e| e.to_string())
+            access(|| {
+                set("refresh-token", account, Some(refresh_token))?;
+                set("guard-data", account, guard_data)
+            })
         }
 
         fn delete(&self, account: &str) -> Result<(), String> {
-            set("refresh-token", account, None).map_err(|e| e.to_string())?;
-            set("guard-data", account, None).map_err(|e| e.to_string())
+            access(|| {
+                set("refresh-token", account, None)?;
+                set("guard-data", account, None)
+            })
         }
     }
 }
@@ -713,6 +729,24 @@ mod tests {
     }
 
     #[test]
+    fn metadata_operations_do_not_access_keyring_with_fallback_credentials() {
+        struct UnexpectedKeyring;
+        impl SecretBackend for UnexpectedKeyring {
+            fn load(&self, _: &str) -> Result<(Option<String>, Option<String>), String> { panic!("unexpected load") }
+            fn save(&self, _: &str, _: &str, _: Option<&str>) -> Result<(), String> { panic!("unexpected save") }
+            fn delete(&self, _: &str) -> Result<(), String> { panic!("unexpected delete") }
+        }
+        let dir = temp_store_dir("metadata-only");
+        upsert_with(&dir, &MockKeyring::unavailable(), sample_account("Alice", "fallback", None));
+        assert!(credentials_path(&dir).exists());
+        assert_eq!(load_with(&dir, &UnexpectedKeyring).len(), 1);
+        update_with(&dir, &UnexpectedKeyring, "alice", |acc| acc.persona_name = "changed".into());
+        assert_eq!(find_with(&dir, &UnexpectedKeyring, "alice").unwrap().persona_name, "changed");
+        assert_eq!(credentials_with(&dir, &UnexpectedKeyring, "Alice").unwrap().refresh_token, "fallback");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn stored_secret_debug_redacts_tokens() {
         let secret = fallback_store::StoredSecret {
             refresh_token: "super_secret_refresh".into(),
@@ -783,9 +817,9 @@ mod tests {
         assert_eq!(creds.refresh_token, "fallback-tok");
         assert_eq!(creds.guard_data.as_deref(), Some("fallback-guard"));
 
-        // Once the OS keyring becomes available, load() migrates tokens into keyring and deletes credentials.json.
+        // A later session can migrate the file when its OS keyring is available.
         keyring.set_available(true);
-        let _ = load_with(&dir, &keyring);
+        migrate_fallback_with(&dir, &keyring);
         assert!(!creds_file.exists(), "fallback credentials.json should be removed once migrated");
         let migrated = credentials_with(&dir, &keyring, "alice").unwrap();
         assert_eq!(migrated.refresh_token, "fallback-tok");

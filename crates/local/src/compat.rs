@@ -173,9 +173,19 @@ pub fn compat_data(install_dir: &Path, app: AppId) -> Option<PathBuf> {
     Some(steamapps.join("compatdata").join(app.to_string()))
 }
 
-/// The game's Proton prefix folder, if it already exists on disk.
-pub fn existing_compat_data(install_dir: &Path, app: AppId) -> Option<PathBuf> {
-    compat_data(install_dir, app).filter(|p| p.is_dir())
+/// The game's Wine/Proton prefix folder (`<library>/steamapps/compatdata/<app>/pfx`),
+/// falling back to `compatdata/<app>` if `pfx` doesn't exist yet, when either
+/// exists on disk.
+pub fn prefix_dir(install_dir: &Path, app: AppId) -> Option<PathBuf> {
+    let data = compat_data(install_dir, app)?;
+    let pfx = data.join("pfx");
+    if pfx.is_dir() {
+        Some(pfx)
+    } else if data.is_dir() {
+        Some(data)
+    } else {
+        None
+    }
 }
 
 /// The Windows user folder inside a game's Proton prefix, where its saves
@@ -259,15 +269,30 @@ mod tests {
     }
 
     #[test]
-    fn existing_compat_data_checks_disk() {
-        let root = std::env::temp_dir().join(format!("sir-compat-exist-{}", std::process::id()));
+    fn prefix_dir_prefers_pfx_and_falls_back_to_compatdata() {
+        let root = std::env::temp_dir().join(format!("sir-compat-prefix-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let install_dir = root.join("steamapps").join("common").join("KH2FM");
+        let install_dir = root.join("steamapps").join("common").join("SomeGame");
         std::fs::create_dir_all(&install_dir).unwrap();
-        assert_eq!(existing_compat_data(&install_dir, 2552430), None);
-        let pfx = root.join("steamapps").join("compatdata").join("2552430");
+
+        assert_eq!(prefix_dir(&install_dir, 420), None);
+
+        let compat = root.join("steamapps").join("compatdata").join("420");
+        std::fs::create_dir_all(&compat).unwrap();
+        assert_eq!(prefix_dir(&install_dir, 420), Some(compat.clone()));
+
+        // A non-directory `pfx` file must fall back to `compatdata/<app>`.
+        let pfx = compat.join("pfx");
+        std::fs::write(&pfx, b"").unwrap();
+        assert_eq!(prefix_dir(&install_dir, 420), Some(compat.clone()));
+        std::fs::remove_file(&pfx).unwrap();
+
         std::fs::create_dir_all(&pfx).unwrap();
-        assert_eq!(existing_compat_data(&install_dir, 2552430), Some(pfx));
+        assert_eq!(prefix_dir(&install_dir, 420), Some(pfx));
+
+        // Unsafe traversal components in `install_dir` are rejected.
+        assert_eq!(prefix_dir(&root.join("steamapps").join("common").join(".."), 420), None);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

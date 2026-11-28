@@ -1,8 +1,13 @@
 //! Controller and keyboard input for Big Picture, turned into the same few
 //! presses: a direction, A (select), B (back), X, Y, LB/RB (tabs), Start
-//! (menu) and Guide.
+//! (menu), Guide and Quick Access (Guide + A).
+//!
+//! Controllers come from Aurora's single unified SDL3 host reader in
+//! `client::pads` on both Windows and Linux (no `gilrs` split-brain).
 
+use client::LauncherPadFrame;
 use egui::{Key, Modifiers};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -20,11 +25,15 @@ pub enum Press {
     Rb,
     Lt,
     Rt,
+    L3,
+    R3,
     /// Right-stick vertical scroll tick: positive scrolls down, negative scrolls up.
     Scroll(i8),
     Start,
     Guide,
     QuickAccess,
+    /// Guide + X (or hardware keyboard toggle): show/hide the overlay OSK.
+    ToggleOsk,
 }
 
 /// What the last input came from: hints show buttons or keys to match.
@@ -35,37 +44,65 @@ pub enum Device {
     Pad,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum ButtonHintMode {
+    #[default]
+    Auto,
+    Controller,
+    Keyboard,
+}
+
+impl ButtonHintMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Controller, Self::Keyboard];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => i18n::t!("Auto"),
+            Self::Controller => i18n::t!("Controller"),
+            Self::Keyboard => i18n::t!("Keyboard"),
+        }
+    }
+}
+
 pub enum PadEvent {
     Press(Press),
+    /// Live touchpad contacts (`[left, right]` on dual-pad devices such as Steam Deck).
+    Touchpads([client::TouchpadFinger; 2]),
+    /// Whether the confirm button (A, or B when swapped) is currently held down.
+    ConfirmDown(bool),
     /// How many controllers are connected now.
     Connected(usize),
 }
 
-/// Start reading controllers on a background thread. Each press wakes the UI.
+// XInput / client::pads button bits.
+const BTN_DPAD_UP: u16 = 0x0001;
+const BTN_DPAD_DOWN: u16 = 0x0002;
+const BTN_DPAD_LEFT: u16 = 0x0004;
+const BTN_DPAD_RIGHT: u16 = 0x0008;
+const BTN_START: u16 = 0x0010;
+const BTN_LSTICK: u16 = 0x0040;
+const BTN_RSTICK: u16 = 0x0080;
+const BTN_LB: u16 = 0x0100;
+const BTN_RB: u16 = 0x0200;
+const BTN_GUIDE: u16 = 0x0400;
+const BTN_A: u16 = 0x1000;
+const BTN_B: u16 = 0x2000;
+const BTN_X: u16 = 0x4000;
+const BTN_Y: u16 = 0x8000;
+
+/// Start reading controllers from Aurora's unified SDL3 host service.
+/// Each press wakes the UI.
 pub fn spawn(ctx: egui::Context) -> mpsc::Receiver<PadEvent> {
     let (tx, rx) = mpsc::channel();
-    // The standard Windows.Gaming.Input gamepad reading omits Guide.
-    // Use the SDL/XInput reader as the single source of Guide presses on Windows.
-    #[cfg(windows)]
-    {
-        let tx = tx.clone();
-        let ctx = ctx.clone();
-        client::listen_for_controller_guide(move || {
-            if tx.send(PadEvent::Press(Press::Guide)).is_err() {
-                return false;
-            }
-            ctx.request_repaint_of(egui::ViewportId::ROOT);
-            true
-        });
-    }
-    let spawned = std::thread::Builder::new().name("gamepads".into()).spawn(move || read_pads(tx, ctx));
+    let frames = client::subscribe_launcher_pads();
+    let spawned = std::thread::Builder::new().name("gamepads".into()).spawn(move || read_pads(frames, tx, ctx));
     if let Err(e) = spawned {
         tracing::warn!("controllers: {e}");
     }
     rx
 }
 
-/// The controller settings, read by the thread that reads the pads.
+/// The controller settings, read by the thread that translates pad frames.
 static SWAP_AB: AtomicBool = AtomicBool::new(false);
 static REPEAT_LEVEL: AtomicU8 = AtomicU8::new(1);
 static STICK_LEVEL: AtomicU8 = AtomicU8::new(1);
@@ -98,136 +135,121 @@ fn stick_edges(level: u8) -> (f32, f32) {
     }
 }
 
-/// What a face or menu button means. `swap`: for pads with A and B the other
+/// What a face or menu button bit means. `swap`: for pads with A and B the other
 /// way round, the right button confirms and the bottom one goes back.
-fn button_press(b: gilrs::Button, swap: bool) -> Option<Press> {
-    use gilrs::Button;
-    Some(match b {
-        Button::South if swap => Press::B,
-        Button::East if swap => Press::A,
-        Button::South => Press::A,
-        Button::East => Press::B,
-        Button::West => Press::X,
-        Button::North => Press::Y,
-        Button::LeftTrigger => Press::Lb,
-        Button::RightTrigger => Press::Rb,
-        Button::LeftTrigger2 => Press::Lt,
-        Button::RightTrigger2 => Press::Rt,
-        Button::Start => Press::Start,
-        #[cfg(not(windows))]
-        Button::Mode => Press::Guide,
+fn button_press(bit: u16, swap: bool) -> Option<Press> {
+    Some(match bit {
+        BTN_A if swap => Press::B,
+        BTN_B if swap => Press::A,
+        BTN_A => Press::A,
+        BTN_B => Press::B,
+        BTN_X => Press::X,
+        BTN_Y => Press::Y,
+        BTN_LB => Press::Lb,
+        BTN_RB => Press::Rb,
+        BTN_LSTICK => Press::L3,
+        BTN_RSTICK => Press::R3,
+        BTN_START => Press::Start,
+        BTN_GUIDE => Press::Guide,
         _ => return None,
     })
 }
 
-/// On Windows the gamepad library reads every pad 125 times a second, even
-/// with none plugged in, which was nearly all of the app's CPU use while
-/// idle. So it only runs while a controller is connected: Windows says when
-/// one is plugged in.
-fn read_pads(tx: mpsc::Sender<PadEvent>, ctx: egui::Context) {
-    #[cfg(windows)]
-    let (wake_tx, wake_rx) = mpsc::channel::<()>();
-    #[cfg(windows)]
-    let _watch = plugged::on_added(move || {
-        let _ = wake_tx.send(());
-    });
-    #[cfg(windows)]
-    let mut announced = None;
-    loop {
-        #[cfg(windows)]
-        if plugged::count() == 0 {
-            if announced != Some(0) {
-                announced = Some(0);
-                if tx.send(PadEvent::Connected(0)).is_err() {
-                    return;
-                }
-                ctx.request_repaint();
-            }
-            // Sleep until one is plugged in (and look again now and then).
-            let _ = wake_rx.recv_timeout(Duration::from_secs(10));
-            while wake_rx.try_recv().is_ok() {}
-            continue;
-        }
-        #[cfg(windows)]
-        {
-            announced = None;
-        }
-        let gilrs = match gilrs::Gilrs::new() {
-            Ok(g) => g,
-            Err(gilrs::Error::NotImplemented(g)) => g,
-            Err(e) => {
-                tracing::warn!("controllers unavailable: {e}");
-                return;
-            }
-        };
-        if !read_connected(gilrs, &tx, &ctx) {
-            return;
-        }
-    }
-}
-
-/// Windows' own list of game controllers, for the cheap "is one plugged in?".
-#[cfg(windows)]
-mod plugged {
-    use windows::Foundation::EventHandler;
-    use windows::Gaming::Input::RawGameController;
-
-    pub fn count() -> u32 {
-        RawGameController::RawGameControllers().and_then(|list| list.Size()).unwrap_or(0)
-    }
-
-    /// Calls `wake` whenever a controller is plugged in, for as long as the
-    /// returned value is kept.
-    pub fn on_added(wake: impl Fn() + Send + Sync + 'static) -> Option<Watch> {
-        let handler = EventHandler::<RawGameController>::new(move |_, _| {
-            wake();
-            Ok(())
-        });
-        RawGameController::RawGameControllerAdded(&handler).ok().map(Watch)
-    }
-
-    pub struct Watch(i64);
-
-    impl Drop for Watch {
-        fn drop(&mut self) {
-            let _ = RawGameController::RemoveRawGameControllerAdded(self.0);
-        }
-    }
-}
+const TRACKED_BUTTONS: [u16; 10] = [
+    BTN_GUIDE,
+    BTN_A,
+    BTN_B,
+    BTN_X,
+    BTN_Y,
+    BTN_LB,
+    BTN_RB,
+    BTN_LSTICK,
+    BTN_RSTICK,
+    BTN_START,
+];
 
 #[derive(Default)]
 struct HeldDirections {
+    prev_buttons: u16,
+    prev_misc: bool,
     dpad: [bool; 4],
     stick: [bool; 4],
     next: [Option<Instant>; 4],
     /// Right stick Y scroll direction (-1 up, 0 neutral, 1 down) and repeat timer.
     scroll_dir: i8,
     next_scroll: Option<Instant>,
-    /// Analog trigger latching (for pads that report triggers via axis rather than buttons).
+    /// Analog trigger latching with hysteresis.
     lt_down: bool,
     rt_down: bool,
-    /// Guide button held: Guide + A emits QuickAccess without also emitting Guide or A.
+    /// Guide button held: Guide + A emits QuickAccess, Guide + X emits ToggleOsk.
     guide_down: bool,
     guide_chorded: bool,
 }
 
 const SCROLL_REPEAT: Duration = Duration::from_millis(65);
+const TRIGGER_PRESS_THRESHOLD: f32 = 0.45;
+const TRIGGER_RELEASE_THRESHOLD: f32 = 0.20;
 
 impl HeldDirections {
-    fn update(&mut self, event: gilrs::EventType) -> Option<Press> {
-        use gilrs::EventType;
-        match event {
-            EventType::ButtonPressed(button, _) => self.update_button(button, true),
-            EventType::ButtonReleased(button, _) => self.update_button(button, false),
-            EventType::AxisChanged(axis, value, _) => self.update_axis(axis, value),
-            _ => None,
+    fn update_sample(&mut self, sample: &client::LauncherPadSample, out: &mut Vec<Press>) {
+        // Button edges (Guide processed first so Guide+A / Guide+X chording works in one frame).
+        let changed = self.prev_buttons ^ sample.buttons;
+        if changed != 0 {
+            for bit in TRACKED_BUTTONS {
+                if changed & bit != 0 {
+                    let pressed = sample.buttons & bit != 0;
+                    if let Some(p) = self.update_button(bit, pressed) {
+                        out.push(p);
+                    }
+                }
+            }
+            self.prev_buttons = sample.buttons;
+        }
+        if sample.misc && !self.prev_misc {
+            out.push(Press::QuickAccess);
+        }
+        self.prev_misc = sample.misc;
+
+        // D-pad.
+        self.dpad[0] = sample.buttons & BTN_DPAD_UP != 0;
+        self.dpad[1] = sample.buttons & BTN_DPAD_DOWN != 0;
+        self.dpad[2] = sample.buttons & BTN_DPAD_LEFT != 0;
+        self.dpad[3] = sample.buttons & BTN_DPAD_RIGHT != 0;
+
+        // Left stick (+Y is up).
+        let (on, off) = stick_edges(STICK_LEVEL.load(Ordering::Relaxed));
+        self.stick[0] = sample.ly > if self.stick[0] { off } else { on };
+        self.stick[1] = -sample.ly > if self.stick[1] { off } else { on };
+        self.stick[3] = sample.lx > if self.stick[3] { off } else { on };
+        self.stick[2] = -sample.lx > if self.stick[2] { off } else { on };
+
+        // Right stick vertical scroll (+Y is up, negative scrolls down).
+        let prev = self.scroll_dir;
+        let (son, soff) = (0.45, 0.25);
+        self.scroll_dir = if sample.ry < -if prev == 1 { soff } else { son } {
+            1
+        } else if sample.ry > if prev == -1 { soff } else { son } {
+            -1
+        } else {
+            0
+        };
+
+        // Analog triggers.
+        let was_lt = self.lt_down;
+        self.lt_down = sample.lt > if was_lt { TRIGGER_RELEASE_THRESHOLD } else { TRIGGER_PRESS_THRESHOLD };
+        if self.lt_down && !was_lt {
+            out.push(Press::Lt);
+        }
+        let was_rt = self.rt_down;
+        self.rt_down = sample.rt > if was_rt { TRIGGER_RELEASE_THRESHOLD } else { TRIGGER_PRESS_THRESHOLD };
+        if self.rt_down && !was_rt {
+            out.push(Press::Rt);
         }
     }
 
-    fn update_button(&mut self, button: gilrs::Button, pressed: bool) -> Option<Press> {
-        use gilrs::Button;
+    fn update_button(&mut self, bit: u16, pressed: bool) -> Option<Press> {
         let swap = SWAP_AB.load(Ordering::Relaxed);
-        if button == Button::Mode {
+        if bit == BTN_GUIDE {
             if pressed {
                 self.guide_down = true;
                 self.guide_chorded = false;
@@ -239,73 +261,20 @@ impl HeldDirections {
             return emit_guide.then_some(Press::Guide);
         }
         if self.guide_down {
-            let is_confirm = button_press(button, swap) == Some(Press::A);
-            if is_confirm {
+            let mapped = button_press(bit, swap);
+            if mapped == Some(Press::A) || mapped == Some(Press::X) {
                 if pressed {
                     self.guide_chorded = true;
-                    return Some(Press::QuickAccess);
+                    return Some(if mapped == Some(Press::A) {
+                        Press::QuickAccess
+                    } else {
+                        Press::ToggleOsk
+                    });
                 }
                 return None;
             }
         }
-        let index = match button {
-            Button::DPadUp => 0,
-            Button::DPadDown => 1,
-            Button::DPadLeft => 2,
-            Button::DPadRight => 3,
-            Button::LeftTrigger2 => {
-                let fire = pressed && !self.lt_down;
-                self.lt_down = pressed;
-                return fire.then_some(Press::Lt);
-            }
-            Button::RightTrigger2 => {
-                let fire = pressed && !self.rt_down;
-                self.rt_down = pressed;
-                return fire.then_some(Press::Rt);
-            }
-            other => return pressed.then(|| button_press(other, swap)).flatten(),
-        };
-        self.dpad[index] = pressed;
-        None
-    }
-
-    fn update_axis(&mut self, axis: gilrs::Axis, value: f32) -> Option<Press> {
-        use gilrs::Axis;
-        match axis {
-            Axis::LeftStickY | Axis::LeftStickX => {
-                let (positive, negative) = if axis == Axis::LeftStickY { (0, 1) } else { (3, 2) };
-                let (on, off) = stick_edges(STICK_LEVEL.load(Ordering::Relaxed));
-                self.stick[positive] = value > if self.stick[positive] { off } else { on };
-                self.stick[negative] = -value > if self.stick[negative] { off } else { on };
-            }
-            Axis::RightStickY => {
-                let prev = self.scroll_dir;
-                let (on, off) = (0.45, 0.25);
-                self.scroll_dir = if value < -if prev == 1 { off } else { on } {
-                    1
-                } else if value > if prev == -1 { off } else { on } {
-                    -1
-                } else {
-                    0
-                };
-            }
-            Axis::LeftZ => {
-                let was = self.lt_down;
-                self.lt_down = if was { value > 0.35 } else { value > 0.65 };
-                if self.lt_down && !was {
-                    return Some(Press::Lt);
-                }
-            }
-            Axis::RightZ => {
-                let was = self.rt_down;
-                self.rt_down = if was { value > 0.35 } else { value > 0.65 };
-                if self.rt_down && !was {
-                    return Some(Press::Rt);
-                }
-            }
-            _ => {}
-        }
-        None
+        pressed.then(|| button_press(bit, swap)).flatten()
     }
 
     fn due(&mut self, now: Instant, first: Duration, repeat: Duration) -> impl Iterator<Item = Dir> + '_ {
@@ -350,7 +319,7 @@ impl HeldDirections {
     }
 }
 
-fn next_poll_timeout(held: &std::collections::HashMap<gilrs::GamepadId, HeldDirections>, now: Instant) -> Duration {
+fn next_poll_timeout(held: &HashMap<u32, HeldDirections>, now: Instant) -> Duration {
     let earliest = held.values().filter_map(HeldDirections::next_deadline).min();
     if let Some(deadline) = earliest {
         return deadline.saturating_duration_since(now).clamp(Duration::from_millis(5), Duration::from_millis(50));
@@ -358,13 +327,11 @@ fn next_poll_timeout(held: &std::collections::HashMap<gilrs::GamepadId, HeldDire
     if held.values().any(HeldDirections::has_active_hold) {
         return Duration::from_millis(16);
     }
-    // Idle: wake immediately on any gilrs event, otherwise check infrequently to save battery.
+    // Idle: wake immediately on any incoming pad frame from client::pads.
     Duration::from_millis(250)
 }
 
-/// Read pads until the app is gone or, on Windows, the last pad is unplugged.
-fn read_connected(mut gilrs: gilrs::Gilrs, tx: &mpsc::Sender<PadEvent>, ctx: &egui::Context) -> bool {
-    use gilrs::EventType;
+fn read_pads(frames: mpsc::Receiver<LauncherPadFrame>, tx: mpsc::Sender<PadEvent>, ctx: egui::Context) {
     let send = |e: PadEvent| {
         let ok = tx.send(e).is_ok();
         if ok {
@@ -372,51 +339,76 @@ fn read_connected(mut gilrs: gilrs::Gilrs, tx: &mpsc::Sender<PadEvent>, ctx: &eg
         }
         ok
     };
-    let mut held = std::collections::HashMap::<gilrs::GamepadId, HeldDirections>::new();
-    let mut connected = gilrs.gamepads().count();
-    if !send(PadEvent::Connected(connected)) {
-        return false;
-    }
+    let mut held = HashMap::<u32, HeldDirections>::new();
+    let mut connected: Option<usize> = None;
+    let mut last_touchpads = [client::TouchpadFinger::default(); 2];
+    let mut last_confirm_down = false;
+    let mut presses = Vec::new();
     loop {
         let wait = next_poll_timeout(&held, Instant::now());
-        if let Some(ev) = gilrs.next_event_blocking(Some(wait)) {
-            match ev.event {
-                EventType::Connected | EventType::Disconnected => {
-                    if matches!(ev.event, EventType::Disconnected) {
-                        held.remove(&ev.id);
-                    }
-                    let count = gilrs.gamepads().count();
-                    if count != connected {
-                        connected = count;
-                        if !send(PadEvent::Connected(count)) {
-                            return false;
+        match frames.recv_timeout(wait) {
+            Ok(mut frame) => {
+                // Drain to the latest frame, processing button edges in order.
+                loop {
+                    if connected != Some(frame.connected) {
+                        connected = Some(frame.connected);
+                        if !send(PadEvent::Connected(frame.connected)) {
+                            return;
                         }
                     }
-                    if cfg!(windows) && count == 0 {
-                        return true;
+                    // Drop disconnected pads.
+                    held.retain(|id, _| frame.pads.iter().any(|p| p.id == *id));
+                    presses.clear();
+                    for sample in &frame.pads {
+                        let state = held.entry(sample.id).or_default();
+                        state.update_sample(sample, &mut presses);
                     }
-                }
-                event => {
-                    let state = held.entry(ev.id).or_default();
-                    if let Some(press) = state.update(event) {
-                        if !send(PadEvent::Press(press)) {
-                            return false;
+                    for p in presses.drain(..) {
+                        if !send(PadEvent::Press(p)) {
+                            return;
                         }
+                    }
+                    let touchpads = frame
+                        .pads
+                        .iter()
+                        .find(|p| p.touchpads.iter().any(|t| t.down || t.click))
+                        .map(|p| p.touchpads)
+                        .unwrap_or_default();
+                    if touchpads != last_touchpads {
+                        last_touchpads = touchpads;
+                        if !send(PadEvent::Touchpads(touchpads)) {
+                            return;
+                        }
+                    }
+                    let confirm_bit = if SWAP_AB.load(Ordering::Relaxed) { BTN_B } else { BTN_A };
+                    let confirm_down = frame.pads.iter().any(|p| p.buttons & confirm_bit != 0 && p.buttons & BTN_GUIDE == 0);
+                    if confirm_down != last_confirm_down {
+                        last_confirm_down = confirm_down;
+                        if !send(PadEvent::ConfirmDown(confirm_down)) {
+                            return;
+                        }
+                    }
+                    match frames.try_recv() {
+                        Ok(next) => frame = next,
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => return,
                     }
                 }
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
         let (first, repeat) = repeat_times(REPEAT_LEVEL.load(Ordering::Relaxed));
         let now = Instant::now();
         for state in held.values_mut() {
             for dir in state.due(now, first, repeat) {
                 if !send(PadEvent::Press(Press::Move(dir))) {
-                    return false;
+                    return;
                 }
             }
             if let Some(scroll) = state.due_scroll(now) {
                 if !send(PadEvent::Press(Press::Scroll(scroll))) {
-                    return false;
+                    return;
                 }
             }
         }
@@ -425,7 +417,7 @@ fn read_connected(mut gilrs: gilrs::Gilrs, tx: &mpsc::Sender<PadEvent>, ctx: &eg
 
 /// Which keys stand for which presses. `typing`: letters go to a text box,
 /// so only keys that aren't text count. Back is Esc only, like Steam's Big
-/// Picture: Backspace deletes in a text box (see [`backspace`]) and does
+/// Picture: Backspace deletes in a text box (see [`super::osk::edit_physical`]) and does
 /// nothing anywhere else, so deleting can never leave a page.
 pub fn key_map(typing: bool) -> Vec<(Key, Press)> {
     let mut map = vec![
@@ -461,20 +453,6 @@ pub fn key_map(typing: bool) -> Vec<(Key, Press)> {
     map
 }
 
-/// Backspace in a text box: delete the last character (with Ctrl, the last
-/// word). An empty box stays empty; it never means "back".
-pub fn backspace(field: &mut String, word: bool) {
-    if word {
-        let kept = field.trim_end().len();
-        field.truncate(kept);
-        let cut = field.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
-        field.truncate(cut);
-    } else {
-        field.pop();
-    }
-}
-
-/// This frame's keyboard presses (taken, so egui doesn't also act on them).
 pub fn keyboard(ctx: &egui::Context, typing: bool) -> Vec<Press> {
     let mut out = Vec::new();
     ctx.input_mut(|i| {
@@ -499,18 +477,15 @@ mod tests {
 
     #[test]
     fn swapping_a_and_b() {
-        use gilrs::Button;
-        assert_eq!(button_press(Button::South, false), Some(Press::A));
-        assert_eq!(button_press(Button::East, false), Some(Press::B));
-        assert_eq!(button_press(Button::South, true), Some(Press::B));
-        assert_eq!(button_press(Button::East, true), Some(Press::A));
+        assert_eq!(button_press(BTN_A, false), Some(Press::A));
+        assert_eq!(button_press(BTN_B, false), Some(Press::B));
+        assert_eq!(button_press(BTN_A, true), Some(Press::B));
+        assert_eq!(button_press(BTN_B, true), Some(Press::A));
         // Only A and B swap.
-        assert_eq!(button_press(Button::West, true), Some(Press::X));
-        #[cfg(not(windows))]
-        assert_eq!(button_press(Button::Mode, true), Some(Press::Guide));
-        #[cfg(windows)]
-        assert_eq!(button_press(Button::Mode, true), None);
-        assert_eq!(button_press(Button::DPadUp, false), None);
+        assert_eq!(button_press(BTN_X, true), Some(Press::X));
+        // Guide works uniformly across both Windows and Linux.
+        assert_eq!(button_press(BTN_GUIDE, true), Some(Press::Guide));
+        assert_eq!(button_press(BTN_DPAD_UP, false), None);
     }
 
     #[test]
@@ -557,63 +532,85 @@ mod tests {
     }
 
     #[test]
-    fn backspace_deletes_and_stops_at_empty() {
-        let mut s = String::from("hi");
-        backspace(&mut s, false);
-        assert_eq!(s, "h");
-        backspace(&mut s, false);
-        backspace(&mut s, false);
-        backspace(&mut s, false);
-        assert_eq!(s, "");
-        let mut s = String::from("see you tonight  ");
-        backspace(&mut s, true);
-        assert_eq!(s, "see you ");
-        backspace(&mut s, true);
-        assert_eq!(s, "see ");
-        backspace(&mut s, true);
-        assert_eq!(s, "");
-        backspace(&mut s, true);
-        assert_eq!(s, "");
-    }
-
-    #[test]
     fn guide_chord_emits_quick_access_without_guide_or_a() {
-        use gilrs::Button;
         SWAP_AB.store(false, Ordering::Relaxed);
         let mut held = HeldDirections::default();
+        let mut out = Vec::new();
         // Standalone Guide emits on release.
-        assert_eq!(held.update_button(Button::Mode, true), None);
-        assert_eq!(held.update_button(Button::Mode, false), Some(Press::Guide));
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: BTN_GUIDE, ..Default::default() }, &mut out);
+        assert!(out.is_empty());
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: 0, ..Default::default() }, &mut out);
+        assert_eq!(out, [Press::Guide]);
+        out.clear();
 
         // Guide + A emits QuickAccess immediately and suppresses Guide on release.
-        assert_eq!(held.update_button(Button::Mode, true), None);
-        assert_eq!(held.update_button(Button::South, true), Some(Press::QuickAccess));
-        assert_eq!(held.update_button(Button::South, false), None);
-        assert_eq!(held.update_button(Button::Mode, false), None);
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: BTN_GUIDE, ..Default::default() }, &mut out);
+        assert!(out.is_empty());
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: BTN_GUIDE | BTN_A, ..Default::default() }, &mut out);
+        assert_eq!(out, [Press::QuickAccess]);
+        out.clear();
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: BTN_GUIDE, ..Default::default() }, &mut out);
+        assert!(out.is_empty());
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: 0, ..Default::default() }, &mut out);
+        assert!(out.is_empty());
+
+        // Guide + X emits ToggleOsk immediately and suppresses Guide on release.
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: BTN_GUIDE, ..Default::default() }, &mut out);
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: BTN_GUIDE | BTN_X, ..Default::default() }, &mut out);
+        assert_eq!(out, [Press::ToggleOsk]);
+        out.clear();
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: 0, ..Default::default() }, &mut out);
+        assert!(out.is_empty());
+
+        // Dedicated Quick Access button (`misc`) emits QuickAccess on rising edge only.
+        held.update_sample(&client::LauncherPadSample { id: 1, misc: true, ..Default::default() }, &mut out);
+        held.update_sample(&client::LauncherPadSample { id: 1, misc: true, ..Default::default() }, &mut out);
+        assert_eq!(out, [Press::QuickAccess]);
+        out.clear();
+
+        // L3 / R3 emit cleanly.
+        held.update_sample(&client::LauncherPadSample { id: 1, buttons: BTN_LSTICK | BTN_RSTICK, ..Default::default() }, &mut out);
+        assert_eq!(out, [Press::L3, Press::R3]);
     }
 
     #[test]
     fn right_stick_scrolls_and_triggers_fire_once() {
-        use gilrs::Axis;
         let mut held = HeldDirections::default();
+        let mut out = Vec::new();
         let now = Instant::now();
-        held.update_axis(Axis::RightStickY, -0.8);
+        held.update_sample(&client::LauncherPadSample { id: 1, ry: -0.8, ..Default::default() }, &mut out);
         assert_eq!(held.due_scroll(now), Some(1));
         assert_eq!(held.due_scroll(now + Duration::from_millis(20)), None);
         assert_eq!(held.due_scroll(now + SCROLL_REPEAT), Some(1));
-        held.update_axis(Axis::RightStickY, 0.0);
+        held.update_sample(&client::LauncherPadSample { id: 1, ry: 0.0, ..Default::default() }, &mut out);
         assert_eq!(held.due_scroll(now + SCROLL_REPEAT * 2), None);
 
-        assert_eq!(held.update_axis(Axis::LeftZ, 0.8), Some(Press::Lt));
-        assert_eq!(held.update_axis(Axis::LeftZ, 0.9), None);
-        assert_eq!(held.update_axis(Axis::LeftZ, 0.1), None);
-        assert_eq!(held.update_axis(Axis::LeftZ, 0.8), Some(Press::Lt));
+        out.clear();
+        held.update_sample(&client::LauncherPadSample { id: 1, lt: 0.50, ..Default::default() }, &mut out);
+        assert_eq!(out, [Press::Lt]);
+        out.clear();
+        held.update_sample(&client::LauncherPadSample { id: 1, lt: 0.9, ..Default::default() }, &mut out);
+        assert!(out.is_empty());
+        held.update_sample(&client::LauncherPadSample { id: 1, lt: 0.1, ..Default::default() }, &mut out);
+        assert!(out.is_empty());
+        held.update_sample(&client::LauncherPadSample { id: 1, lt: 0.50, ..Default::default() }, &mut out);
+        assert_eq!(out, [Press::Lt]);
     }
 
     #[test]
     fn idle_poll_timeout_relaxes_when_nothing_held() {
-        let held = std::collections::HashMap::new();
+        let held = HashMap::new();
         let now = Instant::now();
         assert_eq!(next_poll_timeout(&held, now), Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn button_hint_preference_round_trips_and_auto_is_default() {
+    assert_eq!(ButtonHintMode::default(), ButtonHintMode::Auto);
+    for mode in ButtonHintMode::ALL {
+        let encoded = serde_json::to_string(&mode).unwrap();
+        assert_eq!(serde_json::from_str::<ButtonHintMode>(&encoded).unwrap(), mode);
     }
 }

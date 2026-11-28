@@ -21,6 +21,7 @@ pub const X: &str = "\u{E4F6}";
 pub const PLUS: &str = "\u{E3D4}";
 pub const BACK: &str = "\u{E138}";
 pub const COPY: &str = "\u{E1CA}";
+pub const KEYBOARD: &str = "\u{E2D8}";
 pub const CONTROLLER: &str = "\u{E26E}";
 pub const CLOCK: &str = "\u{E19A}";
 pub const DRIVES: &str = "\u{E2A0}";

@@ -242,7 +242,7 @@ pub fn resize_handles(ctx: &egui::Context) {
         return;
     }
     let screen = ctx.content_rect();
-    let (e, c) = (5.0, 12.0);
+    let (e, c) = (8.0, 16.0);
     let (l, r, tp, b) = (screen.left(), screen.right(), screen.top(), screen.bottom());
     // Keep clear of the minimize / maximize / close buttons in the top-right.
     let buttons = 3.0 * 46.0 + 8.0;
@@ -259,6 +259,8 @@ pub fn resize_handles(ctx: &egui::Context) {
         egui::Area::new(Id::unique(("resize-handle", i)))
             .order(egui::Order::Foreground)
             .fixed_pos(rect.min)
+            .default_size(rect.size())
+            .constrain(false)
             .show(ctx, |ui| {
                 let resp = ui.allocate_rect(Rect::from_min_size(rect.min, rect.size()), Sense::drag());
                 if resp.hovered() || resp.dragged() {
@@ -268,6 +270,20 @@ pub fn resize_handles(ctx: &egui::Context) {
                     ui.ctx().send_viewport_cmd(ViewportCommand::BeginResize(dir));
                 }
             });
+    }
+}
+
+/// Subtle bottom-right resize corner grip for floating resizable windows.
+pub fn resize_grip(ctx: &egui::Context, t: &Theme) {
+    if ctx.input(|i| i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)) {
+        return;
+    }
+    let rect = ctx.content_rect();
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::unique(("window-resize-grip", ctx.viewport_id()))));
+    let stroke = egui::Stroke::new(1.5, t.text_faint.gamma_multiply(0.65));
+    let br = rect.right_bottom();
+    for offset in [4.5f32, 8.5, 12.5] {
+        p.line_segment([egui::pos2(br.x - offset, br.y - 2.0), egui::pos2(br.x - 2.0, br.y - offset)], stroke);
     }
 }
 

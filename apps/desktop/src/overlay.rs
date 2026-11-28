@@ -66,6 +66,26 @@ struct WinState {
     opacity: f32,
 }
 
+struct ForegroundProbe {
+    in_game: bool,
+    hypr_window: Option<(String, i64, String)>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct HyprOverlayState {
+    placement_generation: u64,
+    overlay_addr: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl HyprOverlayState {
+    fn cancel_placement(&mut self) {
+        self.placement_generation = self.placement_generation.wrapping_add(1);
+        self.overlay_addr = None;
+    }
+}
+
 pub struct Overlay {
     pub open: bool,
     manager: Option<GlobalHotKeyManager>,
@@ -75,7 +95,7 @@ pub struct Overlay {
     enabled: bool,
     /// When the foreground window was last checked.
     checked: Option<Instant>,
-    foreground_check: Option<tokio::sync::oneshot::Receiver<bool>>,
+    foreground_check: Option<tokio::sync::oneshot::Receiver<ForegroundProbe>>,
     /// The game's window was in front at the last check.
     game_front: bool,
     pressed: Arc<AtomicBool>,
@@ -94,6 +114,18 @@ pub struct Overlay {
     game_window: isize,
     /// Clicks currently pass through the overlay window.
     passthrough: Option<bool>,
+    /// True after `show()` submits the fallback overlay viewport until a pass
+    /// omits it, so an occluded root viewport knows when a UI pass is needed.
+    fallback_vp_active: bool,
+    /// Last known Hyprland window address of the active game.
+    game_hypr_addr: Option<String>,
+    /// Last known Hyprland `(workspace_id, workspace_name)` of the active game.
+    game_hypr_ws: Option<(i64, String)>,
+    /// True once `"Aurora Overlay"` has been moved/focused onto `game_hypr_ws`.
+    hypr_placed: bool,
+    /// Shared Hyprland open/restore state between the UI thread and placement task.
+    #[cfg(target_os = "linux")]
+    hypr_state: Arc<std::sync::Mutex<HyprOverlayState>>,
     /// Data asked for this session.
     asked: bool,
     /// What the Community window shows (with its own back history).
@@ -169,6 +201,12 @@ impl Overlay {
             focused: false,
             game_window: 0,
             passthrough: None,
+            fallback_vp_active: false,
+            game_hypr_addr: None,
+            game_hypr_ws: None,
+            hypr_placed: false,
+            #[cfg(target_os = "linux")]
+            hypr_state: Arc::new(std::sync::Mutex::new(HyprOverlayState::default())),
             asked: false,
             community: Default::default(),
             achievements: Default::default(),
@@ -189,13 +227,13 @@ impl Overlay {
     }
 
     pub fn set_controller_route(&mut self, app_id: AppId, enabled: bool) {
-        if self.game.is_some_and(|(id, _)| id == app_id) {
+        if self.game.is_none() || self.game.is_some_and(|(id, _)| id == app_id) {
             self.controller_route_enabled = Some(enabled);
         }
     }
 
     pub fn set_controller_applied(&mut self, app_id: AppId, source: String) {
-        if self.game.is_some_and(|(id, _)| id == app_id) {
+        if self.game.is_none() || self.game.is_some_and(|(id, _)| id == app_id) {
             self.controller_applied_source = Some(source);
         }
     }
@@ -205,12 +243,21 @@ impl Overlay {
     /// and the overlay never pops up over other apps.
     pub fn game_started(&mut self, app_id: AppId, enabled: bool) {
         self.flush_notes();
+        let same_app = self.game.is_some_and(|(id, _)| id == app_id);
         self.game = Some((app_id, Instant::now()));
         self.asked = false;
         self.enabled = enabled;
         self.checked = None;
         self.foreground_check = None;
         self.game_front = false;
+        self.game_hypr_addr = None;
+        self.game_hypr_ws = None;
+        self.hypr_placed = false;
+        #[cfg(target_os = "linux")]
+        {
+            let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+            st.cancel_placement();
+        }
         self.fps = None;
         self.screenshots.clear();
         self.screenshots_dirty = true;
@@ -218,8 +265,10 @@ impl Overlay {
         self.notes_app = Some(app_id);
         self.notes_dirty = None;
         self.notes = std::fs::read_to_string(notes_path(app_id)).unwrap_or_default();
-        self.controller_route_enabled = None;
-        self.controller_applied_source = None;
+        if !same_app {
+            // Preserve a ControllerLayoutRoute event that arrived right before GameStarted.
+            self.controller_applied_source = None;
+        }
     }
 
     /// Register Shift+Tab only while the game is the focused window (or the
@@ -229,8 +278,12 @@ impl Overlay {
         if fallback {
             if let Some(rx) = self.foreground_check.as_mut() {
                 match rx.try_recv() {
-                    Ok(front) => {
-                        self.game_front = front;
+                    Ok(probe) => {
+                        self.game_front = probe.in_game;
+                        if let Some((addr, ws_id, ws_name)) = probe.hypr_window {
+                            self.game_hypr_addr = Some(addr);
+                            self.game_hypr_ws = Some((ws_id, ws_name));
+                        }
                         self.foreground_check = None;
                     }
                     Err(tokio::sync::oneshot::error::TryRecvError::Closed) => self.foreground_check = None,
@@ -245,7 +298,7 @@ impl Overlay {
                     let dir = dir.to_path_buf();
                     let ctx = ctx.clone();
                     rt.spawn_blocking(move || {
-                        if tx.send(foreground_is_in(&dir)).is_ok() {
+                        if tx.send(foreground_probe(&dir)).is_ok() {
                             ctx.request_repaint();
                         }
                     });
@@ -275,6 +328,14 @@ impl Overlay {
         self.flush_notes();
         self.game = None;
         self.foreground_check = None;
+        self.game_hypr_addr = None;
+        self.game_hypr_ws = None;
+        self.hypr_placed = false;
+        #[cfg(target_os = "linux")]
+        {
+            let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+            st.cancel_placement();
+        }
         self.ingame = None;
         self.open = false;
         self.fps = None;
@@ -313,13 +374,40 @@ impl Overlay {
         } else {
             self.open = true;
             self.focused = false;
+            self.hypr_placed = false;
             self.game_window = foreground_window();
+            #[cfg(target_os = "linux")]
+            if crate::hyprland::is_available() {
+                if let Some(aw) = crate::hyprland::active_window() {
+                    if aw.pid != std::process::id() {
+                        self.game_hypr_addr = Some(aw.address);
+                        self.game_hypr_ws = Some((aw.workspace_id, aw.workspace_name));
+                    }
+                }
+            }
         }
     }
 
     fn close(&mut self) {
         self.open = false;
-        // Give the keyboard back to the game.
+        self.hypr_placed = false;
+        // Give the keyboard back to the game and keep any pinned windows above it.
+        #[cfg(target_os = "linux")]
+        {
+            let any_pinned = self.any_pinned();
+            let mut st = self.hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+            let overlay_addr = if any_pinned { st.overlay_addr.take() } else { None };
+            st.cancel_placement();
+            drop(st);
+            if crate::hyprland::is_available() {
+                if let Some(addr) = self.game_hypr_addr.as_deref() {
+                    match crate::hyprland::focus_game_keeping_overlay_top(addr, overlay_addr.as_deref()) {
+                        Ok(()) => return,
+                        Err(err) => tracing::warn!("Hyprland focus restore failed: {err}"),
+                    }
+                }
+            }
+        }
         give_focus(self.game_window);
     }
 
@@ -397,6 +485,36 @@ fn foreground_is_in(dir: &std::path::Path) -> bool {
         win_exe_in_dir(&exe, &dir.display().to_string())
     }
 }
+#[cfg(target_os = "linux")]
+fn foreground_probe(dir: &std::path::Path) -> ForegroundProbe {
+    let our_pid = std::process::id();
+    if crate::hyprland::is_available() {
+        if let Some(aw) = crate::hyprland::active_window() {
+            if aw.pid != our_pid && process_in(aw.pid, dir) {
+                return ForegroundProbe {
+                    in_game: true,
+                    hypr_window: Some((aw.address, aw.workspace_id, aw.workspace_name)),
+                };
+            }
+            return ForegroundProbe {
+                in_game: false,
+                hypr_window: None,
+            };
+        }
+    }
+    ForegroundProbe {
+        in_game: foreground_is_in(dir),
+        hypr_window: None,
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn foreground_probe(dir: &std::path::Path) -> ForegroundProbe {
+    ForegroundProbe {
+        in_game: foreground_is_in(dir),
+        hypr_window: None,
+    }
+}
+
 /// Linux: the focused X window (games run on X11 or XWayland) belongs to a
 /// process whose program, folder or command line is inside the game's
 /// folder. Proton games are Wine processes, so their command line holds the
@@ -732,6 +850,36 @@ fn keep_ticking(app: &mut SteamApp, ctx: &egui::Context) {
 pub fn logic(app: &mut SteamApp, ctx: &egui::Context) {
     poll_ingame(app, ctx);
     if app.overlay.ingame.is_none() {
+        if let Some((id, _)) = app.overlay.game {
+            let dir = app.local.games.iter().find(|g| g.app_id == id).map(|g| g.install_dir.as_path());
+            app.overlay.sync_hotkey(dir, ctx, &app._rt);
+            let toggled = if app.overlay.pressed.swap(false, Ordering::Relaxed) {
+                app.overlay.toggle();
+                true
+            } else {
+                false
+            };
+            let want_fallback_ui = app.overlay.open || (app.overlay.any_pinned() && app.overlay.game_front);
+            if want_fallback_ui != app.overlay.fallback_vp_active
+                || !app.overlay.pending.is_empty()
+                || toggled
+                || app.overlay.preview.is_some()
+            {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::RequestPaintWhileHidden,
+                );
+                ctx.request_repaint();
+            }
+        } else if app.overlay.fallback_vp_active {
+            // Game exited while the fallback overlay viewport was open: ask ROOT for
+            // one UI pass so `show()` omits the child viewport and closes it.
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::RequestPaintWhileHidden,
+            );
+            ctx.request_repaint();
+        }
         return;
     }
     let mut actions = std::mem::take(&mut app.overlay.pending);
@@ -757,6 +905,7 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
     // Pinned windows only float over the game, not over other apps.
     if !ingame && !active && !(app.overlay.any_pinned() && app.overlay.game_front) {
         app.overlay.passthrough = None;
+        app.overlay.fallback_vp_active = false;
         return;
     }
     load_once(app);
@@ -795,13 +944,18 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
         .with_mouse_passthrough(!active)
         .with_taskbar(false);
     #[cfg(target_os = "linux")]
-    {
+    if crate::hyprland::is_available() {
+        // Fixed-size Wayland toplevels map as floating in Hyprland. This also
+        // avoids its tiled-window fullscreen policy during the initial map.
+        builder = builder.with_resizable(false);
+    } else {
         builder = builder.with_fullscreen(true);
     }
     // Linux: the overlay window draws in its own frames. The main window is
     // behind the game or minimized then, and the compositor (GNOME on
     // Wayland) hardly gives it frames, so an overlay drawn from them
     // opened late and crawled.
+    app.overlay.fallback_vp_active = true;
     #[cfg(target_os = "linux")]
     if !ctx.embed_viewports() {
         let ptr = AppPtr(app);
@@ -818,9 +972,80 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
                 app.overlay.passthrough = Some(!active);
             }
             if opened_now {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                if !crate::hyprland::is_available() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
                 app.overlay.focused = true;
+            }
+            if active && !app.overlay.hypr_placed && crate::hyprland::is_available() {
+                app.overlay.hypr_placed = true;
+                if let Some((ws_id, ws_name)) = app.overlay.game_hypr_ws.clone() {
+                    let hypr_state = app.overlay.hypr_state.clone();
+                    let generation = hypr_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .placement_generation;
+                    let game_addr = app.overlay.game_hypr_addr.clone();
+                    let overlay_title = format!("{} Overlay", i18n::BRAND);
+                    let our_pid = std::process::id();
+                    app._rt.spawn_blocking(move || {
+                        for attempt in 0..16 {
+                            {
+                                let st = hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+                                if st.placement_generation != generation {
+                                    return;
+                                }
+                            }
+                            let all_clients = crate::hyprland::clients();
+                            if let Some(win) = crate::hyprland::select_overlay_window(
+                                &all_clients,
+                                our_pid,
+                                &overlay_title,
+                            )
+                            .filter(|win| win.mapped && !win.hidden)
+                            {
+                                if win.fullscreen != 0 {
+                                    tracing::warn!("Hyprland overlay must be non-fullscreen to float above a game");
+                                    return;
+                                }
+                                let monitors = crate::hyprland::monitors();
+                                let target_game = game_addr.as_deref().and_then(|addr| {
+                                    all_clients
+                                        .iter()
+                                        .find(|w| w.address == addr && w.workspace_id == ws_id)
+                                });
+                                let monitor_geom = crate::hyprland::select_monitor_geom(
+                                    &monitors,
+                                    target_game,
+                                    ws_id,
+                                );
+                                let placement = crate::hyprland::OverlayPlacement {
+                                    overlay_addr: &win.address,
+                                    ws_id,
+                                    ws_name: &ws_name,
+                                    monitor_geom,
+                                };
+                                let mut st = hypr_state.lock().unwrap_or_else(|e| e.into_inner());
+                                if st.placement_generation != generation {
+                                    return;
+                                }
+                                match crate::hyprland::place_overlay_on_workspace(&placement) {
+                                    Ok(()) => {
+                                        st.overlay_addr = Some(win.address.clone());
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!("Hyprland overlay placement failed: {err}");
+                                    }
+                                }
+                                break;
+                            }
+                            if attempt < 15 {
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                            }
+                        }
+                    });
+                }
             }
             let t = app.prefs.theme.clone();
             let mut actions = std::mem::take(&mut app.overlay.pending);
@@ -830,6 +1055,10 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
             app.overlay.pending = actions;
             // Window commands (and closing) are the main window's job.
             if !app.overlay.pending.is_empty() || !app.overlay.open {
+                ui.ctx().send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::RequestPaintWhileHidden,
+                );
                 ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
             }
             if app.overlay.open {
@@ -1534,7 +1763,11 @@ fn screenshots_window(app: &mut SteamApp, ctx: &egui::Context, t: &Theme) {
             if w::button(ui, t, Some(icons::CAMERA), t!("Take screenshot (F12)"), w::Kind::Primary, w::Size::Sm).clicked() {
                 app.overlay.take_shot_requested = true;
                 // Close overlay so the screenshot captures the game itself.
-                app.overlay.open = false;
+                if app.overlay.ingame.is_none() {
+                    app.overlay.close();
+                } else {
+                    app.overlay.open = false;
+                }
             }
             if w::button(ui, t, Some(icons::FOLDER), t!("Open folder"), w::Kind::Secondary, w::Size::Sm).clicked() {
                 let account = (app.state.steam_id & 0xFFFF_FFFF) as u32;

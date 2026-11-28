@@ -637,8 +637,8 @@ impl Library {
                     local::open_folder(&g.install_dir);
                 }
                 #[cfg(not(windows))]
-                if let Some(pfx) = local::compat::existing_compat_data(&g.install_dir, app) {
-                    if w::button(ui, t, Some(icons::FOLDER), t!("Show Proton prefix folder"), w::Kind::Secondary, w::Size::Sm).clicked() {
+                if let Some(pfx) = local::compat::prefix_dir(&g.install_dir, app) {
+                    if w::button(ui, t, Some(icons::FOLDER), t!("Browse Proton prefix"), w::Kind::Secondary, w::Size::Sm).clicked() {
                         local::open_folder(&pfx);
                     }
                 }

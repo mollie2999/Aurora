@@ -1093,8 +1093,8 @@ impl Library {
                     item(ui, icons::DESKTOP, t!("Add desktop shortcut"), MenuAct::Shortcut);
                     item(ui, icons::FOLDER, t!("Browse local files"), MenuAct::Browse);
                     #[cfg(not(windows))]
-                    if ctx.local.games.iter().find(|g| g.app_id == id).and_then(|g| local::compat::existing_compat_data(&g.install_dir, id)).is_some() {
-                        item(ui, icons::FOLDER, t!("Show Proton prefix folder"), MenuAct::BrowsePrefix);
+                    if ctx.local.games.iter().find(|g| g.app_id == id).and_then(|g| local::compat::prefix_dir(&g.install_dir, id)).is_some() {
+                        item(ui, icons::FOLDER, t!("Browse Proton prefix"), MenuAct::BrowsePrefix);
                     }
                     item(ui, icons::SHIELD, t!("Verify game files"), MenuAct::Verify);
                     item(ui, icons::DRIVES, t!("Move install folder…"), MenuAct::Move);
@@ -1175,7 +1175,7 @@ impl Library {
             }
             #[cfg(not(windows))]
             MenuAct::BrowsePrefix => {
-                if let Some(dir) = local.and_then(|g| local::compat::existing_compat_data(&g.install_dir, id)) {
+                if let Some(dir) = local.and_then(|g| local::compat::prefix_dir(&g.install_dir, id)) {
                     local::open_folder(&dir);
                 }
             }
@@ -2422,7 +2422,7 @@ impl Library {
                 }
                 #[cfg(not(windows))]
                 if let Some(pfx) = client::non_steam_compat_data(&g.exe, g.steam_app_id) {
-                    if w::button(ui, t, Some(icons::FOLDER), t!("Show Proton prefix folder"), w::Kind::Secondary, w::Size::Lg).clicked() {
+                    if w::button(ui, t, Some(icons::FOLDER), t!("Browse Proton prefix"), w::Kind::Secondary, w::Size::Lg).clicked() {
                         local::open_folder(&pfx);
                     }
                 }
@@ -2805,6 +2805,9 @@ impl Library {
                 ui.label(w::text(t!("Network {net}/s · Disk {disk}/s", net = ui::bytes(d.speed), disk = ui::bytes(d.disk_speed)), 12.0, t.text_faint));
             }
         });
+        if t.name.eq_ignore_ascii_case("Metro") {
+            ui.add_space(8.0);
+        }
         if d.verifying() {
             if w::icon_button(ui, t, icons::X, t!("Cancel"), false, 0).clicked() {
                 ctx.send(Command::CancelVerify { app_id: id });
@@ -2835,9 +2838,9 @@ impl Library {
                 local::open_folder(&g.install_dir);
             }
             #[cfg(not(windows))]
-            if let Some(pfx) = local::compat::existing_compat_data(&g.install_dir, id) {
-                if item(ui, icons::FOLDER, t!("Show Proton prefix folder"), t.text) {
-                    local::open_folder(&pfx);
+            if let Some(dir) = local::compat::prefix_dir(&g.install_dir, id) {
+                if item(ui, icons::FOLDER, t!("Browse Proton prefix"), t.text) {
+                    local::open_folder(&dir);
                 }
             }
             if item(ui, icons::SHIELD, t!("Verify game files"), t.text) {

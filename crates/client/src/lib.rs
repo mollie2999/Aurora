@@ -22,6 +22,8 @@ mod installscript;
 pub mod market;
 pub mod profile_edit;
 pub mod social;
+pub mod showcases;
+pub mod profile_page;
 pub mod cloud;
 pub mod reviews;
 pub mod discovery;
@@ -37,7 +39,8 @@ mod input_config;
 pub mod account;
 pub mod chat_groups;
 mod notify;
-mod pads;
+pub mod pads;
+pub(crate) mod vpad;
 
 /// One HTTP client for plain requests (one connection pool and TLS setup,
 /// instead of a new client per request).
@@ -62,13 +65,13 @@ pub use input_config::{
     set_app_binding, set_app_bindings,
 };
 pub use pads::{
-    ConnectionKind, ControllerFamily, ControllerSettings, DetectedController, DetectionSnapshot, FamilyToggles,
-    LiveInput, PadCalibration, SteamInputDecision, app_controller, effective_controller_override, poll_ui as poll_controllers,
+    ConnectedPadSummary, ConnectionKind, ControllerFamily, ControllerSettings, DetectedController, DetectionSnapshot,
+    FamilyToggles, HapticSide, TouchpadHaptic, LauncherPadFrame, LauncherPadSample, LiveInput, PadCalibration, SteamInputDecision, TouchpadFinger,
+    app_controller, connected_summary as connected_pad_summary, effective_controller_override, poll_ui as poll_controllers,
     refresh_ui as refresh_controllers, resolve_steam_input, set_app_controller, set_app_controllers,
-    set_settings as set_controller_settings, settings as controller_settings, trigger_test_rumble,
+    set_settings as set_controller_settings, settings as controller_settings, subscribe_launcher_pads,
+    trigger_touchpad_haptic, trigger_test_rumble, virtual_pad_available, virtual_pad_backend, virtual_pad_hint,
 };
-#[cfg(windows)]
-pub use pads::listen_for_controller_guide;
 pub use launch::{LaunchArgs, LaunchMode, STEAM_DRM, acknowledge_anti_cheat, app_overlay_enabled, mode as launch_mode, mode_cached as launch_mode_cached, mode_peek as launch_mode_peek, overlay_enabled, proton_builds, proton_override, app_proton, app_protons, default_proton, native_build, NATIVE, DEFAULT_PROTON, safe_connect_args, set_app_overlay, set_app_proton, set_app_protons, set_anti_cheat_acknowledged, set_overlay_disabled_apps, set_overlay_enabled, set_overlay_hotkeys, set_prefer_official as launch_through_steam, set_proton_override, set_steam_setting, steam_setting, steam_settings_locked, SteamSetting, apply_steam_prefs, gameplay_downloads, set_gameplay_downloads, spawn_non_steam};
 pub use state::State;
 pub use store::SavedAccount;
@@ -223,6 +226,16 @@ pub enum Command {
     SaveSteamCollections { save: Vec<(String, collections::Entry)>, delete: Vec<String> },
     /// Comments on a profile (newest first), from `start`.
     LoadComments { steam_id: SteamId, start: u32 },
+    /// A profile's showcases (favorite game, group, artwork…). `language` is Steam's name.
+    LoadShowcases { steam_id: SteamId, language: String },
+    /// Steam's profile page: right column, top friends, recent activity.
+    LoadProfilePage { steam_id: SteamId, language: String },
+    /// A profile's previous names.
+    LoadAliases { steam_id: SteamId },
+    /// The SteamID behind a custom profile URL (steamcommunity.com/id/<vanity>).
+    ResolveProfileUrl { vanity: String },
+    /// Clear your own previous names.
+    ClearAliases,
     /// Leave a comment on a profile.
     PostComment { steam_id: SteamId, text: String },
     /// Delete a comment (on your profile, or one you wrote).
@@ -445,6 +458,11 @@ impl std::fmt::Debug for Command {
             Command::LoadSteamCollections => f.write_str("LoadSteamCollections"),
             Command::SaveSteamCollections { save, delete } => f.debug_struct("SaveSteamCollections").field("save", save).field("delete", delete).finish(),
             Command::LoadComments { steam_id, start } => f.debug_struct("LoadComments").field("steam_id", steam_id).field("start", start).finish(),
+            Command::LoadShowcases { steam_id, language } => f.debug_struct("LoadShowcases").field("steam_id", steam_id).field("language", language).finish(),
+            Command::LoadProfilePage { steam_id, language } => f.debug_struct("LoadProfilePage").field("steam_id", steam_id).field("language", language).finish(),
+            Command::LoadAliases { steam_id } => f.debug_struct("LoadAliases").field("steam_id", steam_id).finish(),
+            Command::ResolveProfileUrl { vanity } => f.debug_struct("ResolveProfileUrl").field("vanity", vanity).finish(),
+            Command::ClearAliases => f.write_str("ClearAliases"),
             Command::PostComment { steam_id, text } => f.debug_struct("PostComment").field("steam_id", steam_id).field("text", text).finish(),
             Command::DeleteComment { steam_id, comment_id } => f.debug_struct("DeleteComment").field("steam_id", steam_id).field("comment_id", comment_id).finish(),
             Command::LoadBadges { steam_id } => f.debug_struct("LoadBadges").field("steam_id", steam_id).finish(),
@@ -646,6 +664,13 @@ pub enum Event {
     SteamCollectionsSaved { save: Vec<(String, collections::Entry)>, delete: Vec<String>, result: Result<(), String> },
     /// Comments on a profile, or why they can't be shown (private, turned off).
     Comments { steam_id: SteamId, result: Result<model::Comments, String> },
+    Showcases { steam_id: SteamId, result: Result<Vec<model::Showcase>, String> },
+    ProfilePage { steam_id: SteamId, result: Result<model::ProfilePage, String> },
+    Aliases { steam_id: SteamId, result: Result<Vec<model::Alias>, String> },
+    /// A custom profile URL's SteamID (`vanity` as asked, lowercase).
+    ProfileUrlResolved { vanity: String, result: Result<SteamId, String> },
+    /// Outcome of "Clear Previous Aliases".
+    AliasesCleared(Result<(), String>),
     CommentPosted { steam_id: SteamId, result: Result<(), String> },
     ServerInfo { addr: String, result: Result<crate::a2s::ServerInfo, String> },
     GameServerList { request_id: u64, result: Result<Vec<model::GameServerEntry>, String> },

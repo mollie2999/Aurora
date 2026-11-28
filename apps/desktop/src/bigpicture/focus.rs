@@ -64,6 +64,31 @@ pub struct Hit {
 impl Focus {
     /// Start a frame: apply a move using last frame's item positions.
     pub fn begin(&mut self, ui: &Ui, dir: Option<Dir>, press: bool) {
+        self.begin_frame(ui, dir, press, |focus, dir, now| focus.step(dir, now));
+    }
+
+    /// Drawer rows are registered in reading order. Scrolling moves their
+    /// rectangles, so geometry alone cannot identify the previous or next row.
+    pub fn begin_drawer(&mut self, ui: &Ui, dir: Option<Dir>, press: bool, skip: impl Fn(Id) -> bool, wrap: bool) {
+        self.begin_frame(ui, dir, press, |focus, dir, now| {
+            let ordered = focus.last.iter().filter(|item| !skip(item.id)).map(|item| item.id);
+            let current = focus.current;
+            let next = match dir {
+                Dir::Down => drawer_neighbor(ordered, current, wrap),
+                Dir::Up => drawer_neighbor(ordered.rev(), current, wrap),
+                Dir::Left | Dir::Right => return focus.step(dir, now),
+            };
+            focus.by_pointer = false;
+            if let Some(id) = next.filter(|id| Some(*id) != current) {
+                focus.current = Some(id);
+                focus.moved = true;
+            } else {
+                focus.bump = Some(now);
+            }
+        });
+    }
+
+    fn begin_frame(&mut self, ui: &Ui, dir: Option<Dir>, press: bool, step: impl FnOnce(&mut Self, Dir, f64)) {
         if self.opened == 0.0 {
             self.opened = ui.input(|i| i.time).max(0.001);
         }
@@ -84,7 +109,7 @@ impl Focus {
             self.last_pointer = pos;
         }
         if let Some(d) = dir {
-            self.step(d, now);
+            step(self, d, now);
         }
         if self.current != self.seen {
             self.seen = self.current;
@@ -189,6 +214,11 @@ impl Focus {
         changed && self.current.is_some()
     }
 
+    pub fn current_place(&self) -> Option<Place> {
+        let id = self.current?;
+        self.items.iter().find(|item| item.id == id).map(|item| item.place)
+    }
+
     /// The focused item's rect and place this frame.
     pub fn focused(&self) -> Option<(Rect, Place)> {
         let c = self.current?;
@@ -236,6 +266,15 @@ impl Focus {
         }
         let ring_color = ui::widgets::mix(t.accent, Color32::WHITE, 0.25 + 0.2 * pulse);
         p.rect_stroke(rect.expand(2.0 * s), CornerRadius::same((radius + 2.0 * s).min(255.0) as u8), Stroke::new(3.5 * s, ring_color), StrokeKind::Outside);
+    }
+}
+
+fn drawer_neighbor(mut items: impl Iterator<Item = Id>, current: Option<Id>, wrap: bool) -> Option<Id> {
+    let first = items.next()?;
+    if current == Some(first) || items.by_ref().any(|id| Some(id) == current) {
+        items.next().or_else(|| wrap.then_some(first))
+    } else {
+        Some(first)
     }
 }
 
@@ -430,4 +469,38 @@ mod tests {
         assert!(!focus.moved);
         assert!(focus.items.is_empty());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn drawer_up_reaches_scrolled_rows_before_fixed_controls() {
+    let ctx = egui::Context::default();
+    let tab = Id::unique("tab");
+    let other_tab = Id::unique("other-tab");
+    let banner = Id::unique("banner");
+    let rows = [Id::unique("first"), Id::unique("second")];
+    let mut focus = Focus { current: Some(rows[1]), ..Default::default() };
+    let mut frame = |dir, expected| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            focus.begin_drawer(ui, dir, false, |id| id == other_tab, false);
+            assert_eq!(focus.current, Some(expected));
+            for (id, x, y, place) in [
+                (tab, 0.0, 15.0, Place::Bar),
+                (other_tab, 50.0, 15.0, Place::Bar),
+                (banner, 0.0, 50.0, Place::Bar),
+                (rows[0], 0.0, 36.0, Place::Page),
+                (rows[1], 0.0, 99.0, Place::Page),
+            ] {
+                let rect = Rect::from_min_size(egui::pos2(x, y), egui::vec2(40.0, 20.0));
+                focus.item(ui, id, rect, ui.clip_rect(), place);
+            }
+        });
+        output.textures_delta.clear();
+    };
+    frame(None, rows[1]);
+    frame(Some(Dir::Up), rows[0]);
+    frame(Some(Dir::Up), banner);
+    frame(Some(Dir::Up), tab);
+    frame(Some(Dir::Down), banner);
+    frame(Some(Dir::Down), rows[0]);
 }

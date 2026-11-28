@@ -493,6 +493,11 @@ fn cloud_lock(account: SteamId, app: AppId) -> std::sync::Arc<tokio::sync::Mutex
     lock
 }
 
+enum GameProcessEvent {
+    HeadlessStarted(AppId),
+    Exited(AppId, Option<std::path::PathBuf>),
+}
+
 /// Data the online loop keeps between messages.
 struct Online {
     conn: Connection,
@@ -544,6 +549,8 @@ struct Online {
     launch_layouts: HashMap<AppId, std::sync::Arc<tokio::sync::Mutex<crate::input_config::LaunchLayout>>>,
     /// Games we read non-Xbox controllers for (see pads.rs).
     pad_users: HashSet<AppId>,
+    /// Games backed by OS virtual Xbox 360 pads (`app_id -> include_xbox`).
+    vpad_users: HashMap<AppId, bool>,
     /// Games the official Steam client runs (anti-cheat), by install folder.
     official: HashMap<AppId, std::path::PathBuf>,
     /// Games stopped because their Steam DRM refused our steamclient: Play
@@ -679,6 +686,7 @@ async fn online(
         launch_tokens: HashMap::new(),
         launch_layouts: HashMap::new(),
         pad_users: HashSet::new(),
+        vpad_users: HashMap::new(),
         official: HashMap::new(),
         drm_relaunch: Default::default(),
         country: String::new(),
@@ -702,7 +710,7 @@ async fn online(
     };
     let (dl_tx, mut dl_rx) = mpsc::unbounded_channel::<(AppId, Result<String, String>)>();
     let (apps_tx, mut apps_rx) = mpsc::unbounded_channel::<Vec<OwnedApp>>();
-    let (exit_tx, mut exit_rx) = mpsc::unbounded_channel::<(AppId, Option<std::path::PathBuf>)>();
+    let (process_tx, mut process_rx) = mpsc::unbounded_channel::<GameProcessEvent>();
     // Launches that waited for a Steam Cloud download.
     let (launch_tx, mut launch_rx) = mpsc::unbounded_channel::<(AppId, std::path::PathBuf, crate::LaunchArgs)>();
     // Launches that waited for Workshop downloads (Steam Cloud comes next).
@@ -836,13 +844,13 @@ async fn online(
                         });
                     }
                     None => {
-                        let _ = st.launch(app_id, &install_dir, &args, sink, &exit_tx);
+                        let _ = st.launch(app_id, &install_dir, &args, sink, &process_tx);
                     }
                 }
             }
             #[cfg(windows)]
             {
-                let _ = st.launch(app_id, &install_dir, &args, sink, &exit_tx);
+                let _ = st.launch(app_id, &install_dir, &args, sink, &process_tx);
             }
             }
             }
@@ -1302,6 +1310,36 @@ async fn online(
                     let result = crate::social::comments(web.as_deref().ok(), steam_id, start).await;
                     sink(Event::Comments { steam_id, result });
                 }),
+                Some(Command::LoadProfilePage { steam_id, language }) => st.with_web(sink, move |web, sink| async move {
+                    let result = crate::profile_page::load(web.as_deref().ok(), steam_id, &language).await;
+                    sink(Event::ProfilePage { steam_id, result });
+                }),
+                Some(Command::LoadAliases { steam_id }) => st.with_web(sink, move |web, sink| async move {
+                    let result = crate::social::aliases(web.as_deref().ok(), steam_id).await;
+                    sink(Event::Aliases { steam_id, result });
+                }),
+                Some(Command::ResolveProfileUrl { vanity }) => st.with_web(sink, move |web, sink| async move {
+                    let vanity = vanity.to_ascii_lowercase();
+                    let result = crate::social::resolve_vanity(web.as_deref().ok(), &vanity).await;
+                    sink(Event::ProfileUrlResolved { vanity, result });
+                }),
+                Some(Command::ClearAliases) => {
+                    let me = st.me;
+                    st.with_web(sink, move |web, sink| async move {
+                        let result = match web {
+                            Ok(w) => crate::social::clear_aliases(&w, me).await,
+                            Err(e) => Err(e),
+                        };
+                        sink(Event::AliasesCleared(result));
+                    })
+                }
+                Some(Command::LoadShowcases { steam_id, language }) => {
+                    let (conn, sink) = (st.conn.clone(), sink.clone());
+                    tokio::spawn(async move {
+                        let result = crate::showcases::load(&conn, steam_id, &language).await;
+                        sink(Event::Showcases { steam_id, result });
+                    });
+                }
                 Some(Command::SetNickname { steam_id, nickname }) => {
                     let nick = nickname.clone().unwrap_or_default();
                     let _ = st.conn.send(emsg::AM_CLIENT_SET_PLAYER_NICKNAME, &CMsgClientSetPlayerNickname { steamid: Some(steam_id), nickname: Some(nick) });
@@ -1827,7 +1865,7 @@ async fn online(
             Some((app_id, dir, args)) = launch_rx.recv() => launch_now!(app_id, dir, args),
             Some((app_id, dir, args)) = sh_rx.recv() => {
                 st.shader_jobs.remove(&app_id);
-                let _ = st.launch(app_id, &dir, &args, sink, &exit_tx);
+                let _ = st.launch(app_id, &dir, &args, sink, &process_tx);
             }
             Some((app_id, dir, args)) = ws_rx.recv() => launch_cloud!(app_id, dir, args),
             Some((app_id, report)) = vf_rx.recv() => {
@@ -1835,13 +1873,29 @@ async fn online(
                 sink(Event::VerifyFinished { app_id, result: Ok(report) });
             }
             Some(call) = ipc_rx.recv() => st.ipc_call(call, sink),
-            Some((app_id, host_cloud_dir)) = exit_rx.recv() => {
+            Some(event) = process_rx.recv() => {
+                let (app_id, host_cloud_dir) = match event {
+                    GameProcessEvent::HeadlessStarted(app_id) => {
+                        st.playing = Some(app_id);
+                        if st.link == Link::Online {
+                            if let Err(e) = games_played(&st.conn, Some(app_id)) {
+                                tracing::warn!("could not announce headless game {app_id}: {e}");
+                            }
+                        }
+                        sink(Event::GameStarted { app_id });
+                        continue;
+                    }
+                    GameProcessEvent::Exited(app_id, dir) => (app_id, dir),
+                };
                 st.running.remove(&app_id);
                 st.stop_flags.remove(&app_id);
                 st.launch_layouts.remove(&app_id);
                 st.official.remove(&app_id);
                 if st.pad_users.remove(&app_id) {
                     crate::pads::stop();
+                }
+                if let Some(include_xbox) = st.vpad_users.remove(&app_id) {
+                    crate::pads::stop_virtual_pads(include_xbox);
                 }
                 if let Some(token) = st.launch_tokens.remove(&app_id) {
                     launch::swap_exited(&token);
@@ -3114,7 +3168,7 @@ impl Online {
         dir: &std::path::Path,
         args: &crate::LaunchArgs,
         sink: &Sink,
-        exit_tx: &mpsc::UnboundedSender<(AppId, Option<std::path::PathBuf>)>,
+        process_tx: &mpsc::UnboundedSender<GameProcessEvent>,
     ) -> Result<(), Error> {
         if let Err(e) = launch::safe_connect_args(&args.connect) {
             sink(Event::Error(e));
@@ -3145,20 +3199,19 @@ impl Online {
                 self.running.insert(app_id, 0);
                 self.stop_flags.insert(app_id, stop_flag);
                 self.official.insert(app_id, dir.to_path_buf());
-                let (tx, sink, args, me, offline) = (exit_tx.clone(), sink.clone(), args.clone(), self.me, self.link != Link::Online);
+                let (tx, sink, args, me, offline) = (process_tx.clone(), sink.clone(), args.clone(), self.me, self.link != Link::Online);
                 tokio::task::spawn_blocking(move || {
                     let started = || sink(Event::GameStarted { app_id });
                     if let Err(e) = launch::run_through_steam(app_id, &args, me, offline, started) {
                         sink(Event::Error(e));
                     }
-                    let _ = tx.send((app_id, None));
+                    let _ = tx.send(GameProcessEvent::Exited(app_id, None));
                 });
                 return Ok(());
             }
             crate::LaunchMode::HeadlessHost { steam_drm } => {
-                // The user's own Steam engine, headless, runs it; we follow
-                // along like the official-client case (the engine sends its
-                // own presence/stats). It needs the live refresh token.
+                // Aurora spawns the game after the headless engine signs in.
+                // Announce it to Steam once the spawn succeeds.
                 let app = app.clone();
                 let (account, token, me) = (self.account.clone(), self.refresh_token.clone(), self.me);
                 self.running.insert(app_id, 0);
@@ -3176,11 +3229,39 @@ impl Online {
                 };
                 #[cfg(windows)]
                 let overlay: Option<(u16, String)> = None;
-                let (tx, sink, args, dir2) = (exit_tx.clone(), sink.clone(), args.clone(), dir.to_path_buf());
+                let needs_vpad = launch::needs_aurora_input_route(app_id, args.controller);
+                let ctrl_override = crate::pads::effective_controller_override(app_id, args.controller);
+                let include_xbox = ctrl_override == 1
+                    || crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+                let vpad_started = if needs_vpad {
+                    if crate::pads::start_virtual_pads(include_xbox) {
+                        self.vpad_users.insert(app_id, include_xbox);
+                        tracing::info!(
+                            "controllers: HeadlessHost launch for {} using {} virtual Xbox 360 pad",
+                            app.name,
+                            crate::pads::virtual_pad_backend()
+                        );
+                        true
+                    } else {
+                        tracing::warn!(
+                            "controllers: HeadlessHost launch for {} needs controller translation, but {} is unavailable ({})",
+                            app.name,
+                            crate::pads::virtual_pad_backend(),
+                            crate::pads::virtual_pad_hint()
+                        );
+                        false
+                    }
+                } else {
+                    false
+                };
+                sink(Event::ControllerLayoutRoute { app_id, enabled: false });
+                let (tx, sink, args, dir2) = (process_tx.clone(), sink.clone(), args.clone(), dir.to_path_buf());
                 tokio::task::spawn_blocking(move || {
-                    let started = || sink(Event::GameStarted { app_id });
+                    let started = || {
+                        let _ = tx.send(GameProcessEvent::HeadlessStarted(app_id));
+                    };
                     let ov = overlay.as_ref().map(|(p, t)| (*p, t.as_str()));
-                    let cloud_dir = match launch::run_through_host_cancellable(&app, &dir2, &args, &account, &token, me, ov, Some(&stop_flag), started) {
+                    let cloud_dir = match launch::run_through_host_cancellable(&app, &dir2, &args, &account, &token, me, ov, vpad_started, Some(&stop_flag), started) {
                         Ok(()) if !steam_drm => Some(dir2),
                         Ok(()) => None,
                         Err(e) => {
@@ -3188,7 +3269,7 @@ impl Online {
                             None
                         }
                     };
-                    let _ = tx.send((app_id, cloud_dir));
+                    let _ = tx.send(GameProcessEvent::Exited(app_id, cloud_dir));
                 });
                 return Ok(());
             }
@@ -3209,6 +3290,18 @@ impl Online {
                 let pads = (swapped.is_ok() && input_decision.enabled && input_decision.use_shm_bridge)
                     .then(crate::pads::start)
                     .flatten();
+                #[cfg(not(windows))]
+                let (vpad_started, vpad_include_xbox) = {
+                    let include_xbox = ctrl_override == 1
+                        || crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+                    let ok = swapped.is_ok()
+                        && input_decision.enabled
+                        && launch::needs_aurora_input_route(app_id, args.controller)
+                        && crate::pads::start_virtual_pads(include_xbox);
+                    (ok, include_xbox)
+                };
+                #[cfg(windows)]
+                let (vpad_started, vpad_include_xbox) = (false, false);
                 #[cfg(target_os = "linux")]
                 let overlay = if launch::app_overlay_enabled(app_id) {
                     self.ipc.overlay_port().map(|port| (port, token.clone()))
@@ -3219,15 +3312,23 @@ impl Online {
                 let overlay: Option<(u16, String)> = None;
                 let started = swapped.and_then(|_| {
                     let ov = overlay.as_ref().map(|(p, t)| (*p, t.as_str()));
-                    launch::spawn_with_steamclient(app, dir, args, &self.ipc.env_value(&token), &self.account, pads.as_deref(), ov)
+                    launch::spawn_with_steamclient(app, dir, args, &self.ipc.env_value(&token), &self.account, pads.as_deref(), ov, vpad_started)
                 });
-                if started.is_err() && pads.is_some() {
-                    crate::pads::stop();
+                if started.is_err() {
+                    if pads.is_some() {
+                        crate::pads::stop();
+                    }
+                    if vpad_started {
+                        crate::pads::stop_virtual_pads(vpad_include_xbox);
+                    }
                 }
                 match started {
                     Ok(child) => {
                         if pads.is_some() {
                             self.pad_users.insert(app_id);
+                        }
+                        if vpad_started {
+                            self.vpad_users.insert(app_id, vpad_include_xbox);
                         }
                         self.launch_tokens.insert(app_id, token.clone());
                         if input_decision.enabled {
@@ -3239,7 +3340,7 @@ impl Online {
                             tokio::time::sleep(Duration::from_secs(300)).await;
                             launch::swap_loaded(&token);
                         });
-                        self.track(app_id, dir, child, sink, exit_tx)?;
+                        self.track(app_id, dir, child, sink, process_tx)?;
                     }
                     Err(e) => {
                         launch::swap_exited(&token);
@@ -3266,7 +3367,7 @@ impl Online {
                         if let Some((_, tok)) = overlay {
                             self.launch_tokens.insert(app_id, tok);
                         }
-                        self.track(app_id, dir, child, sink, exit_tx)?;
+                        self.track(app_id, dir, child, sink, process_tx)?;
                     }
                     Err(e) => {
                         if let Some((_, tok)) = overlay {
@@ -3281,7 +3382,7 @@ impl Online {
     }
 
     /// A game we started ourselves: we're the one "playing" it.
-    fn track(&mut self, app_id: AppId, dir: &std::path::Path, child: std::process::Child, sink: &Sink, exit_tx: &mpsc::UnboundedSender<(AppId, Option<std::path::PathBuf>)>) -> Result<(), Error> {
+    fn track(&mut self, app_id: AppId, dir: &std::path::Path, child: std::process::Child, sink: &Sink, process_tx: &mpsc::UnboundedSender<GameProcessEvent>) -> Result<(), Error> {
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.running.insert(app_id, child.id());
         self.stop_flags.insert(app_id, stop_flag.clone());
@@ -3294,10 +3395,11 @@ impl Online {
             self.unconnected_play.insert(app_id, (unix_now(), self.link == Link::Offline));
         }
         sink(Event::GameStarted { app_id });
-        let tx = exit_tx.clone();
+        let tx = process_tx.clone();
         let dir_owned = dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let _ = tx.send((launch::wait_in_dir_cancellable(app_id, &dir_owned, child, Some(&stop_flag)), None));
+            let app_id = launch::wait_in_dir_cancellable(app_id, &dir_owned, child, Some(&stop_flag));
+            let _ = tx.send(GameProcessEvent::Exited(app_id, None));
         });
         Ok(())
     }

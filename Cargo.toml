@@ -5,7 +5,7 @@ members = ["apps/desktop", "apps/installer", "crates/*", "xtask"]
 default-members = ["apps/desktop", "crates/steamclient"]
 
 [workspace.package]
-version = "1.0.0-rc5" # x-release-please-version
+version = "1.0.0-rc6" # x-release-please-version
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"

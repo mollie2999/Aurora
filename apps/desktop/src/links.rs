@@ -48,6 +48,56 @@ pub fn open_http(url: &str) -> bool {
     open::that_detached(parsed.as_str()).is_ok()
 }
 
+/// The page in Aurora a Steam web link stands for, if Aurora has one:
+/// profiles (`/profiles/<id>` and custom `/id/<name>` URLs), store pages,
+/// and the community pages the hub shows (workshop, guides, discussions…).
+pub fn in_app(url: &str) -> Option<(String, Option<String>)> {
+    let url = url.trim();
+    let scheme_len = if url.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
+        8
+    } else if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) {
+        7
+    } else {
+        return None;
+    };
+    let rest = &url[scheme_len..];
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let parts: Vec<&str> = path.split(['?', '#']).next().unwrap_or_default().split('/').filter(|p| !p.is_empty()).collect();
+    match (host, parts.as_slice()) {
+        ("steamcommunity.com", [kind, who, more @ ..]) if kind.eq_ignore_ascii_case("profiles") || kind.eq_ignore_ascii_case("id") => {
+            // Profile lists Aurora shows itself; anything else opens the profile.
+            let section = match more.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                Some("games") => "/games",
+                Some("badges") => "/badges",
+                Some("recommended" | "reviews") => "/reviews",
+                Some("groups") => "/groups",
+                Some("groupscommon") => "/groupscommon",
+                _ => "",
+            };
+            let who = if kind.eq_ignore_ascii_case("id") { format!("id:{who}") } else { who.parse::<u64>().ok()?.to_string() };
+            return Some(("profile".into(), Some(format!("{who}{section}"))));
+        }
+        ("store.steampowered.com", [app, id, ..]) if app.eq_ignore_ascii_case("app") => {
+            return Some(("store".into(), Some(format!("app:{}", id.parse::<u64>().ok()?))));
+        }
+        _ => {}
+    }
+    let view = crate::builtin::hub::route(url)?;
+    Some(view.to_page())
+}
+
+/// Where a link clicked in Steam text goes: a page in Aurora when it has one
+/// (see [`in_app`]), otherwise the browser.
+pub fn web_action(url: &str) -> Option<extensions::Action> {
+    if let Some((page, arg)) = in_app(url) {
+        return Some(extensions::Action::Navigate { page, arg });
+    }
+    open_http(url);
+    None
+}
+
 /// Right-clicking empty space on a page offers "Copy page URL" (its address
 /// on Steam), like a browser. Call it before drawing the page: its widgets
 /// are added after, so they keep their own clicks and menus.
@@ -286,6 +336,12 @@ pub(crate) fn big_picture_mode(request: &str) -> Option<(bool, bool)> {
         DECK_PREVIEW_WINDOW => Some((true, true)),
         _ => None,
     }
+}
+
+/// True when `--desktop` was passed on the command line to opt out of automatic
+/// Steam Deck Big Picture startup.
+pub(crate) fn desktop_requested(args: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+    args.into_iter().any(|a| a.as_ref() == "--desktop")
 }
 
 
@@ -672,6 +728,21 @@ pub fn game_icon(app: Option<&model::OwnedApp>, install_dir: &std::path::Path) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steam_web_links_open_in_aurora() {
+        let page = |u: &str| in_app(u).map(|(p, a)| (p, a.unwrap_or_default()));
+        let p = |page: &str, arg: &str| Some((page.to_string(), arg.to_string()));
+        assert_eq!(page("https://steamcommunity.com/profiles/76561198000000001"), p("profile", "76561198000000001"));
+        // Custom profile URLs keep their name's case for Steam to resolve.
+        assert_eq!(page("https://steamcommunity.com/id/MissColourz/"), p("profile", "id:MissColourz"));
+        assert_eq!(page("https://steamcommunity.com/id/yayazzli/groupscommon/"), p("profile", "id:yayazzli/groupscommon"));
+        assert_eq!(page("https://www.steamcommunity.com/id/x/games/?tab=all"), p("profile", "id:x/games"));
+        assert_eq!(page("https://store.steampowered.com/app/570/Dota_2/"), p("store", "app:570"));
+        assert_eq!(page("https://steamcommunity.com/sharedfiles/filedetails/?id=123"), p("workshop_item", "123"));
+        assert_eq!(page("https://example.com/id/x"), None);
+        assert_eq!(page("https://steamcommunity.com/profiles/notanumber"), None);
+    }
 
     #[test]
     fn parses_links() {

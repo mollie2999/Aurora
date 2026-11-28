@@ -81,6 +81,10 @@ impl Menu {
         self.stick = 0.0;
     }
 
+    pub(super) fn back_label(&self) -> &'static str {
+        if self.view == View::Main { t!("Close") } else { t!("Back") }
+    }
+
     pub fn input(&mut self, presses: &[(Press, bool)], now: f64) -> Outcome {
         if self.closing.is_some() {
             return Outcome::None;
@@ -139,21 +143,25 @@ pub fn show(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, screen: Rect) {
     let pad = (28.0 * s).min(width * 0.12);
     let header_height = (106.0 * s).min(panel.height() * 0.4);
     let header = Rect::from_min_max(panel.min, pos2(panel.right(), panel.top() + header_height));
-    let header_clicked = user_header(bp, ui, f, header.shrink2(vec2(pad, 0.0)), menu.closing.is_none());
     ui.painter().hline(header.x_range(), header.bottom(), Stroke::new(1.0, t.surface_hover));
 
-    let viewport = Rect::from_min_max(pos2(panel.left(), header.bottom()), panel.right_bottom());
+    let footer = menu_footer(panel, s, menu.view);
+    let viewport = Rect::from_min_max(pos2(panel.left(), header.bottom()), footer.right_top());
     let body_clip = viewport.intersect(screen);
     let body_ui = clipped_child(ui, viewport, body_clip);
     let active = menu.closing.is_none();
     let top = viewport.top() - menu.scroll.pos;
-    menu.focus.begin(&body_ui, menu.dir.take().filter(|_| active), std::mem::take(&mut menu.press) && active);
+    let dir = menu.dir.take().filter(|_| active);
+    let press = std::mem::take(&mut menu.press) && active;
+    menu.focus.begin_drawer(ui, dir, press, |_| false, menu.view == View::Main);
+    let span = Rangef::new(panel.left() + pad, panel.right() - pad);
+    let header_clicked = user_header(bp, &mut menu.focus, ui, f, header.shrink2(vec2(pad, 0.0)), header.intersect(screen), active);
     let mut rows = DrawerRows {
         ui: &body_ui,
         theme: &t,
         focus: &mut menu.focus,
         clip: body_clip,
-        span: Rangef::new(panel.left() + pad, panel.right() - pad),
+        span,
         y: top + 16.0 * s,
         s,
         active,
@@ -169,11 +177,20 @@ pub fn show(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, screen: Rect) {
         action = Some(MenuAction::Page(Page::Profile(f.app.state.steam_id)));
     }
     let height = rows.y - top + 10.0 * s;
+    if menu.view == View::Main && footer.is_positive() {
+        let clip = footer.intersect(screen);
+        let footer_ui = clipped_child(ui, footer, clip);
+        footer_ui.painter().hline(footer.x_range(), footer.top(), Stroke::new(1.0, t.surface_hover));
+        let mut footer_rows = DrawerRows {
+            ui: &footer_ui, theme: &t, focus: &mut menu.focus, clip, span,
+            y: footer.top() + 12.0 * s, s, active, place: Place::Bar, open_style: false,
+        };
+        if footer_exit(&mut footer_rows) {
+            action = Some(MenuAction::Leave);
+        }
+    }
     let default = menu.view.default_item();
     menu.focus.end(&[default], default);
-    if let Some((rect, _)) = menu.focus.focused() {
-        menu.focus.ring_around_clipped(rect, 10.0 * s, body_clip);
-    }
     scroll_body(
         &body_ui,
         &menu.focus,
@@ -183,7 +200,7 @@ pub fn show(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, screen: Rect) {
         std::mem::take(&mut menu.stick) * 44.0 * s,
         active,
     );
-    menu.focus.paint_ring(&body_ui, &t, s, 10.0 * s, body_clip);
+    menu.focus.paint_ring(ui, &t, s, 10.0 * s, body_clip);
 
     match action {
         Some(MenuAction::View(view)) => {
@@ -310,10 +327,16 @@ fn main_rows(rows: &mut DrawerRows<'_>, f: &Frame<'_>) -> Option<MenuAction> {
     if rows.button(menu_id("power"), icons::POWER, t!("Power"), icons::CARET_RIGHT, false) {
         action = Some(MenuAction::View(View::Power));
     }
-    if rows.button(menu_id("leave"), icons::DESKTOP, t!("Exit Big Picture"), "", false) {
-        action = Some(MenuAction::Leave);
-    }
     action
+}
+
+fn menu_footer(panel: Rect, s: f32, view: View) -> Rect {
+    let height = if view == View::Main { (74.0 * s).min(panel.height() * 0.5) } else { 0.0 };
+    Rect::from_min_max(pos2(panel.left(), panel.bottom() - height), panel.max)
+}
+
+fn footer_exit(rows: &mut DrawerRows<'_>) -> bool {
+    rows.button(menu_id("leave"), icons::DESKTOP, t!("Exit Big Picture"), "", false)
 }
 
 fn power_rows(rows: &mut DrawerRows<'_>, windowed: bool) -> Option<MenuAction> {
@@ -364,14 +387,21 @@ fn confirm_rows(rows: &mut DrawerRows<'_>, f: &Frame<'_>, view: View) -> Option<
     if cancel { view.parent().map(MenuAction::View) } else { confirm.then_some(action) }
 }
 
-fn user_header(bp: &BigPicture, ui: &Ui, f: &Frame<'_>, rect: Rect, active: bool) -> bool {
+fn user_header(bp: &BigPicture, focus: &mut Focus, ui: &Ui, f: &Frame<'_>, rect: Rect, clip: Rect, active: bool) -> bool {
     let s = f.s;
     let me = f.app.state.me();
     let color = me.map_or(f.t.text_dim, |p| crate::shell::status_color(&f.t, p));
-    let hit = rect.intersect(ui.clip_rect());
-    let resp = (active && hit.is_positive()).then(|| ui.interact(hit, menu_id("user-header"), Sense::click()));
-    if resp.as_ref().is_some_and(|r| r.hovered()) {
-        ui.painter().rect_filled(rect.shrink2(vec2(-8.0 * s, 10.0 * s)), paint::radius(12.0 * s), f.t.surface_hover);
+    let bounds = rect.shrink2(vec2(0.0, (10.0 * s).min(rect.height() * 0.2)));
+    let hit = (f.app.state.steam_id != 0).then(|| {
+        focus.item(ui, menu_id("user-header"), bounds, if active { clip } else { Rect::NOTHING }, Place::Bar)
+    });
+    if let Some(hit) = &hit {
+        if hit.glow > 0.0 {
+            ui.painter().rect_filled(bounds, paint::radius(12.0 * s), f.t.surface_hover.gamma_multiply(hit.glow));
+        }
+        if hit.focused {
+            focus.ring_around_clipped(bounds, 12.0 * s, clip);
+        }
     }
     let av = Rect::from_center_size(pos2(rect.left() + 32.0 * s, rect.center().y), vec2(58.0 * s, 58.0 * s));
     avatar(ui, &f.t, av, me.and_then(|p| p.avatar_hash.as_deref()), color, s);
@@ -415,7 +445,12 @@ fn user_header(bp: &BigPicture, ui: &Ui, f: &Frame<'_>, rect: Rect, active: bool
             f.t.text_dim,
         );
     }
-    resp.is_some_and(|r| r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked())
+    hit.is_some_and(|hit| {
+        if let Some(response) = hit.response {
+            response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
+        hit.activated
+    })
 }
 
 pub(super) fn is_active_download(d: &DownloadStatus) -> bool {
@@ -705,5 +740,37 @@ mod tests {
         assert!(menu.closing.is_none());
         menu.input(&[(Press::B, false)], 2.0);
         assert!(menu.closing.is_some());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn main_menu_footer_keeps_exit_visible_and_selectable() {
+    let ctx = egui::Context::default();
+    let panel = Rect::from_min_size(egui::Pos2::ZERO, vec2(560.0, 800.0));
+    let mut focus = Focus::default();
+    focus.current = Some(menu_id("user-header"));
+    for (dir, press) in [(None, false), (Some(Dir::Up), true)] {
+        let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(panel), ..Default::default() }, |ui| {
+            focus.begin_drawer(ui, dir, press, |_| false, true);
+            focus.item(ui, menu_id("user-header"), Rect::from_min_size(panel.min, vec2(550.0, 88.0)), panel, Place::Bar);
+            let power = Rect::from_min_size(pos2(0.0, 1100.0), vec2(550.0, 50.0));
+            focus.item(ui, menu_id("power"), power, panel, Place::Page);
+            let footer = menu_footer(panel, 1.25, View::Main);
+            assert!(panel.contains_rect(footer) && footer.height() > 50.0);
+            let mut rows = DrawerRows {
+                ui, theme: &Theme::default(), focus: &mut focus, clip: footer,
+                span: footer.x_range().shrink(28.0), y: footer.top() + 12.0 * 1.25,
+                s: 1.25, active: true, place: Place::Bar, open_style: false,
+            };
+            assert_eq!(footer_exit(&mut rows), press);
+            if press {
+                assert_eq!(focus.current, Some(menu_id("leave")));
+                let (rect, place) = focus.focused().unwrap();
+                assert_eq!(place, Place::Bar);
+                assert!(footer.contains_rect(rect));
+            }
+        });
+        output.textures_delta.clear();
     }
 }

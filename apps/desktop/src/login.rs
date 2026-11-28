@@ -9,6 +9,13 @@ use client::{Command, Guard, state::Phase};
 use egui::{Align, Align2, Color32, CornerRadius, Key, Layout, Rect, Sense, Stroke, Ui, pos2, vec2};
 use ui::{Theme, icons, widgets as w};
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LoginField {
+    Account,
+    Password,
+    GuardCode,
+}
+
 #[derive(Default)]
 pub struct LoginForm {
     pub account: String,
@@ -17,16 +24,24 @@ pub struct LoginForm {
     /// Show the sign-in form even when saved accounts exist.
     pub adding: bool,
     /// A password login is in flight.
-    submitted: bool,
+    pub(crate) submitted: bool,
     /// The last failure came from a password attempt (show its error).
-    password_error: bool,
-    qr_requested: bool,
-    qr_failed: bool,
-    qr_cache: Option<(String, Vec<bool>, usize)>,
+    pub(crate) password_error: bool,
+    pub(crate) qr_requested: bool,
+    pub(crate) qr_failed: bool,
+    pub(crate) qr_cache: Option<(String, Vec<bool>, usize)>,
     /// Saved account being signed in (for the splash).
     pub signing_in: Option<String>,
     /// A saved login couldn't reach Steam ("Connection error").
     pub connection_error: Option<crate::offline_ui::ConnectionError>,
+    /// Which field receives desktop OSK / Big Picture login text input.
+    pub(crate) osk_field: Option<LoginField>,
+    /// `None` follows `app.has_touchscreen()`; `Some(b)` is an explicit user toggle.
+    pub(crate) osk_manual: Option<bool>,
+    pub(crate) osk: crate::bigpicture::login::OskState,
+    pub(crate) show_password: bool,
+    pub(crate) bp_osk_open: bool,
+    pub(crate) bp_forget_confirm: Option<(String, f64)>,
 }
 
 impl LoginForm {
@@ -38,6 +53,7 @@ impl LoginForm {
         self.submitted = false;
         self.qr_requested = false;
         self.signing_in = None;
+        self.show_password = false;
     }
 }
 
@@ -46,8 +62,35 @@ pub fn wants_splash(app: &SteamApp) -> bool {
     app.state.phase == Phase::Connecting && !shows_form(app)
 }
 
-fn shows_form(app: &SteamApp) -> bool {
+pub(crate) fn shows_form(app: &SteamApp) -> bool {
     app.saved.is_empty() || app.login.adding
+}
+
+pub(crate) fn desktop_osk_visible(app: &SteamApp) -> bool {
+    app.login.osk_manual.unwrap_or_else(|| app.has_touchscreen())
+}
+
+fn wants_tall_window_parts(
+    splash: bool,
+    ask_language: bool,
+    has_connection_error: bool,
+    shows_form: bool,
+    is_guard: bool,
+    osk_visible: bool,
+) -> bool {
+    !splash && !ask_language && !has_connection_error && (shows_form || is_guard) && osk_visible
+}
+
+/// Whether the desktop sign-in window needs extra height for the docked OSK.
+pub fn wants_tall_window(app: &SteamApp) -> bool {
+    wants_tall_window_parts(
+        wants_splash(app),
+        app.ask_language.is_some(),
+        app.login.connection_error.is_some(),
+        shows_form(app),
+        matches!(app.state.phase, Phase::Guard(_)),
+        desktop_osk_visible(app),
+    )
 }
 
 const BAR: f32 = 34.0;
@@ -257,46 +300,98 @@ fn label(ui: &mut Ui, t: &Theme, text: &str) {
     ui.add_space(-2.0);
 }
 
+fn keyboard_toggle(app: &mut SteamApp, ui: &mut Ui, t: &Theme, open: bool) {
+    let kind = if open { w::Kind::Primary } else { w::Kind::Secondary };
+    if w::button(ui, t, Some(icons::KEYBOARD), t!("Keyboard"), kind, w::Size::Md)
+        .on_hover_text(if open { t!("Hide") } else { t!("Show") })
+        .clicked()
+    {
+        app.login.osk_manual = Some(!open);
+    }
+}
+
 fn form_and_qr(app: &mut SteamApp, ui: &mut Ui, t: &Theme, phase: &Phase) {
     let busy = app.login.submitted && *phase == Phase::Connecting;
-    ui.add_space(6.0);
-    ui.label(w::text_bold(t!("Sign in"), 24.0, t.text));
-    ui.add_space(14.0);
+    let osk_open = desktop_osk_visible(app);
+    if !matches!(app.login.osk_field, Some(LoginField::Account | LoginField::Password)) {
+        app.login.osk_field = Some(if app.login.account.is_empty() { LoginField::Account } else { LoginField::Password });
+    }
+    ui.add_space(if osk_open { 0.0 } else { 6.0 });
+    ui.horizontal(|ui| {
+        ui.label(w::text_bold(t!("Sign in"), 24.0, t.text));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| keyboard_toggle(app, ui, t, osk_open));
+    });
+    ui.add_space(if osk_open { 8.0 } else { 14.0 });
     let qr_w = 210.0;
-    let left_w = ui.available_width() - qr_w - 40.0;
+    let item_spacing = ui.spacing().item_spacing.x;
+    let column_gap = 40.0;
+    let left_w = ui.available_width() - qr_w - column_gap;
     ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = column_gap;
         // Left: account name and password.
         ui.allocate_ui_with_layout(vec2(left_w, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.x = item_spacing;
             ui.set_width(left_w);
             ui.add_enabled_ui(!busy, |ui| {
                 label(ui, t, t!("Sign in with account name"));
                 let name = ui.add(egui::TextEdit::singleline(&mut app.login.account).font(w::font(15.0)).desired_width(f32::INFINITY).margin(vec2(12.0, 9.0))).with_edit_menu();
-                ui.add_space(12.0);
+                if name.gained_focus() || name.clicked() {
+                    app.login.osk_field = Some(LoginField::Account);
+                }
+                ui.add_space(if osk_open { 8.0 } else { 12.0 });
                 label(ui, t, t!("Password"));
-                let pass = ui.add(egui::TextEdit::singleline(&mut app.login.password).password(true).font(w::font(15.0)).desired_width(f32::INFINITY).margin(vec2(12.0, 9.0))).with_edit_menu();
-                w::autofocus(&name, app.login.account.is_empty() && !pass.has_focus());
+                let mut pass_focus = false;
+                let mut pass_lost_enter = false;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let pass_w = (ui.available_width() - 38.0).max(80.0);
+                    let pass = ui.add(
+                        egui::TextEdit::singleline(&mut app.login.password)
+                            .password(!app.login.show_password)
+                            .font(w::font(15.0))
+                            .desired_width(pass_w)
+                            .margin(vec2(12.0, 9.0)),
+                    ).with_edit_menu();
+                    if pass.gained_focus() || pass.clicked() {
+                        app.login.osk_field = Some(LoginField::Password);
+                    }
+                    pass_focus = pass.has_focus();
+                    pass_lost_enter = pass.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    let eye_icon = if app.login.show_password { icons::EYE_SLASH } else { icons::EYE };
+                    let eye_tip = if app.login.show_password { t!("Hide") } else { t!("Show") };
+                    if w::icon_button_sized(ui, t, eye_icon, eye_tip, app.login.show_password, 0, 32.0).clicked() {
+                        app.login.show_password = !app.login.show_password;
+                    }
+                });
+                w::autofocus(
+                    &name,
+                    !osk_open
+                        && app.login.account.is_empty()
+                        && !pass_focus
+                        && app.login.osk_field != Some(LoginField::Password),
+                );
                 if app.login.password_error {
                     if let Some(e) = &app.state.last_error {
                         ui.add_space(6.0);
                         ui.add(egui::Label::new(w::text(format!("{}  {}", icons::WARNING, i18n::tr_dyn(e)), 12.5, t.danger)).wrap());
                     }
                 }
-                ui.add_space(18.0);
+                ui.add_space(if osk_open { 12.0 } else { 18.0 });
                 let ready = !app.login.account.trim().is_empty() && !app.login.password.is_empty();
-                let enter = pass.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                 let label = if busy { t!("Signing in…") } else { t!("Sign in") };
                 let clicked = ui
                     .add_enabled_ui(ready, |ui| {
-                        ui.add_sized(vec2(ui.available_width(), 44.0), egui::Button::new(w::text_bold(label, 15.0, t.on_accent)).fill(t.accent).corner_radius(t.corner_small()))
+                        ui.add_sized(vec2(ui.available_width(), if osk_open { 38.0 } else { 44.0 }), egui::Button::new(w::text_bold(label, 15.0, t.on_accent)).fill(t.accent).corner_radius(t.corner_small()))
                     })
                     .inner
                     .clicked();
-                if ready && (clicked || enter) {
+                if ready && (clicked || pass_lost_enter) {
                     app.login.submitted = true;
+                    app.login.show_password = false;
                     app.client.send(Command::LoginPassword { account: app.login.account.trim().to_string(), password: std::mem::take(&mut app.login.password) });
                 }
             });
-            ui.add_space(12.0);
+            ui.add_space(if osk_open { 8.0 } else { 12.0 });
             ui.horizontal(|ui| {
                 if ui.link(w::text(t!("Help, I can't sign in"), 12.5, t.text_dim)).clicked() {
                     crate::links::open_http("https://help.steampowered.com/wizard/HelpWithLogin");
@@ -309,12 +404,13 @@ fn form_and_qr(app: &mut SteamApp, ui: &mut Ui, t: &Theme, phase: &Phase) {
                 }
             });
         });
-        ui.add_space(40.0);
         // Right: QR code.
         ui.allocate_ui_with_layout(vec2(qr_w, 0.0), Layout::top_down(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = item_spacing;
             label(ui, t, t!("Or sign in with QR"));
             ui.add_space(8.0);
-            let (rect, _) = ui.allocate_exact_size(vec2(190.0, 190.0), Sense::hover());
+            let qr_side = if osk_open { 164.0 } else { 190.0 };
+            let (rect, _) = ui.allocate_exact_size(vec2(qr_side, qr_side), Sense::hover());
             match phase {
                 Phase::Qr(url) => draw_qr(ui, &mut app.login.qr_cache, url, rect),
                 _ if app.login.qr_failed => {
@@ -324,7 +420,7 @@ fn form_and_qr(app: &mut SteamApp, ui: &mut Ui, t: &Theme, phase: &Phase) {
                 }
                 _ => w::skeleton(ui, t, rect, t.corner()),
             }
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             if app.login.qr_failed {
                 if w::button(ui, t, Some(icons::REFRESH), t!("Get a new code"), w::Kind::Secondary, w::Size::Sm).clicked() {
                     app.login.qr_failed = false;
@@ -334,9 +430,72 @@ fn form_and_qr(app: &mut SteamApp, ui: &mut Ui, t: &Theme, phase: &Phase) {
             }
         });
     });
+
+    if osk_open {
+        ui.add_space(10.0);
+        let active = app.login.osk_field.unwrap_or(LoginField::Account);
+        let go_label = match active {
+            LoginField::Account => t!("Continue"),
+            _ => t!("Sign in"),
+        };
+        if let Some(key) = crate::bigpicture::login::draw_desktop(ui, &mut app.login.osk, t, go_label) {
+            if let Some(cmd) = apply_form_osk_key(&mut app.login, key, busy) {
+                app.client.send(cmd);
+            }
+        }
+    }
 }
 
-fn draw_qr(ui: &Ui, cache: &mut Option<(String, Vec<bool>, usize)>, url: &str, rect: Rect) {
+pub(crate) fn apply_form_osk_key(
+    form: &mut LoginForm,
+    key: crate::bigpicture::login::OskKey,
+    busy: bool,
+) -> Option<Command> {
+    let field = match form.osk_field {
+        Some(LoginField::Password) => LoginField::Password,
+        _ => LoginField::Account,
+    };
+    match field {
+        LoginField::Account => {
+            if crate::bigpicture::login::apply_key(&mut form.account, key, None, false) {
+                form.osk_field = Some(LoginField::Password);
+            }
+            None
+        }
+        LoginField::Password => {
+            if crate::bigpicture::login::apply_key(&mut form.password, key, None, false)
+                && !busy
+                && !form.account.trim().is_empty()
+                && !form.password.is_empty()
+            {
+                form.submitted = true;
+                form.show_password = false;
+                Some(Command::LoginPassword {
+                    account: form.account.trim().to_string(),
+                    password: std::mem::take(&mut form.password),
+                })
+            } else {
+                None
+            }
+        }
+        LoginField::GuardCode => None,
+    }
+}
+
+pub(crate) fn apply_guard_osk_key(
+    form: &mut LoginForm,
+    key: crate::bigpicture::login::OskKey,
+) -> Option<Command> {
+    if crate::bigpicture::login::apply_key(&mut form.code, key, Some(5), true)
+        && form.code.trim().len() == 5
+    {
+        Some(Command::SubmitCode(std::mem::take(&mut form.code)))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn draw_qr(ui: &Ui, cache: &mut Option<(String, Vec<bool>, usize)>, url: &str, rect: Rect) {
     if cache.as_ref().is_none_or(|(u, _, _)| u != url) {
         *cache = qrcode::QrCode::new(url.as_bytes()).ok().map(|code| {
             let width = code.width();
@@ -388,7 +547,9 @@ fn guard(app: &mut SteamApp, ui: &mut Ui, t: &Theme, guards: &[Guard]) {
         ui.add_space(10.0);
     }
 
+    let osk_open = desktop_osk_visible(app);
     if let Some(c) = code {
+        app.login.osk_field = Some(LoginField::GuardCode);
         let hint = match c {
             Guard::EmailCode { hint } if !hint.is_empty() => t!("Enter the code Steam emailed to {email}", email = hint),
             Guard::EmailCode { .. } => t!("Enter the code Steam emailed you").to_string(),
@@ -402,25 +563,112 @@ fn guard(app: &mut SteamApp, ui: &mut Ui, t: &Theme, guards: &[Guard]) {
                 .char_limit(5)
                 .align(Align2::CENTER_CENTER)
                 .desired_width(f32::INFINITY)
-                .margin(vec2(12.0, 12.0)),
+                .margin(vec2(12.0, if osk_open { 8.0 } else { 12.0 })),
         ).with_edit_menu();
+        if field.gained_focus() || field.clicked() {
+            app.login.osk_field = Some(LoginField::GuardCode);
+        }
         w::autofocus(&field, app.login.code.is_empty());
         app.login.code = app.login.code.to_uppercase();
         if let Some(e) = &app.state.guard_error {
             ui.label(w::text(format!("{}  {}", icons::WARNING, i18n::tr_dyn(e)), 13.0, t.danger));
         }
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         let ready = app.login.code.trim().len() == 5;
         let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-        let clicked = ui.add_enabled_ui(ready, |ui| w::button(ui, t, None, t!("Continue"), w::Kind::Primary, w::Size::Lg)).inner.clicked();
+        let mut clicked = false;
+        ui.horizontal(|ui| {
+            clicked = ui.add_enabled_ui(ready, |ui| w::button(ui, t, None, t!("Continue"), w::Kind::Primary, if osk_open { w::Size::Md } else { w::Size::Lg })).inner.clicked();
+            ui.add_space(6.0);
+            keyboard_toggle(app, ui, t, osk_open);
+        });
         if ready && (clicked || enter) {
             app.client.send(Command::SubmitCode(std::mem::take(&mut app.login.code)));
         }
     }
 
-    ui.add_space(10.0);
+    ui.add_space(8.0);
     if ui.link(w::text(t!("Cancel"), 13.0, t.text_dim)).clicked() {
         app.client.send(Command::CancelLogin);
         app.login.submitted = false;
+    }
+
+    if code.is_some() && osk_open {
+        ui.add_space(10.0);
+        if let Some(key) = crate::bigpicture::login::draw_desktop(ui, &mut app.login.osk, t, t!("Continue")) {
+            if let Some(cmd) = apply_guard_osk_key(&mut app.login, key) {
+                app.client.send(cmd);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bigpicture::login::OskKey;
+
+    #[test]
+    fn tall_window_only_when_form_or_guard_and_osk_visible() {
+        assert!(wants_tall_window_parts(false, false, false, true, false, true));
+        assert!(wants_tall_window_parts(false, false, false, false, true, true));
+        assert!(!wants_tall_window_parts(false, false, false, true, false, false));
+        assert!(!wants_tall_window_parts(true, false, false, true, false, true));
+        assert!(!wants_tall_window_parts(false, true, false, true, false, true));
+        assert!(!wants_tall_window_parts(false, false, true, true, false, true));
+        assert!(!wants_tall_window_parts(false, false, false, false, false, true));
+    }
+
+    #[test]
+    fn desktop_osk_progresses_account_to_password_and_submits() {
+        let mut form = LoginForm {
+            osk_field: Some(LoginField::Account),
+            show_password: true,
+            ..Default::default()
+        };
+        assert!(apply_form_osk_key(&mut form, OskKey::Char('a'), false).is_none());
+        assert!(apply_form_osk_key(&mut form, OskKey::Char('b'), false).is_none());
+        assert_eq!(form.account, "ab");
+        // Go on Account advances to Password without submitting.
+        assert!(apply_form_osk_key(&mut form, OskKey::Go, false).is_none());
+        assert_eq!(form.osk_field, Some(LoginField::Password));
+
+        // Typing symbols into Password preserves case & symbols.
+        for ch in ['P', '!', '@', '9'] {
+            assert!(apply_form_osk_key(&mut form, OskKey::Char(ch), false).is_none());
+        }
+        assert_eq!(form.password, "P!@9");
+        let cmd = apply_form_osk_key(&mut form, OskKey::Go, false);
+        match cmd {
+            Some(Command::LoginPassword { account, password }) => {
+                assert_eq!(account, "ab");
+                assert_eq!(password, "P!@9");
+            }
+            other => panic!("expected LoginPassword, got {other:?}"),
+        }
+        assert!(form.password.is_empty());
+        assert!(!form.show_password);
+        assert!(form.submitted);
+    }
+
+    #[test]
+    fn desktop_osk_guard_code_uppercases_caps_at_five_and_submits() {
+        let mut form = LoginForm {
+            osk_field: Some(LoginField::GuardCode),
+            ..Default::default()
+        };
+        for ch in ['x', 'y', '1', '2'] {
+            assert!(apply_guard_osk_key(&mut form, OskKey::Char(ch)).is_none());
+        }
+        // Only 4 chars so far: Go does not submit yet.
+        assert!(apply_guard_osk_key(&mut form, OskKey::Go).is_none());
+        assert!(apply_guard_osk_key(&mut form, OskKey::Char('z')).is_none());
+        assert!(apply_guard_osk_key(&mut form, OskKey::Char('q')).is_none());
+        assert_eq!(form.code, "XY12Z");
+        match apply_guard_osk_key(&mut form, OskKey::Go) {
+            Some(Command::SubmitCode(code)) => assert_eq!(code, "XY12Z"),
+            other => panic!("expected SubmitCode, got {other:?}"),
+        }
+        assert!(form.code.is_empty());
     }
 }

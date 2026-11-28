@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.0.0-rc6](https://github.com/mollie2999/Aurora/compare/v1.0.0-rc5...v1.0.0-rc6) (2026-11-28)
+
+### New
+
+* **View menu, Game Servers browser, Screenshots manager & Small Mode:** added a Steam-style **View** menu with **Small Mode**, a native **Game Servers** browser with filter controls, and a **Screenshots** manager, with translations. ([#111](https://github.com/mollie2999/Aurora/pull/111))
+* **Chat copy, clickable links & media previews:** chat messages are now selectable and copyable, URLs are clickable, and shared media renders inline previews with a lightbox viewer. ([#110](https://github.com/mollie2999/Aurora/pull/110))
+* **Metro theme & Steam Family preferred copy:** added the **Metro** theme (with Steam-style supernav spacing, readable links, and download control spacing) and a **Change Preferred Copy** option showing each Steam Family copy's DLC. ([#109](https://github.com/mollie2999/Aurora/pull/109), [#133](https://github.com/mollie2999/Aurora/pull/133))
+* **Opt-in Steam-style profile layout & file filters:** added an opt-in Steam-style profile page with showcases and common connections, plus game, type, and sort filters on profile screenshots and shared files. ([#117](https://github.com/mollie2999/Aurora/pull/117), [#123](https://github.com/mollie2999/Aurora/pull/123))
+* **Browse Proton prefix:** added a **Browse Proton prefix** option to the per-game Manage menu with translations. ([#137](https://github.com/mollie2999/Aurora/pull/137))
+* **Desktop navigation & QoL:** added **Copy page URL** on Store, Wishlist, and Profile pages, browser-style **middle-click autoscroll** (automatically stopped when entering Big Picture), a **Smooth scrolling** setting, and an optional **60 fps cap** for the main window. ([#118](https://github.com/mollie2999/Aurora/pull/118), [#119](https://github.com/mollie2999/Aurora/pull/119), [#120](https://github.com/mollie2999/Aurora/pull/120), [#121](https://github.com/mollie2999/Aurora/pull/121))
+
+### Fixes
+
+* **Steam Deck, Big Picture OSK & unified SDL3 controllers:** unified host controller input on bundled SDL3 (removing `gilrs`, adding virtual Xbox pads, and fixing Windows XInput touchpad init), added the Big Picture on-screen keyboard with touchpad haptics, long-press, Tab cycling, and IME suppression, improved Steam Deck detection, DPI scaling, Quick Access navigation, and controller hints, and eliminated KWallet prompt spam. ([#87](https://github.com/mollie2999/Aurora/pull/87))
+* **Hyprland fallback overlay:** added Hyprland workspace/Lua IPC support so the fallback overlay raises above fullscreen and floating games while preserving fullscreen state, and prevented a Wayland `BadSurface` crash on close. ([#108](https://github.com/mollie2999/Aurora/pull/108))
+* **In-game presence & Invisible mode:** preserved your own in-game status while playing, announced in-game status over CM for HeadlessHost launches, and hid your current game while Invisible. ([#113](https://github.com/mollie2999/Aurora/pull/113), [#122](https://github.com/mollie2999/Aurora/pull/122), [#138](https://github.com/mollie2999/Aurora/pull/138))
+* **Trusted Steam CDN over TUN / fake-IP proxies:** allowed trusted HTTPS Steam CDN hosts to load over TUN/fake-IP proxies while hardening SSRF checks. ([#136](https://github.com/mollie2999/Aurora/pull/136))
+* **Library recent activity sort:** fixed the library clock button so it sorts by recent activity. ([#116](https://github.com/mollie2999/Aurora/pull/116))
+
+### Credits
+
+* Thanks to **[@liathy](https://github.com/liathy)** for contributing the Metro theme, Steam Family preferred copy selector, Steam-style profile layout, screenshots/shared files filters, middle-click autoscroll, smooth scrolling setting, 60 fps cap toggle, Copy page URL, recent-activity sort fix, and in-game/invisible status fixes ([#109](https://github.com/mollie2999/Aurora/pull/109), [#113](https://github.com/mollie2999/Aurora/pull/113), [#116](https://github.com/mollie2999/Aurora/pull/116), [#117](https://github.com/mollie2999/Aurora/pull/117), [#118](https://github.com/mollie2999/Aurora/pull/118), [#119](https://github.com/mollie2999/Aurora/pull/119), [#120](https://github.com/mollie2999/Aurora/pull/120), [#121](https://github.com/mollie2999/Aurora/pull/121), [#122](https://github.com/mollie2999/Aurora/pull/122), [#123](https://github.com/mollie2999/Aurora/pull/123)).
+
 ## [1.0.0-rc5](https://github.com/mollie2999/Aurora/compare/v1.0.0-rc4...v1.0.0-rc5) (2026-11-25)
 
 ### New

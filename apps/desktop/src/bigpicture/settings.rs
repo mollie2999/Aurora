@@ -4,7 +4,7 @@
 //! A toggles/advances, and slow filesystem/hardware queries are TTL-cached.
 
 use super::focus::{Dir, Place};
-use super::{BigPicture, Frame, Page, paint};
+use super::{BigPicture, ButtonHintMode, Frame, Page, paint};
 use crate::builtin::downloads::{DownloadSettings, Downloads};
 use crate::builtin::settings::{AppFlags, FpsCorner};
 use client::Command;
@@ -81,7 +81,7 @@ pub(super) const SYSTEM: usize = 10;
 #[cfg(not(target_os = "linux"))]
 pub(super) const SYSTEM: usize = 9;
 
-const SIZES: [f32; 5] = [0.85, 1.0, 1.1, 1.2, 1.35];
+const SIZES: [f32; 5] = [0.85, 1.0, 1.15, 1.3, 1.5];
 const SCROLL_SPEEDS: [f32; 7] = [0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0];
 const SPEEDS_KBPS: [u32; 7] = [1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000];
 const CONNECTIONS: [u32; 6] = [4, 8, 16, 24, 32, 48];
@@ -352,6 +352,7 @@ fn start_storage_probe(f: &Frame, ctx: egui::Context) -> std::sync::mpsc::Receiv
 }
 
 fn rows(bp: &mut BigPicture, f: &mut Frame, ctx: &egui::Context) -> Vec<Row> {
+    let screen = ctx.content_rect().size();
     let flags = *f.app.shared_flags().lock().unwrap();
     match bp.settings.section {
         DOWNLOADS => {
@@ -702,6 +703,7 @@ fn rows(bp: &mut BigPicture, f: &mut Frame, ctx: &egui::Context) -> Vec<Row> {
         CONTROLLER => {
             let p = &f.app.prefs;
             let (swap, repeat, stick) = (p.bigpicture_swap_ab, p.bigpicture_repeat.min(2), p.bigpicture_stick.min(2));
+            let hints = p.bigpicture_hints;
             let cfg = client::controller_settings();
             let cal = cfg.calibration;
             let need_poll = bp
@@ -729,6 +731,19 @@ fn rows(bp: &mut BigPicture, f: &mut Frame, ctx: &egui::Context) -> Vec<Row> {
                         bp.settings.controller_cache = None;
                     }),
                 },
+                choice(
+                    "ctrl-hints",
+                    t!("Button hints"),
+                    "",
+                    hints.label().into(),
+                    hints == ButtonHintMode::Auto,
+                    hints == ButtonHintMode::Keyboard,
+                    step_act(|_, f, _, delta| {
+                        let modes = ButtonHintMode::ALL;
+                        let current = modes.iter().position(|mode| *mode == f.app.prefs.bigpicture_hints).unwrap_or(0);
+                        f.app.prefs.bigpicture_hints = modes[step_index(modes.len(), current, delta, delta > 1)];
+                    }),
+                ),
                 toggle(
                     "ctrl-swap-ab",
                     t!("Swap A and B"),
@@ -765,6 +780,13 @@ fn rows(bp: &mut BigPicture, f: &mut Frame, ctx: &egui::Context) -> Vec<Row> {
                 controller_toggle("ctrl-fam-switch", t!("Enable Steam Input for Switch Pro controllers"), cfg.families.switch_pro, |c| &mut c.families.switch_pro),
                 controller_toggle("ctrl-fam-generic", t!("Enable Steam Input for generic controllers"), cfg.families.generic, |c| &mut c.families.generic),
                 controller_toggle("ctrl-rumble", t!("Controller vibration (rumble)"), cal.rumble_enabled, |c| &mut c.calibration.rumble_enabled),
+                toggle(
+                    "ctrl-osk-haptics",
+                    t!("Keyboard touchpad haptics"),
+                    t!("Subtle vibration when moving across on-screen keyboard keys with touchpads."),
+                    f.app.prefs.osk_touchpad_haptics,
+                    act(|_, f, _| f.app.prefs.osk_touchpad_haptics = !f.app.prefs.osk_touchpad_haptics),
+                ),
                 controller_toggle("ctrl-gyro", t!("Enable gyroscope & motion sensors"), cal.gyro_enabled, |c| &mut c.calibration.gyro_enabled),
             ];
             if cal.gyro_enabled {
@@ -1158,19 +1180,28 @@ fn rows(bp: &mut BigPicture, f: &mut Frame, ctx: &egui::Context) -> Vec<Row> {
             out
         }
         SYSTEM => {
-            let screen = f.view.size();
-            let mode = if bp.is_deck_preview() {
+            let mode = if bp.system.is_steam_deck() {
+                t!("Steam Deck")
+            } else if bp.is_deck_preview() {
                 t!("Steam Deck preview")
             } else {
                 t!("Big Picture")
             };
+            let mut display = format!("{:.0}×{:.0} · {:.0}%", screen.x, screen.y, f.s * 100.0);
+            if let Some(ppi) = bp.sys_status.display_ppi {
+                display.push_str(&format!(" · {ppi:.0} PPI"));
+            }
             let mut out = vec![
                 Row::Info { label: t!("Aurora version").into(), value: env!("CARGO_PKG_VERSION").into() },
                 Row::Info { label: t!("Mode").into(), value: mode.into() },
                 Row::Info { label: t!("Session").into(), value: bp.sys_status.session_label.clone() },
                 Row::Info {
                     label: t!("Display").into(),
-                    value: format!("{:.0}×{:.0} · {:.0}%", screen.x, screen.y, f.s * 100.0),
+                    value: display,
+                },
+                Row::Info {
+                    label: t!("Touchscreen").into(),
+                    value: if bp.system.has_touchscreen() { t!("Detected") } else { t!("Not detected") }.into(),
                 },
                 Row::Info { label: t!("Controllers connected").into(), value: bp.pads.to_string() },
             ];
@@ -1223,8 +1254,13 @@ fn rows(bp: &mut BigPicture, f: &mut Frame, ctx: &egui::Context) -> Vec<Row> {
                     "gen-start-bp",
                     t!("Start Aurora in Big Picture"),
                     "",
-                    f.app.prefs.bigpicture_start,
-                    act(|_, f, _| f.app.prefs.bigpicture_start = !f.app.prefs.bigpicture_start),
+                    f.app.prefs.bigpicture_start || (bp.system.is_steam_deck() && !f.app.prefs.bigpicture_start_explicit),
+                    act(|bp, f, _| {
+                        let prefs = &mut f.app.prefs;
+                        let current = prefs.bigpicture_start || (bp.system.is_steam_deck() && !prefs.bigpicture_start_explicit);
+                        prefs.bigpicture_start = !current;
+                        prefs.bigpicture_start_explicit = true;
+                    }),
                 ),
                 choice(
                     "gen-lang",

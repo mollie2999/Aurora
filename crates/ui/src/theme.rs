@@ -1018,6 +1018,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_dark_metro_uses_white_links() {
+        let mut metro = Theme { name: "Metro".into(), dark: true, ..Theme::default() };
+        assert_eq!(metro.link_color(), Color32::WHITE);
+        metro.dark = false;
+        assert_eq!(metro.link_color(), metro.accent_text());
+        assert_ne!(metro.link_color(), Color32::WHITE);
+    }
+
+    #[test]
     fn valid_font_header_checks_sfnt_and_ttc_bounds() {
         assert!(!valid_font_header(&[], 0));
         assert!(!valid_font_header(&[0; 12], 0));

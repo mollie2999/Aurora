@@ -229,6 +229,9 @@ pub fn audio_thread(sh: Arc<Shared>) {
     let mut epoch = u64::MAX;
     let mut target = 0.0;
     let mut seg = 0usize;
+    let mut seg_data: Option<Arc<Vec<u8>>> = None;
+    let mut seg_samples: Vec<Sample> = Vec::new();
+    let mut seg_pos = 0usize;
     let mut pcm: VecDeque<f32> = VecDeque::new();
     // Time of the next sample in `pcm`.
     let mut pcm_pts = 0.0;
@@ -260,6 +263,9 @@ pub fn audio_thread(sh: Arc<Shared>) {
             first = None;
             eos = false;
             seg = plan.index_at(t);
+            seg_data = None;
+            seg_samples.clear();
+            seg_pos = 0;
         }
         if vol != vol_set && out.set_volume(vol).is_ok() {
             vol_set = vol;
@@ -267,26 +273,45 @@ pub fn audio_thread(sh: Arc<Shared>) {
 
         // Decode ahead, up to two seconds.
         if !eos && pcm.len() < 2 * rate as usize * ch {
+            const AAC_BATCH: usize = 32;
             let n = if plan.single { 1 } else { plan.segs.len() };
             chunks.clear();
             // ffmpeg decodes on its own time: collect what it has finished.
             #[cfg(not(windows))]
             aac.ready(&mut chunks);
-            if seg >= n {
-                let _ = aac.drain(&mut chunks);
-                eos = true;
-            } else {
+            if seg_pos >= seg_samples.len() && seg < n {
                 let url = if plan.single { plan.init_url() } else { &plan.segs[seg].url };
-                let data = sh.lock().cache.get(url).cloned();
-                if let Some(data) = data {
-                    for s in samples(&plan, &track, &data, target) {
-                        let Some(bytes) = s.offset.checked_add(s.size).and_then(|end| data.get(s.offset..end)) else { continue };
-                        if let Err(e) = aac.decode(bytes, track.pts(&s), track.seconds(s.duration as i64), &mut chunks) {
+                if let Some(data) = sh.lock().cache.get(url).cloned() {
+                    seg_samples = samples(&plan, &track, &data, target);
+                    seg_data = (!seg_samples.is_empty()).then_some(data);
+                    seg_pos = 0;
+                    seg += 1;
+                }
+            }
+            if seg_pos < seg_samples.len() {
+                if let Some(data) = seg_data.as_ref() {
+                    let end = (seg_pos + AAC_BATCH).min(seg_samples.len());
+                    for s in &seg_samples[seg_pos..end] {
+                        if sh.stopped() || sh.epoch() != epoch {
+                            break;
+                        }
+                        let Some(bytes) = s.offset.checked_add(s.size).and_then(|e| data.get(s.offset..e)) else { continue };
+                        if let Err(e) = aac.decode(bytes, track.pts(s), track.seconds(s.duration as i64), &mut chunks) {
                             tracing::debug!("video: aac: {e}");
                         }
                     }
-                    seg += 1;
+                    seg_pos = end;
+                    if seg_pos >= seg_samples.len() {
+                        seg_data = None;
+                        seg_samples.clear();
+                    }
                 }
+            } else if seg >= n {
+                let _ = aac.drain(&mut chunks);
+                eos = true;
+            }
+            if sh.stopped() || sh.epoch() != epoch {
+                continue;
             }
             for (pts, buf) in chunks.drain(..) {
                 let frames = buf.len() / ch_in;

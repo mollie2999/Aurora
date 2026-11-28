@@ -19,6 +19,20 @@ use std::time::Duration;
 const LEGACY_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_LEGACY_ITEM_BYTES: usize = 512 * 1024 * 1024;
 
+/// Download settings for a Workshop sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncOptions {
+    pub concurrency: u32,
+    pub limit_kbps: u64,
+    pub preferred_host: Option<String>,
+}
+
+impl Default for SyncOptions {
+    fn default() -> Self {
+        Self { concurrency: 16, limit_kbps: 0, preferred_host: None }
+    }
+}
+
 /// What a sync did.
 #[derive(Debug, Clone, Default)]
 pub struct Report {
@@ -63,7 +77,15 @@ pub async fn subscribed(conn: &Connection, me: SteamId, app: AppId) -> Result<Ve
 
 /// Download (or update) `items`, or every subscribed item when `items` is
 /// empty. Items already installed at the current version are skipped.
-pub async fn sync(conn: &Connection, me: SteamId, app: AppId, library: &Path, cell_id: u32, items: Vec<u64>) -> Result<Report, String> {
+pub async fn sync(
+    conn: &Connection,
+    me: SteamId,
+    app: AppId,
+    library: &Path,
+    cell_id: u32,
+    items: Vec<u64>,
+    options: SyncOptions,
+) -> Result<Report, String> {
     let ids = if items.is_empty() { subscribed(conn, me, app).await? } else { items };
     let mut report = Report::default();
     if ids.is_empty() {
@@ -90,7 +112,11 @@ pub async fn sync(conn: &Connection, me: SteamId, app: AppId, library: &Path, ce
         }
         let result = if manifest != 0 {
             if cdn.is_none() {
-                let servers = crate::download::content_servers(conn, cell_id).await?;
+                let mut servers = crate::download::content_servers(conn, cell_id).await?;
+                if let Some(host) = options.preferred_host.clone().filter(|h| depot::cdn::valid_host(h)) {
+                    servers.retain(|s| s.host != host);
+                    servers.insert(0, depot::Server { host, https: true, load: 0.0 });
+                }
                 let c = Arc::new(depot::Cdn::new(servers));
                 if c.server_count() == 0 {
                     report.failed.push((id, title, "Steam returned no HTTPS content servers".into()));
@@ -99,7 +125,7 @@ pub async fn sync(conn: &Connection, me: SteamId, app: AppId, library: &Path, ce
                 c.rank().await;
                 cdn = Some(c);
             }
-            depot_item(conn, cdn.clone().unwrap(), app, manifest, &dir).await
+            depot_item(conn, cdn.clone().unwrap(), app, manifest, &dir, options.concurrency, options.limit_kbps).await
         } else if !d.file_url().is_empty() {
             if d.file_size() > MAX_LEGACY_ITEM_BYTES as u64 {
                 Err("Workshop item exceeds 512 MiB limit".into())
@@ -126,8 +152,24 @@ pub async fn sync(conn: &Connection, me: SteamId, app: AppId, library: &Path, ce
     Ok(report)
 }
 
+fn workshop_progress(concurrency: u32, limit_kbps: u64) -> Arc<depot::Progress> {
+    let progress = Arc::new(depot::Progress::default());
+    let concurrency = if concurrency == 0 { 16 } else { concurrency.clamp(1, 64) };
+    progress.concurrency.store(concurrency, std::sync::atomic::Ordering::Relaxed);
+    progress.limit_kbps.store(limit_kbps, std::sync::atomic::Ordering::Relaxed);
+    progress
+}
+
 /// An item stored as a manifest in the game's depot (depot id = app id).
-async fn depot_item(conn: &Connection, cdn: Arc<depot::Cdn>, app: AppId, gid: u64, dir: &Path) -> Result<u64, String> {
+async fn depot_item(
+    conn: &Connection,
+    cdn: Arc<depot::Cdn>,
+    app: AppId,
+    gid: u64,
+    dir: &Path,
+    concurrency: u32,
+    limit_kbps: u64,
+) -> Result<u64, String> {
     let key = crate::download::depot_key(conn, app, app).await.map_err(|e| e.to_string())?;
     let code = crate::download::request_code(conn, app, app, gid, "public").await;
     let raw = cdn.manifest(app, gid, code).await.map_err(|e| e.to_string())?;
@@ -137,7 +179,7 @@ async fn depot_item(conn: &Connection, cdn: Arc<depot::Cdn>, app: AppId, gid: u6
     depot::install::ensure_real_dir(dir).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let job = depot::DepotJob { depot: app, manifest, key, old: None };
-    depot::install(cdn, dir, vec![job], Arc::new(depot::Progress::default())).await.map_err(|e| e.to_string())?;
+    depot::install(cdn, dir, vec![job], workshop_progress(concurrency, limit_kbps)).await.map_err(|e| e.to_string())?;
     Ok(size)
 }
 
@@ -504,5 +546,30 @@ mod tests {
         std::os::unix::fs::symlink(&outside, ws.join("content")).unwrap();
         assert!(depot::install::resolve_inside(&ws, "content/477160/99").is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_options_defaults() {
+        let opts = SyncOptions::default();
+        assert_eq!(opts.concurrency, 16);
+        assert_eq!(opts.limit_kbps, 0);
+        assert_eq!(opts.preferred_host, None);
+    }
+
+    #[test]
+    fn workshop_progress_sets_concurrency_and_limit() {
+        use std::sync::atomic::Ordering;
+
+        let p0 = workshop_progress(0, 0);
+        assert_eq!(p0.concurrency.load(Ordering::Relaxed), 16);
+        assert_eq!(p0.limit_kbps.load(Ordering::Relaxed), 0);
+
+        let p_valid = workshop_progress(24, 5_000);
+        assert_eq!(p_valid.concurrency.load(Ordering::Relaxed), 24);
+        assert_eq!(p_valid.limit_kbps.load(Ordering::Relaxed), 5_000);
+
+        let p_clamped = workshop_progress(128, 12_345);
+        assert_eq!(p_clamped.concurrency.load(Ordering::Relaxed), 64);
+        assert_eq!(p_clamped.limit_kbps.load(Ordering::Relaxed), 12_345);
     }
 }

@@ -1023,9 +1023,16 @@ async fn online(
                         let library = crate::workshop::library_of(&install_dir).filter(|_| sync && st.link == Link::Online && !st.running.contains_key(&app_id));
                         match library {
                             Some(library) => {
-                                let (conn, sink, tx, me, cell) = (st.conn.clone(), sink.clone(), ws_tx.clone(), st.me, st.download_cell.unwrap_or(st.cell_id));
+                                let (conn, sink, tx, me, cell, opts) = (
+                                    st.conn.clone(),
+                                    sink.clone(),
+                                    ws_tx.clone(),
+                                    st.me,
+                                    st.download_cell.unwrap_or(st.cell_id),
+                                    st.workshop_options(),
+                                );
                                 tokio::spawn(async move {
-                                    let result = crate::workshop::sync(&conn, me, app_id, &library, cell, Vec::new()).await;
+                                    let result = crate::workshop::sync(&conn, me, app_id, &library, cell, Vec::new(), opts).await;
                                     if !matches!(&result, Ok(r) if r.downloaded.is_empty() && r.failed.is_empty()) {
                                         sink(Event::WorkshopSync { app_id, result });
                                     }
@@ -2530,8 +2537,23 @@ impl Online {
         });
     }
 
+    fn workshop_options(&self) -> crate::workshop::SyncOptions {
+        crate::workshop::SyncOptions {
+            concurrency: self.concurrency,
+            limit_kbps: self.limit_kbps,
+            preferred_host: self.download_host.clone(),
+        }
+    }
+
     fn workshop_subscribe(&self, app_id: AppId, file_id: u64, sink: &Sink) {
-        let (conn, sink, me, cell, root) = (self.conn.clone(), sink.clone(), self.me, self.download_cell.unwrap_or(self.cell_id), self.steam_root.clone());
+        let (conn, sink, me, cell, root, opts) = (
+            self.conn.clone(),
+            sink.clone(),
+            self.me,
+            self.download_cell.unwrap_or(self.cell_id),
+            self.steam_root.clone(),
+            self.workshop_options(),
+        );
         tokio::spawn(async move {
             let r: Result<CPublishedFileSubscribeResponse, _> = conn
                 .call(
@@ -2543,15 +2565,22 @@ impl Online {
             sink(Event::WorkshopSubscribed { file_id, result: r.map(|_| ()).map_err(|e| e.to_string()) });
             // Like Steam: an installed game gets the item right away.
             if ok {
-                sync_installed(conn, me, cell, root, app_id, vec![file_id], sink).await;
+                sync_installed(conn, me, cell, root, app_id, vec![file_id], opts, sink).await;
             }
         });
     }
 
     /// Download `items` (or every subscribed item) for an installed game.
     fn sync_workshop(&self, app_id: AppId, items: Vec<u64>, sink: &Sink) {
-        let (conn, sink, me, cell, root) = (self.conn.clone(), sink.clone(), self.me, self.download_cell.unwrap_or(self.cell_id), self.steam_root.clone());
-        tokio::spawn(sync_installed(conn, me, cell, root, app_id, items, sink));
+        let (conn, sink, me, cell, root, opts) = (
+            self.conn.clone(),
+            sink.clone(),
+            self.me,
+            self.download_cell.unwrap_or(self.cell_id),
+            self.steam_root.clone(),
+            self.workshop_options(),
+        );
+        tokio::spawn(sync_installed(conn, me, cell, root, app_id, items, opts, sink));
     }
 
     fn load_discovery_queue(&self, country: String, rebuild: bool, sink: &Sink) {
@@ -4345,10 +4374,19 @@ fn logon_id() -> u32 {
 }
 
 /// Workshop downloads for a game, if it's installed (found in the Steam libraries).
-async fn sync_installed(conn: Connection, me: SteamId, cell: u32, root: Option<std::path::PathBuf>, app_id: AppId, items: Vec<u64>, sink: Sink) {
+async fn sync_installed(
+    conn: Connection,
+    me: SteamId,
+    cell: u32,
+    root: Option<std::path::PathBuf>,
+    app_id: AppId,
+    items: Vec<u64>,
+    options: crate::workshop::SyncOptions,
+    sink: Sink,
+) {
     let library = tokio::task::spawn_blocking(move || local::load(root).ok().and_then(|l| l.games.into_iter().find(|g| g.app_id == app_id)).map(|g| g.library)).await.ok().flatten();
     let Some(library) = library else { return };
-    let result = crate::workshop::sync(&conn, me, app_id, &library, cell, items).await;
+    let result = crate::workshop::sync(&conn, me, app_id, &library, cell, items, options).await;
     sink(Event::WorkshopSync { app_id, result });
 }
 

@@ -313,7 +313,7 @@ pub async fn download(conn: &Connection, app_id: AppId, me: u64, id: u64, instal
         Reply::UgcDownloaded { eresult: eresult::FAIL, folder: String::new(), size: 0, updated: 0 }
     };
     let Some(library) = crate::workshop::library_of(install_dir) else { return failed("the game isn't in a Steam library folder".into()) };
-    match crate::workshop::sync(conn, me, app_id, &library, cell_id, vec![id]).await {
+    match crate::workshop::sync(conn, me, app_id, &library, cell_id, vec![id], crate::workshop::SyncOptions::default()).await {
         Ok(r) if r.failed.is_empty() => {
             let mut dir = library.clone();
             for seg in ["steamapps", "workshop", "content", &app_id.to_string(), &id.to_string()] {

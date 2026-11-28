@@ -10,7 +10,8 @@ use std::collections::BinaryHeap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::OnceLock;
-use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::time::Duration;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -71,7 +72,10 @@ impl Proc {
             .map_err(|e| format!("couldn't start ffmpeg: {e}"))?;
         let stdin = child.stdin.take();
         let mut stdout = child.stdout.take().ok_or("ffmpeg has no stdout")?;
-        let (tx, rx) = sync_channel(8);
+        // Unbounded so the reader thread always drains ffmpeg's stdout pipe and
+        // never deadlocks with synchronous stdin writes on the decoder thread.
+        // Memory is bounded by caller-side pacing (IN_FLIGHT / audio batching).
+        let (tx, rx) = channel();
         std::thread::Builder::new()
             .name("video-ffmpeg-out".into())
             .spawn(move || {
@@ -80,6 +84,7 @@ impl Proc {
                     let mut got = 0;
                     while got < chunk {
                         match stdout.read(&mut buf[got..]) {
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                             Ok(0) | Err(_) => break,
                             Ok(n) => got += n,
                         }
@@ -116,7 +121,7 @@ impl Proc {
     /// End of input: everything still inside comes out.
     fn finish(&mut self, mut f: impl FnMut(Vec<u8>)) {
         drop(self.stdin.take());
-        while let Ok(b) = self.out.recv() {
+        while let Ok(b) = self.out.recv_timeout(Duration::from_secs(2)) {
             f(b);
         }
     }
@@ -472,6 +477,48 @@ mod tests {
         assert!(chunks.windows(2).all(|w| w[0].0 < w[1].0));
         let peak = chunks.iter().flat_map(|(_, b)| b.iter()).fold(0f32, |m, v| m.max(v.abs()));
         assert!(peak > 0.05, "a sine, not silence (peak {peak})");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for #129: feeding >64 KiB of compressed AAC in a tight
+    /// loop must not deadlock between ffmpeg's stdin/stdout pipes and the
+    /// reader thread.
+    #[test]
+    fn aac_decode_does_not_deadlock_on_long_burst() {
+        use crate::mp4::{self, Codec};
+        if !available() {
+            eprintln!("no ffmpeg: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ffdec-aac-burst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("long.mp4");
+        let ok = Command::new(&ffmpeg().unwrap().0)
+            .args([
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=12",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+            ])
+            .arg(&file)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("ffmpeg couldn't encode test AAC: skipped");
+            return;
+        }
+        let data = std::fs::read(&file).unwrap();
+        let movie = mp4::parse_movie(&data).unwrap();
+        let a = movie.audio().unwrap();
+        let Codec::Aac { config, channels, rate } = &a.codec else { panic!("not AAC") };
+        let mut aac = Aac::new(config, *rate, *channels).unwrap();
+        let mut chunks = Vec::new();
+        for s in &a.samples {
+            aac.decode(&data[s.offset..s.offset + s.size], a.pts(s), a.seconds(s.duration as i64), &mut chunks).unwrap();
+        }
+        aac.drain(&mut chunks).unwrap();
+        let frames: usize = chunks.iter().map(|(_, b)| b.len() / aac.channels as usize).sum();
+        assert_eq!(frames, a.samples.len() * 1024, "every AAC frame decoded");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

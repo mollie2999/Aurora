@@ -1469,6 +1469,27 @@ impl Drop for HostCount {
 /// Printed by `steamhost serve` once it is signed in and serving.
 const STEAMHOST_READY: &str = "STEAMHOST-READY";
 
+fn read_steamhost_messages(mut reader: impl std::io::BufRead, ready: impl FnOnce(), mut profile: impl FnMut(u64)) {
+    let mut ready = Some(ready);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).is_ok_and(|len| len > 0) {
+        let parsed = std::str::from_utf8(&line).unwrap_or_default();
+        let parsed = parsed.trim_end_matches(['\r', '\n']);
+        if parsed.trim() == STEAMHOST_READY {
+            if let Some(ready) = ready.take() {
+                ready();
+            }
+        } else if ready.is_none()
+            && let Some(target) = parsed.strip_prefix("STEAMHOST-PROFILE ").and_then(|id| id.parse::<u64>().ok())
+            && target >> 52 == 0x11
+            && target as u32 != 0
+        {
+            profile(target);
+        }
+        line.clear();
+    }
+}
+
 /// Run a game on a headless instance of the user's own Steam engine.
 ///
 /// Starts `steamhost serve` (signed in with the user's refresh token, fed on
@@ -1476,8 +1497,7 @@ const STEAMHOST_READY: &str = "STEAMHOST-READY";
 /// Proton with lsteamclient left on (Linux) or natively with Steam's registry
 /// entry naming the host (Windows) so Valve's library inside the game reaches
 /// the host, waits for the game to close, then drops the pipe so the host
-/// shuts down. Nothing of Valve's is bundled or modified; the engine does its
-/// own ownership check, so a game the user doesn't own won't start.
+/// shuts down. The installed Valve engine performs its own ownership check.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn run_through_host(
@@ -1491,7 +1511,7 @@ pub fn run_through_host(
     ignore_physical_pads: bool,
     started: impl FnOnce(),
 ) -> Result<(), String> {
-    run_through_host_cancellable(app, install_dir, args, account, token, steam_id, overlay, ignore_physical_pads, None, started)
+    run_through_host_cancellable(app, install_dir, args, account, token, steam_id, overlay, ignore_physical_pads, None, started, |_| {})
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1506,6 +1526,7 @@ pub(crate) fn run_through_host_cancellable(
     ignore_physical_pads: bool,
     stop: Option<&std::sync::atomic::AtomicBool>,
     started: impl FnOnce(),
+    profile: impl FnMut(u64) + Send + 'static,
 ) -> Result<(), String> {
     use std::io::{BufRead, BufReader, Write};
     use std::sync::mpsc;
@@ -1518,6 +1539,12 @@ pub(crate) fn run_through_host_cancellable(
     // Valve's switches for no assert minidumps, crash dialog or monitor.
     cmd.arg("serve").arg(&root).args(["-noassert", "-nocrashdialog", "-nocrashmonitor"]);
     cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let disable_profile_forwarding = std::env::var_os("AURORA_STEAMHOST_PROFILE_FORWARDING").is_some_and(|value| value == "0");
+    let forward_profiles = cfg!(all(windows, target_arch = "x86_64")) && app_overlay_enabled(app.app_id) && !disable_profile_forwarding;
+    if disable_profile_forwarding {
+        tracing::info!("steamhost profile forwarding disabled for this launch");
+    }
+    cmd.env("AURORA_STEAMHOST_PROFILE_FORWARDING", if forward_profiles { "1" } else { "0" });
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1532,7 +1559,13 @@ pub(crate) fn run_through_host_cancellable(
         let last = last_err.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                tracing::debug!("steamhost: {line}");
+                if let Some(reason) = line.strip_prefix("profile forwarding unavailable: ") {
+                    tracing::warn!("steamhost profile forwarding unavailable: {reason}");
+                } else if line == "profile forwarding enabled" {
+                    tracing::info!("steamhost profile forwarding enabled");
+                } else {
+                    tracing::debug!("steamhost: {line}");
+                }
                 *last.lock().unwrap() = line;
             }
         });
@@ -1543,17 +1576,13 @@ pub(crate) fn run_through_host_cancellable(
     stdin.write_all(format!("{account}\n{token}\n{steam_id}\n").as_bytes()).map_err(|e| format!("couldn't send credentials to the host: {e}"))?;
     stdin.flush().ok();
 
-    // Watch stdout for the ready marker on another thread (reading blocks).
+    // Keep reading after the ready marker so the running host can send profile requests.
     let stdout = host.stdout.take().ok_or("host stdout unavailable")?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if line.trim() == STEAMHOST_READY {
-                let _ = tx.send(true);
-                return;
-            }
-        }
-        let _ = tx.send(false); // stdout closed without ready = host gave up
+        read_steamhost_messages(BufReader::new(stdout), || {
+            let _ = tx.send(true);
+        }, profile);
     });
 
     let wait_start = Instant::now();
@@ -3254,6 +3283,20 @@ mod win {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_profile_messages_preserve_the_target_after_ready() {
+        let ready = std::cell::Cell::new(false);
+        let mut profiles = Vec::new();
+        let mut messages = b"STEAMHOST-PROFILE 76561197960265769\nstartup info\nSTEAMHOST-READY\r\n".to_vec();
+        messages.extend_from_slice(b"STEAMHOST-PROFILE 76561197960265770\n\xff\nSTEAMHOST-PROFILE 42\nSTEAMHOST-PROFILE 76561197960265771\r\n");
+        super::read_steamhost_messages(std::io::Cursor::new(messages), || ready.set(true), |target| {
+            assert!(ready.get());
+            profiles.push(target);
+        });
+        assert!(ready.get());
+        assert_eq!(profiles, [76561197960265770, 76561197960265771]);
+    }
+
     use super::*;
 
     #[cfg(not(windows))]

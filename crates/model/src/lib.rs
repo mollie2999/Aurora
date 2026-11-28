@@ -2515,6 +2515,8 @@ pub mod chat {
 
     const TRUSTED_MEDIA_HOSTS: &[&str] = &[
         "steamusercontent.com",
+        "steamusercontent-a.akamaihd.net",
+        "steamuserimages-a.akamaihd.net",
         "steamstatic.com",
         "steamcdn-a.akamaihd.net",
         "steamcommunity.com",
@@ -2580,6 +2582,24 @@ pub mod chat {
         [".png", ".jpg", ".jpeg", ".gif", ".webp"]
             .iter()
             .any(|ext| lower.ends_with(ext))
+    }
+
+    /// Steam screenshots and uploaded chat images use a UGC ID and hash in place of an extension.
+    fn is_steam_ugc_image(url: &str, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        if !matches!(host.as_str(), "images.steamusercontent.com" | "steamusercontent-a.akamaihd.net" | "steamuserimages-a.akamaihd.net") {
+            return false;
+        }
+        let Some((_, path)) = http_rest(url).and_then(|rest| rest.split(['?', '#']).next()?.split_once('/')) else {
+            return false;
+        };
+        let mut segments = path.trim_end_matches('/').split('/');
+        matches!(
+            (segments.next(), segments.next(), segments.next(), segments.next()),
+            (Some("ugc"), Some(id), Some(hash), None)
+                if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+                    && !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        )
     }
 
     fn valid_yt_id(id: &str) -> bool {
@@ -2693,7 +2713,7 @@ pub mod chat {
             (ChatMediaKind::Image, is_trusted_media_host(host))
         } else if youtube_id_from_url(trimmed).is_some() {
             (ChatMediaKind::Video, true)
-        } else if has_image_extension(trimmed) {
+        } else if has_image_extension(trimmed) || is_steam_ugc_image(trimmed, host) {
             (ChatMediaKind::Image, is_trusted_media_host(host))
         } else {
             (ChatMediaKind::Link, is_trusted_media_host(host))
@@ -2996,6 +3016,27 @@ pub mod chat {
             let (text, inv) = parse("Сыграем в Human Fall Flat? steam://run/477160");
             assert_eq!(text, "Сыграем в Human Fall Flat? steam://run/477160");
             assert_eq!(inv, Some(GameInvite { app_id: 477160, connect: String::new() }));
+        }
+
+        #[test]
+        fn steam_screenshot_links_and_direct_gifs() {
+            let path = "/ugc/12345678901234567890/ABCDEF0123456789ABCDEF0123456789ABCDEF0/";
+            for url in [
+                format!("https://images.steamusercontent.com{path}"),
+                format!("https://steamuserimages-a.akamaihd.net{path}?imw=600"),
+            ] {
+                let parsed = parse_message(&format!("look at {url}"));
+                assert_eq!(parsed.media[0].kind, ChatMediaKind::Image);
+                assert_eq!(parsed.media[0].url, url);
+                assert!(parsed.media[0].trusted);
+            }
+            let lookalike = parse_message(&format!("https://images.steamusercontent.com.example{path}"));
+            assert_eq!(lookalike.media[0].kind, ChatMediaKind::Link);
+            assert!(!lookalike.media[0].trusted);
+
+            let gif = parse_message("https://example.com/clip.GIF?v=1");
+            assert_eq!(gif.media[0].kind, ChatMediaKind::Image);
+            assert!(!gif.media[0].trusted);
         }
 
         #[test]

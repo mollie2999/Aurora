@@ -41,7 +41,10 @@ use super::{
 use crate::epaint::textures::TexturesDelta;
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
-    native::{epi_integration::EpiIntegration, winit_integration::sleep_if_invisible_or_minimized},
+    native::{
+        epi_integration::EpiIntegration,
+        winit_integration::{is_invisible_or_minimized, sleep_if_invisible_or_minimized},
+    },
 };
 
 // ----------------------------------------------------------------------------
@@ -817,13 +820,20 @@ impl GlowWinitRunning<'_> {
                 .actions_requested
                 .iter()
                 .any(egui_winit::ActionRequested::wants_paint);
+            let wants_pixels = wants_paint
+                && (viewport_id != ViewportId::ROOT
+                    || viewport.actions_requested.iter().any(|action| {
+                        matches!(action, egui_winit::ActionRequested::Screenshot(_))
+                    }));
             // A hidden window is not painted, since nothing would be shown — unless someone
             // wants the pixels anyway, e.g. to screenshot an app that is in the background.
             // A LogicOnly pass on ROOT with PaintWhileHidden runs UI/viewport declarations
             // for child viewports (such as the fallback overlay) without clearing or
             // swapping ROOT's occluded surface.
-            let is_visible = (mode == PassMode::Full && viewport.info.visible().unwrap_or(true))
-                || (wants_paint && !logic_only_root_ui);
+            let is_visible = (mode == PassMode::Full
+                && !is_invisible_or_minimized(window)
+                && viewport.info.visible().unwrap_or(true))
+                || (wants_pixels && !logic_only_root_ui);
 
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
@@ -835,13 +845,20 @@ impl GlowWinitRunning<'_> {
             // while covered by a maximized child window like Friends & Chat), still run the
             // full UI pass whenever a child immediate viewport is visible so that child
             // window keeps painting.
+            if wants_paint && !is_visible {
+                // Run the root UI to manage child windows without presenting
+                // a buffer for a minimized or tray-hidden window.
+                viewport.actions_requested.retain(|action| {
+                    !matches!(action, egui_winit::ActionRequested::PaintWhileHidden)
+                });
+            }
             let has_visible_descendant = glutin.viewports.values().any(|child| {
                 child.ids.parent == viewport_id
                     && child.ids.this != viewport_id
                     && child.viewport_ui_cb.is_none()
                     && is_viewport_or_descendant_visible(&glutin.viewports, child.ids.this)
             });
-            let show_ui = is_visible || has_visible_descendant || logic_only_root_ui;
+            let show_ui = is_visible || has_visible_descendant || wants_paint || logic_only_root_ui;
 
             (raw_input, viewport_ui_cb, is_visible, show_ui)
         };
@@ -1140,7 +1157,7 @@ impl GlowWinitRunning<'_> {
             apply_texture_deltas(&mut painter, pending_deltas);
         }
 
-        glutin.handle_viewport_output(event_loop, &integration.egui_ctx, &viewport_output);
+        glutin.handle_viewport_output(event_loop, &integration.egui_ctx, viewport_output);
         let textures_applied = pending_deltas.is_empty();
 
         integration.report_frame_time(frame_timer.total_time_sec()); // don't count auto-save time as part of regular frame time
@@ -1933,6 +1950,7 @@ impl GlutinWindowContext {
             .get_mut(&viewport_id)
             .expect("viewport doesn't exist");
 
+        let new_window = viewport.window.is_none();
         let window = if let Some(window) = &mut viewport.window {
             window
         } else {
@@ -2002,6 +2020,12 @@ impl GlutinWindowContext {
             self.viewport_from_window.remove(&old);
         }
         self.viewport_from_window.insert(window.id(), viewport_id);
+
+        if new_window {
+            // A hidden viewport may need to paint before it becomes visible.
+            // Apply commands queued during creation before its first redraw.
+            viewport.process_commands(&self.egui_ctx, Vec::new());
+        }
 
         Ok(())
     }
@@ -2135,9 +2159,12 @@ impl GlutinWindowContext {
         &mut self,
         event_loop: &ActiveEventLoop,
         egui_ctx: &egui::Context,
-        viewport_output: &OrderedViewportIdMap<ViewportOutput>,
+        mut viewport_output: OrderedViewportIdMap<ViewportOutput>,
     ) {
         profiling::function_scope!();
+
+        retain_registered_viewports(&mut viewport_output, &self.viewports);
+        self.remove_viewports_not_in(&viewport_output);
 
         for (
             viewport_id,
@@ -2149,7 +2176,7 @@ impl GlutinWindowContext {
                 commands,
                 repaint_delay: _, // ignored - we listened to the repaint callback instead
             },
-        ) in viewport_output.clone()
+        ) in viewport_output
         {
             let ids = ViewportIdPair::from_self_and_parent(viewport_id, parent);
 
@@ -2181,9 +2208,32 @@ impl GlutinWindowContext {
 
         // Create windows for any new viewports:
         self.initialize_all_windows(event_loop);
-
-        self.remove_viewports_not_in(viewport_output);
     }
+}
+
+fn retain_registered_viewports(
+    output: &mut OrderedViewportIdMap<ViewportOutput>,
+    native_viewports: &OrderedViewportIdMap<Viewport>,
+) {
+    output.retain(|id, viewport| {
+        if *id == ViewportId::ROOT || viewport.class != ViewportClass::Root {
+            return true;
+        }
+
+        // Egui can report an immediate viewport as Root. Its inline renderer
+        // has already registered it as Immediate before emitting this output.
+        if native_viewports
+            .get(id)
+            .is_some_and(|native| native.class == ViewportClass::Immediate)
+        {
+            viewport.class = ViewportClass::Immediate;
+            return true;
+        }
+
+        // A repaint request can create default egui state for a closed child.
+        // Wait for show_viewport_* to declare it before creating a window.
+        false
+    });
 }
 
 fn create_winit_state(
@@ -2480,7 +2530,7 @@ fn render_immediate_viewport(
     egui_winit.handle_platform_output(window, platform_output);
 
     event_loop_context::with_current_event_loop(|event_loop| {
-        glutin.handle_viewport_output(event_loop, egui_ctx, &viewport_output);
+        glutin.handle_viewport_output(event_loop, egui_ctx, viewport_output);
     });
 }
 
@@ -2561,7 +2611,57 @@ fn save_screenshot_and_exit(
 
 #[cfg(test)]
 mod tests {
-    use super::{context_attributes_to_try, create_first_context};
+    use super::*;
+
+    #[test]
+    fn repaint_of_undeclared_child_does_not_create_a_native_window() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let overlay = ViewportId::from_hash_of("overlay");
+        let timer = ViewportId::from_hash_of("timer");
+        let popup = ViewportId::from_hash_of("popup");
+        let mut native = OrderedViewportIdMap::default();
+        let popup_ids = ViewportIdPair::from_self_and_parent(popup, ViewportId::ROOT);
+        initialize_or_update_viewport(
+            &mut native,
+            &mut None,
+            popup_ids,
+            ViewportClass::Immediate,
+            ViewportBuilder::default(),
+            None,
+        );
+
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx()
+                .show_viewport_deferred(timer, ViewportBuilder::default(), |_, _| {});
+        })
+        .drop_without_applying_deltas();
+
+        let mut input = egui::RawInput {
+            viewport_id: timer,
+            ..Default::default()
+        };
+        input.viewports.insert(
+            timer,
+            ViewportInfo {
+                parent: Some(ViewportId::ROOT),
+                ..Default::default()
+            },
+        );
+        let mut result = ctx.run_ui(input, |ui| {
+            ui.ctx().request_repaint_of(overlay);
+            ui.ctx().request_repaint_of(popup);
+        });
+        assert!(result.viewport_output[&overlay].class == ViewportClass::Root);
+
+        retain_registered_viewports(&mut result.viewport_output, &native);
+
+        assert!(!result.viewport_output.contains_key(&overlay));
+        assert!(result.viewport_output.contains_key(&ViewportId::ROOT));
+        assert!(result.viewport_output[&timer].class == ViewportClass::Deferred);
+        assert!(result.viewport_output[&popup].class == ViewportClass::Immediate);
+        result.drop_without_applying_deltas();
+    }
 
     #[test]
     fn context_attributes_end_with_compatibility_profile() {

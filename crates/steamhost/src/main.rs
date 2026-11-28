@@ -2,8 +2,8 @@
 //! `steamclient64.dll` on Windows) as the global Steam instance, with no
 //! steamui and no steamwebhelper.
 //!
-//! Nothing of Valve's is patched or bundled: the library is the user's own,
-//! loaded as-is, and its exported `CreateInterface` gives the engine.
+//! The installed library supplies the engine. Profile forwarding on verified
+//! Windows builds redirects one dispatch call in this process's memory.
 //!
 //! `steamhost probe <steam-root>`        become the global instance and name
 //!                                       the interfaces the getters return

@@ -447,11 +447,25 @@ fn collect_screenshots_in(dir: &std::path::Path, seen: &mut std::collections::BT
 
 /// List all local screenshots recorded across every game on this machine (newest first).
 pub fn list_all_screenshots() -> Vec<(AppId, LocalScreenshot)> {
-    let base = crate::store::config_dir().join("screenshots");
-    let Ok(rd) = std::fs::read_dir(&base) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
+    collect_screenshot_library(&crate::store::config_dir().join("screenshots"), false, &mut out);
+    out.sort_by(|a, b| b.1.modified.cmp(&a.1.modified).then_with(|| b.1.name.cmp(&a.1.name)));
+    out
+}
+
+pub(crate) fn last_screenshot(steam_root: Option<&std::path::Path>, account_id: u32) -> Option<LocalScreenshot> {
+    let mut shots = list_all_screenshots();
+    if let Some(root) = steam_root.filter(|root| !root.as_os_str().is_empty() && account_id != 0) {
+        let remote = root.join("userdata").join(account_id.to_string()).join("760").join("remote");
+        collect_screenshot_library(&remote, true, &mut shots);
+    }
+    shots.into_iter().map(|(_, s)| s).max_by(|a, b| {
+        a.modified.cmp(&b.modified).then_with(|| a.name.cmp(&b.name))
+    })
+}
+
+fn collect_screenshot_library(base: &std::path::Path, steam_layout: bool, out: &mut Vec<(AppId, LocalScreenshot)>) {
+    let Ok(rd) = std::fs::read_dir(base) else { return };
     let mut seen = std::collections::BTreeSet::new();
     for entry in rd.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
@@ -462,13 +476,12 @@ pub fn list_all_screenshots() -> Vec<(AppId, LocalScreenshot)> {
             continue;
         };
         let mut per_app = Vec::new();
-        collect_screenshots_in(&entry.path(), &mut seen, &mut per_app);
+        let dir = if steam_layout { entry.path().join("screenshots") } else { entry.path() };
+        collect_screenshots_in(&dir, &mut seen, &mut per_app);
         for s in per_app {
             out.push((app_id, s));
         }
     }
-    out.sort_by(|a, b| b.1.modified.cmp(&a.1.modified).then_with(|| b.1.name.cmp(&a.1.name)));
-    out
 }
 
 /// Delete a screenshot and its thumbnail from disk.

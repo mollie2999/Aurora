@@ -53,6 +53,20 @@ pub fn open_http(url: &str) -> bool {
 /// and the community pages the hub shows (workshop, guides, discussions…).
 pub fn in_app(url: &str) -> Option<(String, Option<String>)> {
     let url = url.trim();
+    if let Some(rest) = url.trim_matches('"').strip_prefix("steam://") {
+        let (command, target) = rest.split_once('/')?;
+        if command.eq_ignore_ascii_case("url") {
+            let (destination, id) = target.trim_end_matches('/').split_once('/')?;
+            if destination.eq_ignore_ascii_case("SteamIDPage") {
+                let id = id.parse::<u64>().ok().filter(|&id| id != 0)?;
+                return Some(("profile".into(), Some(id.to_string())));
+            }
+        }
+        if command.eq_ignore_ascii_case("openurl") && validate_http_url(target).is_some() {
+            return in_app(target);
+        }
+        return None;
+    }
     let scheme_len = if url.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
         8
     } else if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) {
@@ -114,6 +128,22 @@ pub fn page_url_menu(ui: &mut egui::Ui, url: &str) {
 /// `base` with these query parameters, encoded.
 pub fn with_query(base: &str, params: &[(&str, &str)]) -> String {
     reqwest::Url::parse_with_params(base, params).map(String::from).unwrap_or_else(|_| base.to_string())
+}
+
+/// Whether Aurora can open this Steam destination.
+pub(crate) fn is_aurora_link(url: &str) -> bool {
+    in_app(url).is_some() || parse(url).is_some_and(|link| link != Link::Show) || big_picture_mode(url).is_some()
+}
+
+/// Keep the destination of a Steam link without re-running its command.
+pub(crate) fn retained_page_arg<'a>(page: &str, arg: Option<&'a str>) -> Option<&'a str> {
+    let arg = arg?;
+    match (page, arg.split_once(':')) {
+        ("library", Some(("install" | "uninstall" | "verify", id))) => Some(id),
+        ("servers", Some(("connect", _))) => None,
+        ("library", _) if matches!(arg, "restore" | "add") => None,
+        _ => Some(arg),
+    }
 }
 
 /// Validate a YouTube video ID (`[A-Za-z0-9_-]+`).
@@ -764,6 +794,33 @@ mod tests {
         assert_eq!(parse("https://example.com"), None);
         assert!(shortcut_runs("[InternetShortcut]\r\nURL=steam://rungameid/570\r\n", 570));
         assert!(!shortcut_runs("[InternetShortcut]\r\nURL=steam://rungameid/5700\r\n", 570));
+    }
+
+    #[test]
+    fn reopening_a_steam_link_tab_does_not_replay_the_command() {
+        assert_eq!(retained_page_arg("library", Some("install:440")), Some("440"));
+        assert_eq!(retained_page_arg("library", Some("uninstall:440")), Some("440"));
+        assert_eq!(retained_page_arg("library", Some("verify:440")), Some("440"));
+        assert_eq!(retained_page_arg("servers", Some("connect:play.example.com:27015")), None);
+        assert_eq!(retained_page_arg("store", Some("app:440")), Some("app:440"));
+    }
+
+    #[test]
+    fn recognizes_supported_game_links_for_the_overlay() {
+        assert!(is_aurora_link("steam://store/620"));
+        assert!(is_aurora_link("steam://open/downloads"));
+        assert!(is_aurora_link("https://store.steampowered.com/app/620/"));
+        assert!(!is_aurora_link("steam://unknown"));
+        assert!(!is_aurora_link("https://example.org/"));
+    }
+
+    #[test]
+    fn steam_profile_protocol_links_open_the_native_profile() {
+        let expected = Some(("profile".to_string(), Some("76561197999984396".to_string())));
+        assert_eq!(in_app("steam://url/SteamIDPage/76561197999984396"), expected);
+        assert_eq!(in_app("steam://openurl/https://steamcommunity.com/profiles/76561197999984396"), expected);
+        assert!(!is_aurora_link("steam://url/SteamIDPage/not-an-id"));
+        assert!(!is_aurora_link("steam://openurl/https://example.org/"));
     }
 
     #[test]

@@ -438,6 +438,7 @@ impl State {
                 }
                 self.achievement_list.insert(*app_id, result.clone());
             }
+            Event::AchievementUnlocks { .. } | Event::GameAchievementsUnlocked { .. } => {}
             Event::AchievementProgress(list) => {
                 for (app, unlocked, total) in list {
                     self.achievements.insert(*app, (*unlocked, *total));
@@ -766,6 +767,7 @@ impl State {
             Event::LoggedOut { reason } => {
                 *self = State { last_error: Some(reason.clone()), ..Default::default() };
             }
+            Event::ChatAttachmentFailed(_) => {}
             Event::Error(msg) => {
                 if self.playing.is_none() {
                     self.launching = None;

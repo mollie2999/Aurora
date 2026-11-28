@@ -2,8 +2,8 @@
 //! reactions/mentions/invites, member sidebar, and group management dialogs.
 //! Reused across Community, the undocked Friends & Chat window, and the overlay.
 
-use super::community::{Sender, format_time, game_invite_card};
-use client::{Command, State};
+use super::community::{Sender, chat_attachment_menu, chat_message_continuation, chat_message_group, format_time, game_invite_card};
+use client::{ChatRecipient, Command, State};
 use egui::{Align, Align2, Color32, CornerRadius, Key, Layout, Margin, Rect, Sense, Stroke, Ui, pos2, vec2};
 use extensions::Action;
 use i18n::t;
@@ -264,7 +264,7 @@ pub fn group_view(
     group_id: GroupChatId,
     ui_state: &mut GroupUiState,
     actions: &mut Vec<Action>,
-    compact: bool,
+    in_overlay: bool,
     height: f32,
 ) {
     let Some(g) = state.chat_groups.get(&group_id).cloned() else {
@@ -305,7 +305,7 @@ pub fn group_view(
 
     let used_h = (ui.cursor().top() - top_y).max(0.0);
     let body_h = (total_h - used_h).floor().max(60.0);
-    let show_members = !compact && ui_state.show_members && ui.available_width() > 480.0;
+    let show_members = !in_overlay && ui_state.show_members && ui.available_width() > 480.0;
     let member_w = if show_members { 200.0 } else { 0.0 };
     let feed_w = (ui.available_width() - if show_members { member_w + 12.0 } else { 0.0 }).max(160.0);
 
@@ -315,7 +315,7 @@ pub fn group_view(
         ui.allocate_ui_with_layout(vec2(feed_w, body_h), Layout::top_down(Align::Min), |ui| {
             ui.set_min_height(body_h);
             ui.set_max_height(body_h);
-            message_feed(ui, t, state, client, &g, active_chat_id, &perms, ui_state, actions, body_h);
+            message_feed(ui, t, state, client, &g, active_chat_id, &perms, ui_state, actions, body_h, in_overlay);
         });
         if show_members {
             ui.add_space(6.0);
@@ -403,6 +403,7 @@ fn message_feed(
     ui_state: &mut GroupUiState,
     actions: &mut Vec<Action>,
     height: f32,
+    in_overlay: bool,
 ) {
     let empty = Vec::new();
     let msgs = state.group_messages.get(&(g.id, chat_id)).unwrap_or(&empty);
@@ -460,34 +461,25 @@ fn message_feed(
                     if new_group {
                         ui.add_space(10.0);
                         let p = state.persona(m.from);
-                        ui.horizontal_top(|ui| {
-                            w::avatar(ui, t, &art::avatar(p.avatar_hash.as_deref()), 34.0, None);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                ui.horizontal(|ui| {
-                                    let me = m.from == state.steam_id;
-                                    let name = if p.name.is_empty() {
-                                        if me { t!("You").to_string() } else { m.from.to_string() }
-                                    } else {
-                                        p.display_name()
-                                    };
-                                    let color = if me {
-                                        t.accent
-                                    } else if g.owner_id == m.from {
-                                        t.away
-                                    } else {
-                                        t.text
-                                    };
-                                    ui.label(w::text_semibold(name, 14.0, color));
-                                    ui.label(w::text(format_time(m.time), 11.5, t.text_faint));
-                                });
-                                group_message_body(ui, t, state, client, g, chat_id, perms, m, ui_state, actions);
-                            });
+                        let me = m.from == state.steam_id;
+                        let name = if p.name.is_empty() {
+                            if me { t!("You").to_string() } else { m.from.to_string() }
+                        } else {
+                            p.display_name()
+                        };
+                        let color = if me {
+                            t.accent
+                        } else if g.owner_id == m.from {
+                            t.away
+                        } else {
+                            t.text
+                        };
+                        chat_message_group(ui, t, p.avatar_hash.as_deref(), (name, color, m.time), |ui| {
+                            group_message_body(ui, t, state, client, g, chat_id, perms, m, ui_state, actions);
                         });
                     } else {
-                        ui.horizontal_top(|ui| {
-                            ui.add_space(42.0);
-                            ui.vertical(|ui| group_message_body(ui, t, state, client, g, chat_id, perms, m, ui_state, actions));
+                        chat_message_continuation(ui, |ui| {
+                            group_message_body(ui, t, state, client, g, chat_id, perms, m, ui_state, actions);
                         });
                     }
                     last = Some((m.from, m.time));
@@ -522,10 +514,11 @@ fn message_feed(
                                 .hint_text(w::text(hint, 14.0, t.text_faint))
                                 .font(w::font(14.5))
                                 .frame(egui::Frame::NONE)
-                                .desired_width(ui.available_width() - 48.0),
+                                .desired_width((ui.available_width() - 80.0).max(0.0)),
                         )
                         .with_edit_menu();
                     let send = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    chat_attachment_menu(ui, t, client, ChatRecipient::Group { group_id: g.id, chat_id }, in_overlay);
                     let clicked = w::icon_button(ui, t, icons::SEND, t!("Send"), false, 0).clicked();
                     if (send || clicked) && !ui_state.input.trim().is_empty() {
                         let member_names: Vec<(u32, String)> = g

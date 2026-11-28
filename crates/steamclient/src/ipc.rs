@@ -20,6 +20,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Hello => "Hello",
         Request::UserStats { .. } => "UserStats",
         Request::StoreStats { .. } => "StoreStats",
+        Request::AchievementsUnlocked { .. } => "AchievementsUnlocked",
         Request::RichPresence { .. } => "RichPresence",
         Request::CurrentPlayers => "CurrentPlayers",
         Request::AuthTicket { .. } => "AuthTicket",

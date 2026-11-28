@@ -81,6 +81,7 @@ pub const DESKTOP: &str = "\u{E560}";
 pub const BRANCH: &str = "\u{E278}";
 pub const HEART: &str = "\u{E2A8}";
 pub const IMAGE: &str = "\u{E2CA}";
+pub const PAPERCLIP: &str = "\u{E39A}";
 pub const LINK: &str = "\u{E2E2}";
 pub const PAINT: &str = "\u{E6F0}";
 pub const STACK: &str = "\u{E466}";

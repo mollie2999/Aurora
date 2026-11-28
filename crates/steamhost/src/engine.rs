@@ -91,8 +91,8 @@ mod user {
 }
 
 /// The printed line that tells a parent process the host is signed in and
-/// ready for games to connect. Diagnostics go to stderr; this marker is the
-/// only thing a parent needs to match on stdout.
+/// ready for games to connect. Diagnostics go to stderr and profile requests
+/// use their own stdout prefix.
 pub const READY: &str = "STEAMHOST-READY";
 
 fn zeroize_slice(buf: &mut [u8]) {
@@ -163,8 +163,15 @@ struct Session {
 
 /// Become the global instance and sign in with the given credentials, waiting
 /// until the engine reports logged-on (or timing out).
-fn sign_in(root: &Path, account: SecretCString, mut token: SecretCString, steam_id: u64) -> Result<Session, String> {
+fn sign_in(root: &Path, account: SecretCString, mut token: SecretCString, steam_id: u64, forward_profiles: bool) -> Result<Session, String> {
     let lib = Lib::open(root)?;
+    if forward_profiles {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        match sys::install_profile_forwarding(root) {
+            Ok(()) => eprintln!("profile forwarding enabled"),
+            Err(e) => eprintln!("profile forwarding unavailable: {e}"),
+        }
+    }
     let (e, pipe, h_user) = global_instance(&lib)?;
     sys::verify_slot(e, user::GETTER)?;
     // SAFETY: getter slot shaped (this, hUser, hPipe), verified in `steamclient`.
@@ -211,7 +218,7 @@ fn sign_in(root: &Path, account: SecretCString, mut token: SecretCString, steam_
 pub fn login(root: &Path) -> Result<(), String> {
     let mut lines = std::io::stdin().lock();
     let (account, token, steam_id) = read_credentials(&mut lines)?;
-    let _session = sign_in(root, account, token, steam_id)?;
+    let _session = sign_in(root, account, token, steam_id, false)?;
     eprintln!("logged on");
     hold();
     Ok(())
@@ -223,7 +230,8 @@ pub fn login(root: &Path) -> Result<(), String> {
 pub fn serve(root: &Path) -> Result<(), String> {
     let mut lines = std::io::stdin().lock();
     let (account, token, steam_id) = read_credentials(&mut lines)?;
-    let _session = sign_in(root, account, token, steam_id)?;
+    let forward_profiles = std::env::var_os("AURORA_STEAMHOST_PROFILE_FORWARDING").is_some_and(|value| value == "1");
+    let _session = sign_in(root, account, token, steam_id, forward_profiles)?;
     println!("{READY}");
     use std::io::Write;
     std::io::stdout().flush().map_err(|e| e.to_string())?;

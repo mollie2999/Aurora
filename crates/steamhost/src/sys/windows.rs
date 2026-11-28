@@ -10,6 +10,12 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(target_arch = "x86_64")]
+#[path = "windows_profile.rs"]
+mod profile;
+#[cfg(target_arch = "x86_64")]
+pub use profile::install_profile_forwarding;
+
 /// Class names [`class_name`] gives for the engine and its `IClientUser`.
 pub const ENGINE_CLASS: &str = ".?AVCSteamClient@@";
 pub const USER_CLASS: &str = ".?AVIClientUserMap@@";

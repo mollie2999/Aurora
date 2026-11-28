@@ -646,14 +646,25 @@ impl SteamApp {
                     }
                 }
                 Event::GameStarted { app_id } => {
-                    self.overlay.game_started(*app_id, self.prefs.overlay_enabled);
+                    self.overlay.game_started(*app_id, client::app_overlay_enabled(*app_id));
                     if let Some(p) = self.launch_popup.as_mut().filter(|p| p.app_id == *app_id) {
                         p.stage = crate::launch_popup::Stage::Running(now);
                     }
                 }
                 Event::GameStopped { .. } => {
-                    self.overlay.game_stopped();
+                    self.overlay.game_stopped(ctx);
                     self.reload_local_async(ctx);
+                }
+                Event::GameOverlay { app_id, dialog, target } => {
+                    self.handle_game_overlay(ctx, *app_id, dialog, target, actions);
+                }
+                Event::AchievementUnlocks { app_id, since, achievements } => {
+                    self.overlay.achievement_unlocked(*app_id, *since, achievements);
+                }
+                Event::GameAchievementsUnlocked { app_id, achievements } => {
+                    if self.prefs.toast_notifications && client::app_overlay_enabled(*app_id) {
+                        self.overlay.game_achievements_unlocked(*app_id, achievements);
+                    }
                 }
                 Event::ControllerLayoutRoute { app_id, enabled } => {
                     self.overlay.set_controller_route(*app_id, *enabled);
@@ -671,6 +682,9 @@ impl SteamApp {
                         Some(p) => p.stage = crate::launch_popup::Stage::Failed(msg.clone()),
                         None => self.toast(now, i18n::t!("Something went wrong"), i18n::tr_dyn(msg)),
                     }
+                }
+                Event::ChatAttachmentFailed(msg) => {
+                    self.toast(now, i18n::t!("Attachment not sent"), i18n::tr_dyn(msg));
                 }
                 Event::KeyActivated(r) => {
                     if let Some(a) = &mut self.activate {
@@ -705,6 +719,7 @@ impl SteamApp {
     }
 
     fn go(&mut self, page: String, arg: Option<String>) {
+        self.overlay.desktop_navigation_changed();
         self.registry.navigate(&page, arg.as_deref());
         self.prefs.page = page;
         self.current_arg = arg;
@@ -978,6 +993,9 @@ impl SteamApp {
         }
         if self.applied_fonts_key != fonts_key {
             ui::install_fonts_for_theme(ctx, lcd_subpixel_enabled(), self.prefs.theme.weight_preset, custom_fonts.as_ref());
+            if let Some(session) = &self.overlay.ingame {
+                ui::install_fonts_for_theme(&session.ctx, false, self.prefs.theme.weight_preset, custom_fonts.as_ref());
+            }
             self.applied_fonts_key = fonts_key;
         }
         sync_texture(ctx, &mut self.bg_tex, bg_path.as_deref(), bg_wrap, "theme-bg");
@@ -1058,12 +1076,20 @@ impl SteamApp {
         }
     }
 
+
     fn handle_links(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame, actions: &mut Vec<Action>) {
-        use crate::links::Link;
         while let Ok(request) = self.links.try_recv() {
-            self.show_window(ctx, frame, request.activation_token);
-            if request.arg != "show" {
+            let in_game = self.state.phase == Phase::LoggedIn
+                && crate::links::is_aurora_link(&request.arg)
+                && (self.overlay.is_visible() || self.overlay.game_has_focus(&self.local));
+            if in_game {
+                self.overlay.open_for_game_request(ctx);
                 self.pending_links.push(request.arg);
+            } else {
+                self.show_window(ctx, frame, request.activation_token);
+                if request.arg != "show" {
+                    self.pending_links.push(request.arg);
+                }
             }
         }
         // Allow Big Picture / Steam Deck launch requests even while on the login screen.
@@ -1079,30 +1105,101 @@ impl SteamApp {
         if self.state.phase != Phase::LoggedIn {
             return;
         }
+        let mut routed = Vec::new();
         for raw in std::mem::take(&mut self.pending_links) {
-            let nav = |page: &str, arg: Option<String>| Action::Navigate { page: page.into(), arg };
-            match crate::links::parse(&raw) {
-                Some(Link::Run(id)) => match self.local.games.iter().find(|g| g.app_id == id) {
-                    Some(g) => {
-                        let now = ctx.input(|i| i.time);
-                        self.launch_popup = Some(crate::launch_popup::LaunchPopup::new(id, g.name.clone(), now));
-                        self.client.send(Command::Launch { app_id: id, install_dir: g.install_dir.clone(), args: client::LaunchArgs::default() });
-                    }
-                    None => actions.push(nav("library", Some(format!("install:{id}")))),
-                },
-                Some(Link::Install(id)) => actions.push(nav("library", Some(format!("install:{id}")))),
-                Some(Link::Uninstall(id)) => actions.push(nav("library", Some(format!("uninstall:{id}")))),
-                Some(Link::Validate(id)) => actions.push(nav("library", Some(format!("verify:{id}")))),
-                Some(Link::Store(id)) => actions.push(nav("store", Some(format!("app:{id}")))),
-                Some(Link::Connect { addr, password }) => {
-                    let target = match password {
-                        Some(pw) => format!("connect:{addr}|{pw}"),
-                        None => format!("connect:{addr}"),
-                    };
-                    actions.push(nav("servers", Some(target)));
+            self.route_link(ctx, &raw, &mut routed);
+        }
+        if routed.is_empty() {
+            return;
+        }
+        if self.overlay.is_visible() || self.overlay.game_has_focus(&self.local) {
+            self.route_overlay_actions(routed, actions);
+        } else {
+            actions.extend(routed);
+        }
+    }
+
+    fn handle_game_overlay(&mut self, ctx: &egui::Context, app_id: model::AppId, dialog: &str, target: &str, actions: &mut Vec<Action>) {
+        use crate::builtin::hub::{HubTab, View};
+        let accepts = self.overlay.accepts_game_request(app_id);
+        if dialog == "url" {
+            if accepts && crate::links::is_aurora_link(target) {
+                self.overlay.open_for_game_request(ctx);
+                let mut routed = Vec::new();
+                self.route_link(ctx, target, &mut routed);
+                self.route_overlay_actions(routed, actions);
+            } else {
+                crate::links::open_http(target);
+            }
+            return;
+        }
+        if !accepts {
+            return;
+        }
+        let (page, arg) = match dialog {
+            "friends" | "players" | "invite" | "invite_connect" => ("community".into(), None),
+            "settings" => ("settings".into(), None),
+            "community" | "officialgamegroup" => View::Hub { app: app_id, tab: HubTab::All }.to_page(),
+            "stats" | "achievements" => View::Achievements { app: app_id, friend: None }.to_page(),
+            "user:chat" => {
+                let Ok(id) = target.parse::<u64>() else { return };
+                ("community".into(), Some(id.to_string()))
+            }
+            name if name.starts_with("user:") => {
+                let Ok(id) = target.parse::<u64>() else { return };
+                ("profile".into(), Some(id.to_string()))
+            }
+            _ => return,
+        };
+        self.overlay.open_for_game_request(ctx);
+        self.overlay.show_page(page, arg);
+    }
+
+    pub(crate) fn route_link(&mut self, ctx: &egui::Context, raw: &str, actions: &mut Vec<Action>) -> bool {
+        use crate::links::Link;
+        let nav = |page: &str, arg: Option<String>| Action::Navigate { page: page.into(), arg };
+        if let Some((deck_preview, windowed)) = crate::links::big_picture_mode(raw) {
+            self.bigpicture.enter_requested(ctx, deck_preview, windowed);
+            return true;
+        }
+        if let Some((page, arg)) = crate::links::in_app(raw) {
+            actions.push(Action::Navigate { page, arg });
+            return true;
+        }
+        match crate::links::parse(raw) {
+            Some(Link::Run(id)) => match self.local.games.iter().find(|g| g.app_id == id) {
+                Some(g) => {
+                    let now = ctx.input(|i| i.time);
+                    self.launch_popup = Some(crate::launch_popup::LaunchPopup::new(id, g.name.clone(), now));
+                    self.client.send(Command::Launch { app_id: id, install_dir: g.install_dir.clone(), args: client::LaunchArgs::default() });
                 }
-                Some(Link::Page(p)) => actions.push(nav(p, None)),
-                Some(Link::Show) | None => {}
+                None => actions.push(nav("library", Some(format!("install:{id}")))),
+            },
+            Some(Link::Install(id)) => actions.push(nav("library", Some(format!("install:{id}")))),
+            Some(Link::Uninstall(id)) => actions.push(nav("library", Some(format!("uninstall:{id}")))),
+            Some(Link::Validate(id)) => actions.push(nav("library", Some(format!("verify:{id}")))),
+            Some(Link::Store(id)) => actions.push(nav("store", Some(format!("app:{id}")))),
+            Some(Link::Connect { addr, password }) => {
+                let target = match password {
+                    Some(pw) => format!("connect:{addr}|{pw}"),
+                    None => format!("connect:{addr}"),
+                };
+                actions.push(nav("servers", Some(target)));
+            }
+            Some(Link::Page(p)) => actions.push(nav(p, None)),
+            Some(Link::Show) => {}
+            None => return false,
+        }
+        true
+    }
+
+    pub(crate) fn route_overlay_actions(&mut self, routed: Vec<Action>, other: &mut Vec<Action>) {
+        for action in routed {
+            match action {
+                Action::Navigate { page, arg } => self.overlay.show_page(page, arg),
+                Action::OpenChat(id) => crate::overlay::open_chat(self, id, other),
+                Action::OpenGroupChat { group_id, chat_id } => crate::overlay::open_group_channel(self, group_id, chat_id),
+                action => other.push(action),
             }
         }
     }
@@ -1120,7 +1217,7 @@ impl SteamApp {
                 TrayCmd::Friends => self.friends_window.open = true,
                 TrayCmd::Status(s) => self.client.send(Command::SetPersonaState(s)),
                 TrayCmd::Exit => {
-                    if frame.is_window_attached() || self.downloading() {
+                    if self.downloading() {
                         self.show_window(ctx, frame, event.activation_token);
                     }
                     self.request_exit(ctx);
@@ -1233,12 +1330,15 @@ fn instant_wheel(raw_input: &mut egui::RawInput, line_points: f32) {
 
 impl eframe::App for SteamApp {
     /// Runs before every frame, and also while the window gets no frames
-    /// (minimized or behind a fullscreen game on Wayland): the overlay drawn
-    /// inside the game runs here so it stays quick then.
+    /// (minimized or behind a fullscreen game on Wayland). This drives the
+    /// in-game overlay and handles the window overlay's shortcut.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let mut actions = Vec::new();
         self.drain_events(ctx, &mut actions);
         self.handle_tray(ctx, frame, &mut actions);
+        if self.exiting {
+            return;
+        }
         self.handle_links(ctx, frame, &mut actions);
         if !self.anti_cheat_notices.is_empty() && (self.hidden || ctx.input(|i| i.viewport().minimized == Some(true))) {
             self.show_window(ctx, frame, None);
@@ -1312,6 +1412,9 @@ impl eframe::App for SteamApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if self.exiting && self.hidden {
+            return;
+        }
         // "Limit to 60 fps" (Settings > Accessibility): at most 60 frames a
         // second, even on faster monitors. A frame that comes sooner waits
         // out the rest of its 1/60 s. Idle windows draw nothing, and slower
@@ -1371,6 +1474,9 @@ impl eframe::App for SteamApp {
         self.drain_events(&ctx, &mut actions);
         self.taskbar.update(&self.state.downloads);
         self.handle_tray(&ctx, frame, &mut actions);
+        if self.exiting && self.hidden {
+            return;
+        }
         self.handle_links(&ctx, frame, &mut actions);
 
         // Closing the window hides it in the tray (like Steam) unless "Exit" was chosen.

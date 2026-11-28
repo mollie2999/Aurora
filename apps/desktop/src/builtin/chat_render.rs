@@ -10,6 +10,8 @@ use model::{ChatMedia, ChatMediaKind};
 use std::collections::HashSet;
 use ui::{Theme, icons, widgets as w};
 
+const IMAGE_PREVIEW_FPS: f32 = 24.0;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatLightbox {
     url: String,
@@ -181,8 +183,10 @@ pub fn render_message_text(
                     .clone()
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .on_hover_text(&url);
-                if no_drag && link_resp.clicked() {
-                    links::open_http(&url);
+                if no_drag && link_resp.clicked()
+                    && let Some(url) = links::validate_http_url(&url)
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url.as_str()));
                 }
                 return link_resp;
             }
@@ -247,18 +251,9 @@ pub fn render_media(ui: &mut Ui, t: &Theme, text: &str, media: &[ChatMedia]) {
             ChatMediaKind::Image => {
                 ui.add_space(4.0);
                 if m.trusted || revealed.contains(&m.url) {
-                    let sized = sized_images::inline_url(&m.url, 320.0, 240.0, ppp);
-                    let r = ui.add(
-                        egui::Image::new(sized)
-                            .max_size(vec2(320.0, 240.0))
-                            .fit_to_original_size(1.0)
-                            .corner_radius(t.corner_small())
-                            .sense(Sense::click()),
-                    );
-                    if r.rect.height() < 4.0 {
-                        let (rect, _) = ui.allocate_exact_size(vec2(240.0, 140.0), Sense::hover());
-                        w::image_or_skeleton(ui, t, rect, &m.url, t.corner_small());
-                    }
+                    let width = ui.available_width().clamp(1.0, 320.0);
+                    let sized = sized_images::inline_url(&m.url, width, 240.0, ppp);
+                    let r = w::picture_fit_width(ui, t, &sized, width, 240.0, IMAGE_PREVIEW_FPS);
                     let clicked = r
                         .clone()
                         .on_hover_cursor(egui::CursorIcon::ZoomIn)
@@ -347,7 +342,9 @@ pub fn render_media(ui: &mut Ui, t: &Theme, text: &str, media: &[ChatMedia]) {
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .on_hover_text(&m.url);
                         if chip.clicked() {
-                            links::open_http(&m.url);
+                            if let Some(url) = links::validate_http_url(&m.url) {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(url.as_str()));
+                            }
                         }
                         media_context_menu(chip, &m.url);
                     }
@@ -372,7 +369,6 @@ pub fn show_lightbox(ctx: &egui::Context, t: &Theme) {
 
     let screen = ctx.content_rect();
     let mut close = false;
-    let ppp = ctx.pixels_per_point();
     egui::Area::new(egui::Id::unique("aurora_chat_image_lightbox_area"))
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
@@ -420,8 +416,7 @@ pub fn show_lightbox(ctx: &egui::Context, t: &Theme) {
                             ui.add_space(10.0);
                             let avail = vec2(ui.available_width(), (card_h - 84.0).max(120.0));
                             let (img_rect, _) = ui.allocate_exact_size(avail, Sense::hover());
-                            let sized = sized_images::inline_url(&lb.url, avail.x, avail.y, ppp);
-                            if !w::paint_contain(ui, img_rect, &sized, Align2::CENTER_CENTER) {
+                            if !w::paint_contain_animated(ui, img_rect, &lb.url, Align2::CENTER_CENTER, IMAGE_PREVIEW_FPS) {
                                 ui.put(
                                     Rect::from_center_size(img_rect.center(), vec2(32.0, 32.0)),
                                     egui::Spinner::new().size(28.0).color(t.accent),

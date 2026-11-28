@@ -43,10 +43,10 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(conn: Conn, main: &egui::Context, rt: &tokio::runtime::Runtime, theme: &ui::Theme) -> Self {
+    pub fn new(conn: Conn, main: &egui::Context, rt: &tokio::runtime::Runtime, theme: &ui::Theme, fonts: Option<&ui::CustomFonts>) -> Self {
         let ctx = egui::Context::default();
         egui_extras::install_image_loaders(&ctx);
-        ui::install_fonts(&ctx);
+        ui::install_fonts_for_theme(&ctx, false, theme.weight_preset, fonts);
         crate::image_cache::ImageCache::install(&ctx, rt.handle().clone());
         theme.apply(&ctx);
         no_animations(&ctx);

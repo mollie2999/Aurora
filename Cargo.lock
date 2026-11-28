@@ -5303,6 +5303,7 @@ name = "steamhost"
 version = "1.0.0-rc6"
 dependencies = [
  "libc",
+ "sha2",
 ]
 
 [[package]]

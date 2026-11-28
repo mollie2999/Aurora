@@ -601,13 +601,12 @@ extern "C" fn fr_level(_t: This, id: u64) -> i32 {
 extern "C" fn fr_has_friend(_t: This, id: u64, flags: i32) -> bool {
     with_session(|s| s.friends.iter().any(|f| f.steam_id == id && flag_match(f.relationship, flags))).unwrap_or(false)
 }
-/// No overlay: open the page in the browser instead.
 extern "C" fn fr_overlay_web(_t: This, url: *const c_char, _mode: i32) {
-    crate::win::open_url(&unsafe { text(url) });
+    overlay("url".into(), unsafe { text(url) });
 }
 /// Ask Aurora to open its overlay on a dialog (without blocking the game).
 fn overlay(dialog: String, target: String) {
-    crate::log!("overlay: {dialog} {target}");
+    crate::log!("overlay: {dialog}");
     std::thread::spawn(move || {
         crate::ipc::request(Request::Overlay { dialog, target });
     });
@@ -642,7 +641,7 @@ extern "C" fn fr_invite_to_game(_t: This, friend: u64, connect: *const c_char) -
     friend != 0
 }
 extern "C" fn fr_overlay_store(_t: This, app: u32, _flag: i32) {
-    crate::win::open_url(&format!("https://store.steampowered.com/app/{app}/"));
+    overlay("url".into(), format!("https://store.steampowered.com/app/{app}/"));
 }
 extern "C" fn fr_set_rich_presence(_t: This, key: *const c_char, value: *const c_char) -> bool {
     let (k, v) = unsafe { (text(key), text(value)) };
@@ -884,6 +883,7 @@ fn store_stats() -> bool {
     crate::log!("storing {} stat(s)", changes.len());
     std::thread::spawn(move || {
         let reply = crate::ipc::request(Request::StoreStats { stats: changes.clone(), crc, reset });
+        let mut unlocked_toasts = Vec::new();
         let again = {
             let mut g = lock();
             let app = g.app_id();
@@ -902,6 +902,11 @@ fn store_stats() -> bool {
                         let on = (v >> a.def.bit) & 1 == 1;
                         if on && !a.stored {
                             unlocked.push(a.def.name.clone());
+                            let title = if a.def.display_name.is_empty() { &a.def.name } else { &a.def.display_name };
+                            unlocked_toasts.push(crate::protocol::AchievementToast {
+                                title: title.chars().take(256).collect(),
+                                icon: a.def.icon.rsplit('/').next().unwrap_or("").chars().take(80).collect(),
+                            });
                         }
                         a.stored = on;
                     }
@@ -924,6 +929,11 @@ fn store_stats() -> bool {
         };
         if again {
             store_stats();
+        }
+        // A notification can fail independently of the stats write. Batch it
+        // separately to stay below the IPC request size limit.
+        for unlocks in unlocked_toasts.chunks(32) {
+            let _ = crate::ipc::request(Request::AchievementsUnlocked { unlocks: unlocks.to_vec() });
         }
     });
     true

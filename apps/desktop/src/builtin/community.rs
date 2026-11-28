@@ -1,9 +1,10 @@
 //! Community: friends, 1:1 chat, and group chats.
 
+use super::chat_image_picker::{IMAGE_EXTENSIONS, ImagePicker};
 use super::group_chat::{self, ChatTarget, GroupUiState};
 use ui::widgets::EditMenu;
 use i18n::t;
-use client::{Client, Command, Event, State};
+use client::{ChatAttachment, ChatRecipient, Client, Command, Event, State};
 use egui::{Align, Align2, CornerRadius, Key, Layout, Margin, Rect, Sense, Stroke, Ui, pos2, vec2};
 use extensions::{Action, Ctx, Extension, Manifest, PageSpec};
 use model::{GroupChatId, PersonaState, SteamId, art};
@@ -161,6 +162,7 @@ impl Community {
         egui::Frame::new().fill(t.chrome).inner_margin(Margin::symmetric(24, 14)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
                 group_chat::group_avatar(ui, t, &g, &name, 44.0);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
@@ -194,6 +196,7 @@ impl Community {
         egui::Frame::new().fill(t.chrome).inner_margin(Margin::symmetric(24, 14)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
                 w::avatar(ui, t, &art::avatar(p.avatar_hash.as_deref()), 44.0, Some(crate::shell::status_color(t, &p)));
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
@@ -207,12 +210,13 @@ impl Community {
                     }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if w::icon_button(ui, t, icons::X, t!("Close conversation"), false, 0).clicked() {
+                        self.selected = None;
+                    }
                     if w::icon_button(ui, t, icons::COPY, t!("Copy SteamID"), false, 0).clicked() {
                         ui.ctx().copy_text(id.to_string());
                         ctx.toast(t!("SteamID copied"));
-                    }
-                    if w::icon_button(ui, t, icons::X, t!("Close conversation"), false, 0).clicked() {
-                        self.selected = None;
                     }
                 });
             });
@@ -221,7 +225,7 @@ impl Community {
         ui.painter().hline(rect.x_range(), ui.cursor().top(), Stroke::new(1.0, t.border));
         egui::Frame::new().inner_margin(Margin::symmetric(24, 12)).show(ui, |ui| {
             let h = ui.available_height();
-            if let Some(a) = chat_body(ui, t, ctx.state, &client_of(ctx), id, &mut self.input, h) {
+            if let Some(a) = chat_body(ui, t, ctx.state, &client_of(ctx), id, &mut self.input, h, false) {
                 ctx.act(a);
             }
         });
@@ -250,9 +254,73 @@ impl Sender for Client {
     }
 }
 
+pub(super) fn chat_attachment_menu(ui: &mut Ui, t: &Theme, client: &impl Sender, recipient: ChatRecipient, in_overlay: bool) {
+    let draft_id = ui.scope_id().with(("chat-attachment", recipient));
+    let picker_id = draft_id.with("image-picker");
+    let button = w::icon_button(ui, t, icons::PAPERCLIP, t!("Attachments"), false, 0);
+    let selection = egui::Popup::menu(&button).show(|ui| {
+        if w::button(ui, t, Some(icons::IMAGE), t!("Upload an image"), w::Kind::Ghost, w::Size::Sm).clicked() {
+            ui.close();
+            if in_overlay {
+                ui.data_mut(|d| d.insert_temp(picker_id, ImagePicker::new()));
+                return None;
+            }
+            return rfd::FileDialog::new()
+                .add_filter(t!("Images").to_string(), IMAGE_EXTENSIONS)
+                .pick_file()
+                .map(ChatAttachment::Image);
+        }
+        if w::button(ui, t, Some(icons::CAMERA), t!("Upload last screenshot"), w::Kind::Ghost, w::Size::Sm).clicked() {
+            ui.close();
+            return Some(ChatAttachment::LastScreenshot);
+        }
+        if w::button(ui, t, Some(icons::LINK), t!("Share your trade offer URL"), w::Kind::Ghost, w::Size::Sm).clicked() {
+            ui.close();
+            return Some(ChatAttachment::TradeOfferUrl);
+        }
+        None
+    });
+    if let Some(attachment) = selection.and_then(|r| r.inner) {
+        ui.data_mut(|d| d.insert_temp(draft_id, attachment));
+    }
+    if let Some(picker) = ui.data_mut(|d| d.remove_temp::<ImagePicker>(picker_id)) {
+        if let Some(path) = picker.show(ui, t, picker_id) {
+            ui.data_mut(|d| d.insert_temp(draft_id, ChatAttachment::Image(path)));
+            ui.ctx().request_repaint();
+        }
+        return;
+    }
+    let Some(attachment) = ui.data(|d| d.get_temp::<ChatAttachment>(draft_id)) else { return };
+    let description = match &attachment {
+        ChatAttachment::Image(path) => {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            t!("Send {name} to this chat?", name = name)
+        }
+        ChatAttachment::LastScreenshot => t!("Send your most recent local Steam or Aurora screenshot to this chat?").to_string(),
+        ChatAttachment::TradeOfferUrl => t!("Share your Steam trade offer URL with this chat?").to_string(),
+    };
+    let mut send = false;
+    let mut cancel = false;
+    let modal = w::modal(ui.ctx(), draft_id).show(ui.ctx(), |ui| {
+        ui.set_max_width(340.0);
+        ui.label(w::text_bold(t!("Send attachment"), 18.0, t.text));
+        ui.label(w::text(description, 13.0, t.text_dim));
+        ui.horizontal(|ui| {
+            send = w::button(ui, t, Some(icons::SEND), t!("Send"), w::Kind::Primary, w::Size::Sm).clicked();
+            cancel = w::button(ui, t, None, t!("Cancel"), w::Kind::Ghost, w::Size::Sm).clicked();
+        });
+    });
+    if send {
+        client.send(Command::SendChatAttachment { recipient, attachment });
+    }
+    if send || cancel || modal.should_close() {
+        ui.data_mut(|d| d.remove::<ChatAttachment>(draft_id));
+    }
+}
+
 /// Message list plus composer. Used by Community, the Friends window and
 /// the overlay. Returns a game invite the user chose to join.
-pub fn chat_body(ui: &mut Ui, t: &Theme, state: &State, client: &impl Sender, friend: SteamId, input: &mut String, height: f32) -> Option<Action> {
+pub fn chat_body(ui: &mut Ui, t: &Theme, state: &State, client: &impl Sender, friend: SteamId, input: &mut String, height: f32, in_overlay: bool) -> Option<Action> {
     let empty = Vec::new();
     let msgs = state.chats.get(&friend).unwrap_or(&empty);
     let mut join = None;
@@ -281,23 +349,14 @@ pub fn chat_body(ui: &mut Ui, t: &Theme, state: &State, client: &impl Sender, fr
                 if new_group {
                     ui.add_space(10.0);
                     let p = state.persona(m.from);
-                    ui.horizontal_top(|ui| {
-                        w::avatar(ui, t, &art::avatar(p.avatar_hash.as_deref()), 34.0, None);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.horizontal(|ui| {
-                                let me = m.from == state.steam_id;
-                                let name = if p.name.is_empty() { t!("You").to_string() } else { p.name.clone() };
-                                ui.label(w::text_semibold(name, 14.0, if me { t.accent } else { t.text }));
-                                ui.label(w::text(format_time(m.time), 11.5, t.text_faint));
-                            });
-                            message(ui, t, state, client, m, &mut join);
-                        });
+                    let name = if p.name.is_empty() { t!("You").to_string() } else { p.name };
+                    let color = if m.from == state.steam_id { t.accent } else { t.text };
+                    chat_message_group(ui, t, p.avatar_hash.as_deref(), (name, color, m.time), |ui| {
+                        message(ui, t, state, client, m, &mut join);
                     });
                 } else {
-                    ui.horizontal_top(|ui| {
-                        ui.add_space(42.0);
-                        ui.vertical(|ui| message(ui, t, state, client, m, &mut join));
+                    chat_message_continuation(ui, |ui| {
+                        message(ui, t, state, client, m, &mut join);
                     });
                 }
                 last = Some((m.from, m.time));
@@ -322,12 +381,13 @@ pub fn chat_body(ui: &mut Ui, t: &Theme, state: &State, client: &impl Sender, fr
                         .hint_text(w::text(t!("Message {name}", name = state.persona(friend).name), 14.0, t.text_faint))
                         .font(w::font(14.5))
                         .frame(egui::Frame::NONE)
-                        .desired_width(ui.available_width() - 48.0),
+                        .desired_width((ui.available_width() - 80.0).max(0.0)),
                 ).with_edit_menu();
                 if input.len() > before && before == 0 {
                     client.send(Command::Typing { to: friend });
                 }
                 let send = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                chat_attachment_menu(ui, t, client, ChatRecipient::Friend(friend), in_overlay);
                 let clicked = w::icon_button(ui, t, icons::SEND, t!("Send"), false, 0).clicked();
                 if (send || clicked) && !input.trim().is_empty() {
                     client.send(Command::SendMessage { to: friend, text: input.trim().to_string() });
@@ -342,6 +402,39 @@ pub fn chat_body(ui: &mut Ui, t: &Theme, state: &State, client: &impl Sender, fr
         ui.ctx().request_repaint();
     }
     join
+}
+
+const CHAT_AVATAR_SIZE: i8 = 34;
+const CHAT_AVATAR_GAP: i8 = 10;
+
+pub(super) fn chat_message_group(
+    ui: &mut Ui,
+    t: &Theme,
+    avatar_hash: Option<&str>,
+    (name, color, time): (String, egui::Color32, u64),
+    body: impl FnOnce(&mut Ui),
+) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = f32::from(CHAT_AVATAR_GAP);
+        w::avatar(ui, t, &art::avatar(avatar_hash), f32::from(CHAT_AVATAR_SIZE), None);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            egui::Frame::new().inner_margin(Margin { top: 2, ..Margin::ZERO }).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(w::text_semibold(name, 14.0, color));
+                    ui.label(w::text(format_time(time), 11.5, t.text_faint));
+                });
+            });
+            body(ui);
+        });
+    });
+}
+
+pub(super) fn chat_message_continuation(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
+    egui::Frame::new()
+        .inner_margin(Margin { left: CHAT_AVATAR_SIZE + CHAT_AVATAR_GAP, ..Margin::ZERO })
+        .show(ui, body);
 }
 
 /// One message: its text, media previews, plus any game invite or group chat invite card.
@@ -425,6 +518,7 @@ fn friend_list(ui: &mut Ui, t: &Theme, state: &State, filter: &str, selected: Op
             }
             let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(6.0, 6.0))).layout(Layout::left_to_right(Align::Center)));
             w::avatar(&mut c, t, &art::avatar(p.avatar_hash.as_deref()), 36.0, Some(crate::shell::status_color(t, p)));
+            c.add_space(8.0);
             c.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
                 ui.add_space(2.0);
@@ -939,6 +1033,29 @@ mod tests {
         fn send(&self, _: Command) {}
     }
 
+    #[test]
+    fn chat_follow_up_messages_share_the_first_messages_left_edge() {
+        let ctx = egui::Context::default();
+        let t = Theme::default();
+        for spacing in [0.0, 8.0] {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = spacing;
+                    let mut first = 0.0;
+                    chat_message_group(ui, &t, None, ("sender".into(), t.text, 1_700_000_000), |ui| {
+                        first = ui.label("first").rect.left();
+                    });
+                    for line in ["second", "third"] {
+                        chat_message_continuation(ui, |ui| {
+                            assert_eq!(first, ui.label(line).rect.left());
+                        });
+                    }
+                });
+            });
+            output.textures_delta.clear();
+        }
+    }
+
     /// The chat inside a resizable window (like the overlay's) must keep the
     /// window's size; it used to grow a little every frame.
     #[test]
@@ -966,7 +1083,7 @@ mod tests {
                         ui.horizontal(|ui| ui.label("status"));
                         ui.add_space(6.0);
                         let h = ui.available_height();
-                        let _ = chat_body(ui, &t, &state, &NoSend, friend, &mut input, h);
+                        let _ = chat_body(ui, &t, &state, &NoSend, friend, &mut input, h, false);
                     });
                 heights.push(r.map(|r| r.response.rect.height()).unwrap_or(0.0));
             });

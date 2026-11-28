@@ -55,7 +55,7 @@ pub async fn web(conn: &Connection, me: SteamId, refresh: &str, cache: &WebCache
 
 fn build_cookie_jar(me: SteamId, access_token: &str, session_id: &str) -> Arc<reqwest::cookie::Jar> {
     let jar = Arc::new(reqwest::cookie::Jar::default());
-    for host in STEAM_WEB_HOSTS {
+    for host in STEAM_WEB_HOSTS.into_iter().chain([crate::chat_attachments::HOST]) {
         let url: reqwest::Url = format!("https://{host}").parse().unwrap();
         // Omit Domain= so cookies stay host-only and cannot be sent to subdomains.
         jar.add_cookie_str(&format!("steamLoginSecure={me}%7C%7C{access_token}; Path=/; Secure; HttpOnly"), &url);
@@ -66,6 +66,9 @@ fn build_cookie_jar(me: SteamId, access_token: &str, session_id: &str) -> Arc<re
 
 fn build_web_http(jar: Arc<reqwest::cookie::Jar>) -> Result<reqwest::Client, String> {
     let redirect = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().iter().any(|url| url.host_str() == Some(crate::chat_attachments::HOST)) {
+            return attempt.error("Steam Chat redirected the request");
+        }
         if attempt.previous().len() >= 10 {
             return attempt.error("too many redirects");
         }
@@ -608,7 +611,7 @@ var g_strInventoryLoadURL = "x";</script>"#;
         use std::net::TcpListener;
 
         let jar = super::build_cookie_jar(76561198000000001, "tok", "deadbeef");
-        for host in ["steamcommunity.com", "store.steampowered.com", "help.steampowered.com"] {
+        for host in super::STEAM_WEB_HOSTS.into_iter().chain([crate::chat_attachments::HOST]) {
             let root: reqwest::Url = format!("https://{host}/market/").parse().unwrap();
             let sub: reqwest::Url = format!("https://evil.{host}/market/").parse().unwrap();
             assert!(jar.cookies(&root).is_some(), "expected cookie on {host}");

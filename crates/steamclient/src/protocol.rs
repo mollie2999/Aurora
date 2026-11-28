@@ -35,6 +35,7 @@ pub enum Request {
     UserStats { steam_id: u64 },
     /// Save changed stats (achievements are bits in "achievement block" stats).
     StoreStats { stats: Vec<(u32, u32)>, crc: u32, reset: bool },
+    AchievementsUnlocked { unlocks: Vec<AchievementToast> },
     /// The game's full rich presence (empty = cleared).
     RichPresence { pairs: Vec<(String, String)> },
     /// How many people play this game right now.
@@ -498,4 +499,10 @@ pub struct Achievement {
     pub icon_gray: String,
     pub unlocked: bool,
     pub unlock_time: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AchievementToast {
+    pub title: String,
+    pub icon: String,
 }

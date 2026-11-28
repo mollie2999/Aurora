@@ -23,12 +23,6 @@ unsafe extern "system" {
     fn RegGetValueW(key: isize, sub: *const u16, value: *const u16, flags: u32, kind: *mut u32, data: *mut c_void, len: *mut u32) -> i32;
 }
 
-#[cfg(windows)]
-#[link(name = "shell32")]
-unsafe extern "system" {
-    fn ShellExecuteW(hwnd: *mut c_void, op: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> *mut c_void;
-}
-
 const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
 const RRF_RT_REG_SZ: u32 = 0x2;
 
@@ -145,20 +139,6 @@ pub fn proc_address(module: usize, name: &str) -> usize {
 #[cfg(not(windows))]
 pub fn proc_address(_module: usize, _name: &str) -> usize {
     0
-}
-
-/// Open a web page in the default browser (stands in for the Steam overlay).
-pub fn open_url(url: &str) {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return;
-    }
-    #[cfg(windows)]
-    {
-        let (op, file) = (wide("open"), wide(url));
-        unsafe {
-            ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
-        }
-    }
 }
 
 /// Under Wine (Proton): the Windows path of a Linux one, as Wine maps it.

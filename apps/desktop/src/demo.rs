@@ -761,6 +761,9 @@ pub fn spawn(rt: &tokio::runtime::Handle, local: &local::LocalState, sink: clien
                         media: parsed.media,
                     }));
                 }
+                Command::SendChatAttachment { .. } => {
+                    sink(Event::ChatAttachmentFailed("Attachments require a Steam connection.".into()));
+                }
                 Command::SendGroupMessage { group_id, chat_id, text } => {
                     ordinal += 1;
                     let parsed = model::chat::parse_message(&text);

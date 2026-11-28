@@ -1,8 +1,6 @@
-//! Shift+Tab overlay, laid out like Steam's: the game is dimmed, a bar at the
-//! top shows the game, session time, the window buttons and the clock, and
-//! Game Overview, Achievements, Friends, Chat and Notes open as windows you
-//! can move, resize and pin. A pinned window stays over the game after the
-//! overlay closes, at the opacity you pick, and lets clicks through to it.
+//! The Shift+Tab overlay hosts Aurora pages and game tools in tabs. Game
+//! panels can be moved, resized and pinned. Pinned panels stay over the game
+//! when the overlay closes and let clicks through.
 //!
 //! For games we start with our steamclient DLL (D3D11, D3D12, D3D9, OpenGL,
 //! and Vulkan) it is drawn inside the game, like Steam's (see `ingame.rs` and
@@ -26,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use ui::{Theme, icons, widgets as w};
 
+mod achievement_notifications;
+
 /// The overlay's windows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Win {
@@ -36,12 +36,11 @@ enum Win {
     Notes,
     /// Community pages: hub, guides, discussions, Workshop items.
     Community,
-    /// The game's store page.
-    Store,
     /// Local screenshots taken during the game.
     Screenshots,
     /// Per-game Steam Input / controller layout switcher.
     Controller,
+    Pages,
 }
 
 impl Win {
@@ -52,9 +51,9 @@ impl Win {
         Win::Chat,
         Win::Notes,
         Win::Community,
-        Win::Store,
         Win::Screenshots,
         Win::Controller,
+        Win::Pages,
     ];
 }
 
@@ -66,8 +65,15 @@ struct WinState {
     opacity: f32,
 }
 
+struct PageTab {
+    id: u64,
+    page: String,
+    arg: Option<String>,
+}
+
 struct ForegroundProbe {
     in_game: bool,
+    game_window: Option<isize>,
     hypr_window: Option<(String, i64, String)>,
 }
 
@@ -88,6 +94,8 @@ impl HyprOverlayState {
 
 pub struct Overlay {
     pub open: bool,
+    /// Keep the panels open while the standalone window is hidden on Alt+Tab.
+    suspended: bool,
     manager: Option<GlobalHotKeyManager>,
     hotkey: HotKey,
     registered: bool,
@@ -107,8 +115,17 @@ pub struct Overlay {
     search: String,
     show_offline: bool,
     wins: [WinState; 9],
+    tab: Option<u64>,
+    pages: Vec<PageTab>,
+    next_tab: u64,
+    registry_page: Option<u64>,
+    raise_pages: bool,
+    steam_link: String,
+    pending_steam_links: Vec<String>,
     /// Focus was given to the overlay since it opened.
     focused: bool,
+    /// The overlay window actually received focus after requesting it.
+    had_focus: bool,
     /// The window that had focus when the overlay opened (the game), so it
     /// gets focus back when the overlay closes.
     game_window: isize,
@@ -132,9 +149,8 @@ pub struct Overlay {
     community: crate::builtin::hub::HubView,
     /// The Achievements window (compare with a friend inside it).
     achievements: crate::builtin::hub::HubView,
-    /// Game whose store page the Store window shows, and whether the store
-    /// page was pointed at it yet.
-    store_app: Option<(AppId, bool)>,
+    achievement_notifications: achievement_notifications::Notifications,
+    achievement_window_visible: bool,
     /// `--overlay-open=guides|discussions|hub|store|achievements`: a window to
     /// open for previews.
     preview: Option<String>,
@@ -163,12 +179,14 @@ pub struct Overlay {
 impl Overlay {
     pub fn new(ctx: &egui::Context) -> Self {
         let pressed = Arc::new(AtomicBool::new(false));
+        let hotkey = HotKey::new(Some(Modifiers::SHIFT), Code::Tab);
+        let hotkey_id = hotkey.id();
         let manager = GlobalHotKeyManager::new().map_err(|e| tracing::warn!("global hotkeys unavailable: {e}")).ok();
         let (flag, repaint) = (pressed.clone(), ctx.clone());
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
-            if e.state == HotKeyState::Pressed {
+            if e.id == hotkey_id && e.state == HotKeyState::Pressed {
                 flag.store(true, Ordering::Relaxed);
-                repaint.request_repaint();
+                repaint.request_repaint_of(egui::ViewportId::ROOT);
                 repaint.request_repaint_of(overlay_viewport());
             }
         }));
@@ -182,8 +200,9 @@ impl Overlay {
         wins[Win::Friends as usize].open = true;
         Self {
             open: false,
+            suspended: false,
             manager,
-            hotkey: HotKey::new(Some(Modifiers::SHIFT), Code::Tab),
+            hotkey,
             registered: false,
             enabled: false,
             checked: None,
@@ -198,7 +217,15 @@ impl Overlay {
             search: String::new(),
             show_offline: false,
             wins,
+            tab: None,
+            pages: Vec::new(),
+            next_tab: 0,
+            registry_page: None,
+            raise_pages: false,
+            steam_link: String::new(),
+            pending_steam_links: Vec::new(),
             focused: false,
+            had_focus: false,
             game_window: 0,
             passthrough: None,
             fallback_vp_active: false,
@@ -210,7 +237,8 @@ impl Overlay {
             asked: false,
             community: Default::default(),
             achievements: Default::default(),
-            store_app: None,
+            achievement_notifications: Default::default(),
+            achievement_window_visible: false,
             preview: std::env::args().find_map(|a| a.strip_prefix("--overlay-open=").map(String::from)),
             ingame: None,
             pending: Vec::new(),
@@ -245,6 +273,7 @@ impl Overlay {
         self.flush_notes();
         let same_app = self.game.is_some_and(|(id, _)| id == app_id);
         self.game = Some((app_id, Instant::now()));
+        self.achievement_notifications.start(app_id);
         self.asked = false;
         self.enabled = enabled;
         self.checked = None;
@@ -279,7 +308,7 @@ impl Overlay {
             if let Some(rx) = self.foreground_check.as_mut() {
                 match rx.try_recv() {
                     Ok(probe) => {
-                        self.game_front = probe.in_game;
+                        self.game_front = probe.in_game && probe.game_window.map_or(true, |window| window == foreground_window());
                         if let Some((addr, ws_id, ws_name)) = probe.hypr_window {
                             self.game_hypr_addr = Some(addr);
                             self.game_hypr_ws = Some((ws_id, ws_name));
@@ -314,7 +343,14 @@ impl Overlay {
         }
 
         // The in-process overlay receives its own hotkey.
-        let want = fallback && self.enabled && (self.open || self.game_front);
+        if self.suspended && self.game_front {
+            self.suspended = false;
+            self.focused = false;
+            self.had_focus = false;
+            self.game_window = foreground_window();
+            repaint_fallback(ctx);
+        }
+        let want = fallback && self.enabled && ((self.open && !self.suspended) || self.game_front);
         let Some(m) = &self.manager else { return };
         if want && !self.registered {
             self.registered = m.register(self.hotkey).map_err(|e| tracing::warn!("Shift+Tab: {e}")).is_ok();
@@ -324,9 +360,15 @@ impl Overlay {
         }
     }
 
-    pub fn game_stopped(&mut self) {
+    pub fn game_stopped(&mut self, ctx: &egui::Context) {
+        if self.ingame.is_none() && (self.open || self.passthrough.is_some()) {
+            repaint_fallback(ctx);
+        }
         self.flush_notes();
+        self.achievement_notifications = Default::default();
+        self.achievement_window_visible = false;
         self.game = None;
+        self.pressed.store(false, Ordering::Relaxed);
         self.foreground_check = None;
         self.game_hypr_addr = None;
         self.game_hypr_ws = None;
@@ -338,6 +380,7 @@ impl Overlay {
         }
         self.ingame = None;
         self.open = false;
+        self.suspended = false;
         self.fps = None;
         self.screenshots.clear();
         self.screenshots_dirty = true;
@@ -354,6 +397,14 @@ impl Overlay {
             }
             self.registered = false;
         }
+    }
+
+    pub fn achievement_unlocked(&mut self, app_id: AppId, since: u64, achievements: &[(u32, model::Achievement)]) {
+        self.achievement_notifications.enqueue(app_id, since, achievements);
+    }
+
+    pub fn game_achievements_unlocked(&mut self, app_id: AppId, achievements: &[model::Achievement]) {
+        self.achievement_notifications.enqueue_stored(app_id, achievements);
     }
 
     fn flush_notes(&mut self) {
@@ -373,7 +424,9 @@ impl Overlay {
             self.close();
         } else {
             self.open = true;
+            self.suspended = false;
             self.focused = false;
+            self.had_focus = false;
             self.hypr_placed = false;
             self.game_window = foreground_window();
             #[cfg(target_os = "linux")]
@@ -391,6 +444,7 @@ impl Overlay {
     fn close(&mut self) {
         self.open = false;
         self.hypr_placed = false;
+        let suspended = std::mem::take(&mut self.suspended);
         // Give the keyboard back to the game and keep any pinned windows above it.
         #[cfg(target_os = "linux")]
         {
@@ -399,7 +453,7 @@ impl Overlay {
             let overlay_addr = if any_pinned { st.overlay_addr.take() } else { None };
             st.cancel_placement();
             drop(st);
-            if crate::hyprland::is_available() {
+            if !suspended && crate::hyprland::is_available() {
                 if let Some(addr) = self.game_hypr_addr.as_deref() {
                     match crate::hyprland::focus_game_keeping_overlay_top(addr, overlay_addr.as_deref()) {
                         Ok(()) => return,
@@ -408,7 +462,41 @@ impl Overlay {
                 }
             }
         }
-        give_focus(self.game_window);
+        if !suspended {
+            give_focus(self.game_window);
+        }
+    }
+
+    fn lost_window_focus(&mut self, ctx: &egui::Context) -> bool {
+        if !self.open || self.game.is_none() {
+            return false;
+        }
+        match ctx.input(|i| i.viewport().focused) {
+            Some(true) => {
+                self.had_focus = true;
+                false
+            }
+            Some(false) => {
+                let foreground = foreground_window();
+                if foreground != 0 && foreground == self.game_window {
+                    return false;
+                }
+                if !self.had_focus && (foreground == 0 || self.game_window == 0) {
+                    return false;
+                }
+                // Alt+Tab already selected another window. Hide until the game returns.
+                self.suspended = true;
+                self.game_front = false;
+                self.checked = None;
+                self.foreground_check = None;
+                self.passthrough = None;
+                #[cfg(windows)]
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                repaint_fallback(ctx);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn win(&self, w: Win) -> WinState {
@@ -417,6 +505,55 @@ impl Overlay {
 
     fn win_mut(&mut self, w: Win) -> &mut WinState {
         &mut self.wins[w as usize]
+    }
+
+    fn show_panel(&mut self, win: Win) {
+        self.win_mut(win).open = true;
+    }
+
+    fn close_panel(&mut self, win: Win) {
+        let state = self.win_mut(win);
+        state.open = false;
+        state.pinned = false;
+    }
+
+    pub(crate) fn show_page(&mut self, page: String, arg: Option<String>) {
+        let id = if let Some(existing) = self.pages.iter().find(|tab| tab.page == page && tab.arg == arg) {
+            existing.id
+        } else {
+            self.next_tab += 1;
+            self.pages.push(PageTab { id: self.next_tab, page, arg });
+            self.next_tab
+        };
+        self.tab = Some(id);
+        self.raise_pages = true;
+        self.show_panel(Win::Pages);
+    }
+
+    pub(crate) fn desktop_navigation_changed(&mut self) {
+        self.registry_page = None;
+    }
+
+    pub(crate) fn is_visible(&self) -> bool {
+        self.open && !self.suspended
+    }
+
+    pub(crate) fn open_for_game_request(&mut self, ctx: &egui::Context) {
+        if !self.open {
+            self.toggle();
+        }
+        repaint_fallback(ctx);
+    }
+
+    pub(crate) fn game_has_focus(&self, local: &local::LocalState) -> bool {
+        self.enabled && self.game.is_some_and(|(id, _)| {
+            local.games.iter().find(|game| game.app_id == id)
+                .is_some_and(|game| foreground_is_in(&game.install_dir))
+        })
+    }
+
+    pub(crate) fn accepts_game_request(&self, app_id: AppId) -> bool {
+        self.enabled && self.game.is_some_and(|(id, _)| id == app_id)
     }
 
     fn any_pinned(&self) -> bool {
@@ -493,24 +630,30 @@ fn foreground_probe(dir: &std::path::Path) -> ForegroundProbe {
             if aw.pid != our_pid && process_in(aw.pid, dir) {
                 return ForegroundProbe {
                     in_game: true,
+                    game_window: None,
                     hypr_window: Some((aw.address, aw.workspace_id, aw.workspace_name)),
                 };
             }
             return ForegroundProbe {
                 in_game: false,
+                game_window: None,
                 hypr_window: None,
             };
         }
     }
     ForegroundProbe {
         in_game: foreground_is_in(dir),
+        game_window: None,
         hypr_window: None,
     }
 }
 #[cfg(not(target_os = "linux"))]
 fn foreground_probe(dir: &std::path::Path) -> ForegroundProbe {
+    let window = foreground_window();
+    let game_window = (window != 0 && foreground_is_in(dir) && window == foreground_window()).then_some(window);
     ForegroundProbe {
-        in_game: foreground_is_in(dir),
+        in_game: game_window.is_some(),
+        game_window,
         hypr_window: None,
     }
 }
@@ -681,13 +824,19 @@ fn poll_ingame(app: &mut SteamApp, ctx: &egui::Context) {
         if app.overlay.game.is_some_and(|(id, _)| id != conn.app_id) {
             tracing::info!("in-game overlay from app {} while {:?} runs; using it anyway", conn.app_id, app.overlay.game);
         }
-        let session = crate::ingame::Session::new(conn, ctx, &app._rt, &app.prefs.theme);
+        let session = {
+            let themes = app.themes.lock().unwrap();
+            let fonts = themes.manager.resolved.as_ref().and_then(|theme| theme.custom_fonts.as_ref());
+            crate::ingame::Session::new(conn, ctx, &app._rt, &app.prefs.theme, fonts)
+        };
         // Shift+Tab to toggle overlay, F12 to take a screenshot.
         session.send_config(client::ingame::wire::MOD_SHIFT, 0x09, 0, 0x7B);
         app.overlay.ingame = Some(session);
         // Let go of Shift+Tab now: the game handles it.
         app.overlay.checked = None;
-        app.overlay.open = false;
+        // A game can request a Steam page before its renderer connects.
+        app.overlay.game_window = 0;
+        app.overlay.suspended = false;
     }
     let enabled = app.overlay.enabled && app.prefs.overlay_enabled;
     let Some(s) = app.overlay.ingame.as_mut() else { return };
@@ -769,9 +918,12 @@ fn ingame_frame(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Actio
     let active = app.overlay.open;
     let fps_visible = app.prefs.fps_counter != crate::builtin::settings::FpsCorner::Off && app.overlay.fps.is_some();
     let has_toasts = !app.toasts.is_empty();
-    let draw = active || app.overlay.any_pinned() || fps_visible || has_toasts;
+    let draw = active || app.overlay.any_pinned() || fps_visible || has_toasts || app.overlay.achievement_notifications.visible();
     let mut close = false;
     s.run(ctx, draw, |ui| close |= content(app, ui, &t, actions, active));
+    if !app.overlay.pending_steam_links.is_empty() {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
     if close {
         app.overlay.open = false;
     }
@@ -844,11 +996,47 @@ fn keep_ticking(app: &mut SteamApp, ctx: &egui::Context) {
     });
 }
 
-/// The overlay drawn inside a game (from `App::logic`, which also runs when
-/// the app's window gets no frames): read the game's input, run the UI, send
-/// the frame. Window commands it asks for wait for the next real frame.
+/// Drive the overlay from `App::logic`, including when the main window is hidden.
 pub fn logic(app: &mut SteamApp, ctx: &egui::Context) {
+    let links = std::mem::take(&mut app.overlay.pending_steam_links);
+    if !links.is_empty() {
+        let mut routed = Vec::new();
+        let mut actions = Vec::new();
+        for link in links {
+            app.route_link(ctx, &link, &mut routed);
+        }
+        app.route_overlay_actions(routed, &mut actions);
+        app.apply_actions(ctx, actions);
+        repaint_fallback(ctx);
+    }
+    if (!app.overlay.open || app.overlay.suspended || !app.overlay.win(Win::Pages).open || app.overlay.tab.is_none())
+        && app.overlay.registry_page.take().is_some()
+    {
+        let page = &app.prefs.page;
+        let arg = crate::links::retained_page_arg(page, app.current_arg.as_deref());
+        app.registry.navigate(page, arg);
+    }
     poll_ingame(app, ctx);
+    if let Some((id, _)) = app.overlay.game {
+        let dir = app.local.games.iter().find(|g| g.app_id == id).map(|g| g.install_dir.as_path());
+        app.overlay.sync_hotkey(dir, ctx, &app._rt);
+    }
+    if app.overlay.pressed.swap(false, Ordering::Relaxed) && app.overlay.registered {
+        app.overlay.toggle();
+        repaint_fallback(ctx);
+    }
+    let notifications_enabled = app.overlay.enabled && app.prefs.toast_notifications;
+    if notifications_enabled && app.overlay.game.is_some_and(|(id, _)| matches!(app.state.launch_modes.get(&id), Some(client::LaunchMode::HeadlessHost { .. }))) {
+        app.overlay.achievement_notifications.poll(&app.client, ctx);
+    }
+    let can_show = app.overlay.ingame.is_some() || app.overlay.is_visible() || app.overlay.game_front;
+    app.overlay.achievement_notifications.update(notifications_enabled && can_show, ctx);
+    let fallback_visible = notifications_enabled && app.overlay.ingame.is_none() && app.overlay.game_front
+        && app.overlay.achievement_notifications.visible();
+    if fallback_visible != app.overlay.achievement_window_visible {
+        app.overlay.achievement_window_visible = fallback_visible;
+        repaint_fallback(ctx);
+    }
     if app.overlay.ingame.is_none() {
         if let Some((id, _)) = app.overlay.game {
             let dir = app.local.games.iter().find(|g| g.app_id == id).map(|g| g.install_dir.as_path());
@@ -890,20 +1078,20 @@ pub fn logic(app: &mut SteamApp, ctx: &egui::Context) {
     }
 }
 
+fn repaint_fallback(ctx: &egui::Context) {
+    // App::ui manages the fallback viewport even when the main window is hidden.
+    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::RequestPaintWhileHidden);
+}
+
 pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) {
     actions.append(&mut app.overlay.pending);
-    // Shift+Tab belongs to the game only while the game is in front.
-    if let Some((id, _)) = app.overlay.game {
-        let dir = app.local.games.iter().find(|g| g.app_id == id).map(|g| g.install_dir.as_path());
-        app.overlay.sync_hotkey(dir, ctx, &app._rt);
-    }
-    if app.overlay.pressed.swap(false, Ordering::Relaxed) {
-        app.overlay.toggle();
+    if app.overlay.suspended {
+        return;
     }
     let active = app.overlay.open;
     let ingame = app.overlay.ingame.is_some();
     // Pinned windows only float over the game, not over other apps.
-    if !ingame && !active && !(app.overlay.any_pinned() && app.overlay.game_front) {
+    if !ingame && !active && !app.overlay.achievement_window_visible && !(app.overlay.any_pinned() && app.overlay.game_front) {
         app.overlay.passthrough = None;
         app.overlay.fallback_vp_active = false;
         return;
@@ -913,7 +1101,7 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
         use crate::builtin::hub::{HubTab, View};
         match what.as_str() {
             "store" => open_store(app, id),
-            "achievements" => app.overlay.win_mut(Win::Achievements).open = true,
+            "achievements" => app.overlay.show_panel(Win::Achievements),
             "guides" => open_community(app, View::Guides(id), true),
             "discussions" => open_community(app, View::Forum { app: id, forum: String::new() }, true),
             _ => open_community(app, View::Hub { app: id, tab: HubTab::All }, true),
@@ -951,33 +1139,33 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
     } else {
         builder = builder.with_fullscreen(true);
     }
-    // Linux: the overlay window draws in its own frames. The main window is
-    // behind the game or minimized then, and the compositor (GNOME on
-    // Wayland) hardly gives it frames, so an overlay drawn from them
-    // opened late and crawled.
+    // Give the transparent overlay its own frames while the main window is
+    // minimized or behind the game.
     app.overlay.fallback_vp_active = true;
-    #[cfg(target_os = "linux")]
     if !ctx.embed_viewports() {
+        #[cfg(windows)]
+        let builder = builder.with_visible(false).with_active(false);
         let ptr = AppPtr(app);
         ctx.show_viewport_deferred(viewport, builder, move |ui, _class| {
             let app = unsafe { &mut *ptr.get() };
+            if app.overlay.suspended || app.overlay.lost_window_focus(ui.ctx()) {
+                app.overlay.pressed.store(false, Ordering::Relaxed);
+                return;
+            }
+            let was_open = app.overlay.open;
             // Shift+Tab while the overlay is in front closes it right here.
-            if app.overlay.pressed.swap(false, Ordering::Relaxed) {
+            if was_open && app.overlay.pressed.swap(false, Ordering::Relaxed) && app.overlay.registered {
                 app.overlay.toggle();
             }
             let active = app.overlay.open;
             let opened_now = active && !app.overlay.focused;
+            #[cfg(windows)]
+            let first_frame = app.overlay.passthrough.is_none();
             if app.overlay.passthrough != Some(!active) {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!active));
                 app.overlay.passthrough = Some(!active);
             }
-            if opened_now {
-                if !crate::hyprland::is_available() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                app.overlay.focused = true;
-            }
+            #[cfg(target_os = "linux")]
             if active && !app.overlay.hypr_placed && crate::hyprland::is_available() {
                 app.overlay.hypr_placed = true;
                 if let Some((ws_id, ws_name)) = app.overlay.game_hypr_ws.clone() {
@@ -1053,18 +1241,34 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
                 app.overlay.close();
             }
             app.overlay.pending = actions;
+            #[cfg(windows)]
+            if first_frame && (!was_open || app.overlay.open) {
+                // eframe applies visibility after presenting this first frame.
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
+            if opened_now && app.overlay.open {
+                #[cfg(target_os = "linux")]
+                if !crate::hyprland::is_available() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                #[cfg(not(target_os = "linux"))]
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                app.overlay.focused = true;
+            }
             // Window commands (and closing) are the main window's job.
-            if !app.overlay.pending.is_empty() || !app.overlay.open {
-                ui.ctx().send_viewport_cmd_to(
-                    egui::ViewportId::ROOT,
-                    egui::ViewportCommand::RequestPaintWhileHidden,
-                );
+            if (was_open && !app.overlay.open) || !app.overlay.pending.is_empty() || !app.overlay.open {
+                repaint_fallback(ui.ctx());
                 ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
             }
             if app.overlay.open {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
             }
         });
+        #[cfg(windows)]
+        if app.overlay.passthrough.is_none() {
+            ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::RequestPaintWhileHidden);
+        }
         return;
     }
     let opened_now = active && !app.overlay.focused;
@@ -1088,7 +1292,7 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
 /// The overlay itself: the dimmed game, the top bar and the windows. Shared
 /// by the window overlay and the in-game one. Returns true to close.
 fn content(app: &mut SteamApp, ui: &mut Ui, t: &Theme, actions: &mut Vec<Action>, active: bool) -> bool {
-    let close = active && ui.input(|i| i.key_pressed(Key::Escape) || (i.modifiers.shift && i.key_pressed(Key::Tab)) || i.viewport().close_requested());
+    let first_action = actions.len();
     // Dim the game, like Steam does (nothing but pinned windows when closed).
     let fill = if active { Color32::from_black_alpha(150) } else { Color32::TRANSPARENT };
     egui::CentralPanel::default().frame(egui::Frame::new().fill(fill)).show(ui, |ui| {
@@ -1099,6 +1303,9 @@ fn content(app: &mut SteamApp, ui: &mut Ui, t: &Theme, actions: &mut Vec<Action>
     let ctx = ui.ctx().clone();
     fps_hud(app, &ctx, t);
     toasts_hud(app, &ctx, t);
+    if app.prefs.toast_notifications && app.overlay.enabled {
+        app.overlay.achievement_notifications.show(&ctx, t);
+    }
     overview_window(app, &ctx, t);
     achievements_window(app, &ctx, t);
     friends_window(app, &ctx, t, actions);
@@ -1107,18 +1314,35 @@ fn content(app: &mut SteamApp, ui: &mut Ui, t: &Theme, actions: &mut Vec<Action>
     screenshots_window(app, &ctx, t);
     controller_window(app, &ctx, t, actions);
     community_window(app, &ctx, t, actions);
-    store_window(app, &ctx, t, actions);
+    steam_pages_window(app, &ctx, t, actions);
     crate::builtin::group_chat::modals(&ctx, t, &app.state, &app.client, &mut app.overlay.group_ui);
     crate::builtin::chat_render::show_lightbox(&ctx, t);
-    if active && app.overlay.ingame.is_some() {
+    if active && ctx.embed_viewports() {
         software_cursor(&ctx);
     }
     if app.overlay.notes_dirty.is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(1)) {
         app.overlay.flush_notes();
     }
+    let mut links = Vec::new();
+    ctx.output_mut(|out| out.commands.retain(|command| {
+        if let egui::OutputCommand::OpenUrl(url) = command
+            && crate::links::is_aurora_link(&url.url)
+        {
+            links.push(url.url.clone());
+            return false;
+        }
+        true
+    }));
+    if !links.is_empty() {
+        app.overlay.pending_steam_links.extend(links);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+    let routed = actions.split_off(first_action);
+    app.route_overlay_actions(routed, actions);
     // The clock and session time.
     ctx.request_repaint_after(std::time::Duration::from_secs(1));
-    close
+    // Give dialogs the first opportunity to consume Escape.
+    active && ui.input(|i| i.key_pressed(Key::Escape) || (i.modifiers.shift && i.key_pressed(Key::Tab)) || i.viewport().close_requested())
 }
 
 /// Local time as HH:MM.
@@ -1146,6 +1370,7 @@ fn clock() -> String {
 
 const STRIP: f32 = 76.0;
 
+
 fn top_strip(app: &mut SteamApp, ui: &mut Ui, t: &Theme) {
     let full = ui.max_rect();
     let strip = Rect::from_min_size(full.min, vec2(full.width(), STRIP));
@@ -1162,8 +1387,9 @@ fn top_strip(app: &mut SteamApp, ui: &mut Ui, t: &Theme) {
                 let s = app.overlay.win_mut(Win::Overview);
                 s.open = !s.open;
             }
-            c.add_space(10.0);
+            c.add_space(14.0);
             c.vertical(|ui| {
+                ui.add_space(16.0);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(w::text_bold(&name, 18.0, t.text));
                 ui.label(w::text(format!("{}  {}", icons::CLOCK, session_text(since)), 12.5, t.text_dim));
@@ -1176,7 +1402,7 @@ fn top_strip(app: &mut SteamApp, ui: &mut Ui, t: &Theme) {
     }
     // Window buttons in the middle, like Steam's toolbar.
     let game = app.overlay.game.map(|g| g.0);
-    let mid = Rect::from_center_size(strip.center(), vec2(740.0, STRIP));
+    let mid = Rect::from_center_size(strip.center(), vec2(800.0, STRIP));
     let mut m = ui.new_child(egui::UiBuilder::new().max_rect(mid).layout(Layout::left_to_right(Align::Center)));
     m.spacing_mut().item_spacing.x = 6.0;
     let unread = app.state.total_unread();
@@ -1214,6 +1440,11 @@ fn top_strip(app: &mut SteamApp, ui: &mut Ui, t: &Theme) {
             }
         }
     }
+    let pages_open = app.overlay.win(Win::Pages).open;
+    if strip_button(&mut m, t, icons::LINK, t!("Steam pages"), pages_open, 0).clicked() {
+        app.overlay.win_mut(Win::Pages).open = !pages_open;
+        app.overlay.raise_pages = !pages_open;
+    }
     // Clock and close on the right.
     let right = Rect::from_min_max(pos2(strip.right() - 420.0, strip.top()), pos2(strip.right() - 24.0, strip.bottom()));
     let mut r = ui.new_child(egui::UiBuilder::new().max_rect(right).layout(Layout::right_to_left(Align::Center)));
@@ -1232,15 +1463,6 @@ fn top_strip(app: &mut SteamApp, ui: &mut Ui, t: &Theme) {
     });
 }
 
-fn session_text(since: Instant) -> String {
-    let mins = since.elapsed().as_secs() / 60;
-    if mins < 60 { t!("{n} min this session", n = mins) } else { t!("{h} h {m} min this session", h = mins / 60, m = mins % 60) }
-}
-
-fn hours(minutes: u64) -> String {
-    if minutes < 60 { t!("{n} min", n = minutes) } else { t!("{h} h", h = format!("{:.1}", minutes as f32 / 60.0)) }
-}
-
 fn strip_button(ui: &mut Ui, t: &Theme, icon: &str, label: &str, on: bool, badge: usize) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(label.to_string(), w::font_medium(11.5), t.text);
     let width = galley.size().x.max(44.0) + 20.0;
@@ -1248,7 +1470,7 @@ fn strip_button(ui: &mut Ui, t: &Theme, icon: &str, label: &str, on: bool, badge
     let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
     let p = ui.painter();
     if on || hover > 0.0 {
-        p.rect_filled(rect, CornerRadius::same(6), if on { t.accent.gamma_multiply(0.18) } else { t.surface_hover.gamma_multiply(hover) });
+        p.rect_filled(rect, t.corner_small(), if on { w::active_fill(t) } else { t.surface_hover.gamma_multiply(hover) });
     }
     let color = if on { t.accent } else { w::mix(t.text_dim, t.text, hover) };
     p.text(pos2(rect.center().x, rect.top() + 21.0), Align2::CENTER_CENTER, icon, w::font(20.0), color);
@@ -1259,6 +1481,120 @@ fn strip_button(ui: &mut Ui, t: &Theme, icon: &str, label: &str, on: bool, badge
         p.text(c, Align2::CENTER_CENTER, badge.min(99).to_string(), w::font_bold(10.0), Color32::WHITE);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+
+fn steam_pages_window(app: &mut SteamApp, ctx: &egui::Context, t: &Theme, actions: &mut Vec<Action>) {
+    let screen = ctx.content_rect();
+    let pos = pos2(screen.left() + 120.0, STRIP + 24.0);
+    let size = vec2((screen.width() - 240.0).clamp(360.0, 1060.0), (screen.height() - STRIP - 60.0).clamp(300.0, 780.0));
+    ov_window(app, ctx, t, Win::Pages, t!("Steam pages"), pos, size, |app, ui| {
+        if std::mem::take(&mut app.overlay.raise_pages) {
+            ctx.move_to_top(ui.layer_id());
+        }
+        steam_pages_tabs(app, ui, t, actions);
+        aurora_page(app, ui, t, actions);
+    });
+}
+
+fn steam_pages_tabs(app: &mut SteamApp, ui: &mut Ui, t: &Theme, actions: &mut Vec<Action>) {
+    let specs = app.registry.pages();
+    egui::Frame::new()
+        .fill(t.chrome)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(t.corner_small())
+        .inner_margin(Margin::same(6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.menu_button(format!("{} {}", icons::PLUS, icons::CARET_DOWN), |ui| {
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for page in &specs {
+                            if ui.button(i18n::tr_dyn(&page.title)).clicked() {
+                                app.overlay.show_page(page.id.clone(), None);
+                                ui.close();
+                            }
+                        }
+                    });
+                }).response.on_hover_text(t!("Open a tab"));
+                egui::ScrollArea::horizontal().id_salt("steam-pages-tabs").show(ui, |ui| {
+                    let tabs: Vec<_> = app.overlay.pages.iter().map(|tab| {
+                        let title = match (tab.page.as_str(), tab.arg.as_deref()) {
+                            ("store", Some(arg)) => arg.strip_prefix("app:").and_then(|id| id.parse().ok())
+                                .and_then(|id| app.state.app_name(id)).map(str::to_owned),
+                            (page, arg) => crate::builtin::hub::View::from_page(page, arg).map(|view| view.title(&app.state)),
+                        };
+                        let title = title.unwrap_or_else(|| specs.iter().find(|page| page.id == tab.page)
+                            .map(|page| i18n::tr_dyn(&page.title)).unwrap_or_else(|| tab.page.clone()));
+                        (tab.id, title)
+                    }).collect();
+                    for (id, title) in tabs {
+                        let selected = app.overlay.tab == Some(id);
+                        ui.push_id(id, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                if w::nav_tab(ui, t, &title, selected, 32.0).clicked() {
+                                    app.overlay.tab = Some(id);
+                                }
+                                if w::icon_button_sized(ui, t, icons::X, t!("Close tab"), false, 0, 24.0).clicked() {
+                                    app.overlay.pages.retain(|tab| tab.id != id);
+                                    if selected {
+                                        app.overlay.tab = app.overlay.pages.last().map(|tab| tab.id);
+                                    }
+                                }
+                            });
+                        });
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label(w::text(icons::LINK, 15.0, t.link_color()));
+                let submit = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let open = w::button(ui, t, None, t!("Open"), w::Kind::Secondary, w::Size::Sm).clicked();
+                    let input = ui.add(egui::TextEdit::singleline(&mut app.overlay.steam_link)
+                        .hint_text(t!("Paste a Steam link"))
+                        .char_limit(2048)
+                        .desired_width(ui.available_width()));
+                    open || (input.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
+                }).inner;
+                if submit {
+                    let raw = app.overlay.steam_link.trim();
+                    if crate::links::is_aurora_link(raw) {
+                        app.overlay.pending_steam_links.push(raw.to_owned());
+                        app.overlay.steam_link.clear();
+                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                    } else if !raw.is_empty() {
+                        actions.push(Action::Toast(t!("This Steam link isn't supported.").into()));
+                    }
+                }
+            });
+        });
+}
+
+fn aurora_page(app: &mut SteamApp, ui: &mut Ui, t: &Theme, actions: &mut Vec<Action>) {
+    let Some(id) = app.overlay.tab else { return };
+    let Some(target) = app.overlay.pages.iter_mut().find(|tab| tab.id == id) else { return };
+    if app.overlay.registry_page != Some(id) {
+        app.registry.navigate(&target.page, target.arg.as_deref());
+        target.arg = crate::links::retained_page_arg(&target.page, target.arg.as_deref()).map(str::to_owned);
+        app.overlay.registry_page = Some(id);
+    }
+    let page = target.page.clone();
+    egui::Frame::new().fill(t.bg).inner_margin(Margin::same(12)).show(ui, |ui| {
+        ui.set_min_size(ui.available_size());
+        let env = extensions::Env { state: &app.state, local: &app.local, theme: t, zoom: app.prefs.zoom, client: &app.client, actions };
+        if !app.registry.show_page(&page, ui, env) {
+            ui.label(t!("This page isn't available."));
+        }
+    });
+}
+
+fn session_text(since: Instant) -> String {
+    let mins = since.elapsed().as_secs() / 60;
+    if mins < 60 { t!("{n} min this session", n = mins) } else { t!("{h} h {m} min this session", h = mins / 60, m = mins % 60) }
+}
+
+fn hours(minutes: u64) -> String {
+    if minutes < 60 { t!("{n} min", n = minutes) } else { t!("{h} h", h = format!("{:.1}", minutes as f32 / 60.0)) }
 }
 
 /// Solid window look shared by the overlay's windows.
@@ -1300,8 +1636,10 @@ fn ov_window(app: &mut SteamApp, ctx: &egui::Context, t: &Theme, win: Win, title
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         close = w::icon_button(ui, t, icons::X, t!("Close"), false, 0).clicked();
-                        let tip = if s.pinned { t!("Unpin: hide this window when the overlay closes") } else { t!("Pin: keep this window over the game") };
-                        pin = w::icon_button(ui, t, if s.pinned { icons::PUSH_PIN_SLASH } else { icons::PUSH_PIN }, tip, s.pinned, 0).clicked();
+                        if win != Win::Pages {
+                            let tip = if s.pinned { t!("Unpin: hide this window when the overlay closes") } else { t!("Pin: keep this window over the game") };
+                            pin = w::icon_button(ui, t, if s.pinned { icons::PUSH_PIN_SLASH } else { icons::PUSH_PIN }, tip, s.pinned, 0).clicked();
+                        }
                         if s.pinned {
                             ui.add(egui::Slider::new(&mut level, 0.2..=1.0).show_value(false)).on_hover_text(t!("Opacity over the game"));
                         }
@@ -1319,8 +1657,7 @@ fn ov_window(app: &mut SteamApp, ctx: &egui::Context, t: &Theme, win: Win, title
         s.pinned = !s.pinned;
     }
     if close {
-        s.open = false;
-        s.pinned = false;
+        app.overlay.close_panel(win);
         if win == Win::Chat {
             app.overlay.chat_with = None;
         }
@@ -1371,7 +1708,7 @@ fn overview_window(app: &mut SteamApp, ctx: &egui::Context, t: &Theme) {
                     w::progress(ui, t, done as f32 / all as f32, ui.available_width());
                     ui.add_space(6.0);
                     if w::button(ui, t, Some(icons::TROPHY), t!("View achievements"), w::Kind::Secondary, w::Size::Sm).clicked() {
-                        app.overlay.win_mut(Win::Achievements).open = true;
+                        app.overlay.show_panel(Win::Achievements);
                     }
                 }
                 Some(_) => {
@@ -1449,14 +1786,13 @@ fn open_community(app: &mut SteamApp, view: crate::builtin::hub::View, fresh: bo
         View::Page(..) => {}
         v => {
             app.overlay.community.open(v, fresh);
-            app.overlay.win_mut(Win::Community).open = true;
+            app.overlay.show_panel(Win::Community);
         }
     }
 }
 
 fn open_store(app: &mut SteamApp, id: AppId) {
-    app.overlay.store_app = Some((id, false));
-    app.overlay.win_mut(Win::Store).open = true;
+    app.overlay.show_page("store".into(), Some(format!("app:{id}")));
 }
 
 /// Guides, discussions, the community hub and Workshop items, in a window.
@@ -1477,31 +1813,9 @@ fn community_window(app: &mut SteamApp, ctx: &egui::Context, t: &Theme, actions:
         actions.extend(acts);
         for v in open {
             match v {
-                // Pages the overlay doesn't have (profiles, the Workshop browser) open in the main window.
                 View::Page(page, arg) if page != "store" => actions.push(Action::Navigate { page, arg }),
                 v => open_community(app, v, false),
             }
-        }
-    });
-}
-
-/// The game's store page (the app's native store) in a window.
-fn store_window(app: &mut SteamApp, ctx: &egui::Context, t: &Theme, actions: &mut Vec<Action>) {
-    let Some((id, sent)) = app.overlay.store_app else { return };
-    if !app.overlay.win(Win::Store).open {
-        return;
-    }
-    if !sent {
-        app.registry.navigate("store", Some(&format!("app:{id}")));
-        app.overlay.store_app = Some((id, true));
-    }
-    let title = app.state.app_name(id).map(|n| format!("{n} · {}", t!("Store page"))).unwrap_or_else(|| t!("Store page").to_string());
-    let pos = pos2(260.0, STRIP + 50.0);
-    let size = vec2(1000.0, (ctx.content_rect().height() - STRIP - 100.0).clamp(400.0, 800.0));
-    ov_window(app, ctx, t, Win::Store, &title, pos, size, |app, ui| {
-        let env = extensions::Env { state: &app.state, local: &app.local, theme: &app.prefs.theme, zoom: app.prefs.zoom, client: &app.client, actions: &mut *actions };
-        if !app.registry.show_page("store", ui, env) {
-            ui.label(w::text(t!("The store isn't available."), 13.0, t.text_faint));
         }
     });
 }
@@ -1648,9 +1962,9 @@ fn friend_row(app: &mut SteamApp, ui: &mut Ui, t: &Theme, id: model::SteamId, ac
     }
 }
 
-fn open_chat(app: &mut SteamApp, id: SteamId, actions: &mut Vec<Action>) {
+pub(crate) fn open_chat(app: &mut SteamApp, id: SteamId, actions: &mut Vec<Action>) {
     app.overlay.chat_with = Some(crate::builtin::group_chat::ChatTarget::Friend(id));
-    app.overlay.win_mut(Win::Chat).open = true;
+    app.overlay.show_panel(Win::Chat);
     app.client.send(Command::LoadHistory { friend: id });
     actions.push(Action::MarkRead(id));
 }
@@ -1658,7 +1972,12 @@ fn open_chat(app: &mut SteamApp, id: SteamId, actions: &mut Vec<Action>) {
 fn open_group_chat(app: &mut SteamApp, group_id: model::GroupChatId) {
     app.overlay.chat_with = Some(crate::builtin::group_chat::ChatTarget::Group(group_id));
     app.overlay.group_ui.chat_id = None;
-    app.overlay.win_mut(Win::Chat).open = true;
+    app.overlay.show_panel(Win::Chat);
+}
+
+pub(crate) fn open_group_channel(app: &mut SteamApp, group_id: model::GroupChatId, chat_id: Option<model::ChatRoomId>) {
+    open_group_chat(app, group_id);
+    app.overlay.group_ui.chat_id = chat_id;
 }
 
 fn chat_window(app: &mut SteamApp, ctx: &egui::Context, t: &Theme, actions: &mut Vec<Action>) {
@@ -1676,13 +1995,13 @@ fn chat_window(app: &mut SteamApp, ctx: &egui::Context, t: &Theme, actions: &mut
                 ui.add_space(6.0);
                 // Exactly the space the window has, so it never grows by itself.
                 let h = ui.available_height();
-                actions.extend(crate::builtin::community::chat_body(ui, t, &app.state, &app.client, id, &mut app.overlay.input, h));
+                actions.extend(crate::builtin::community::chat_body(ui, t, &app.state, &app.client, id, &mut app.overlay.input, h, true));
             });
         }
         crate::builtin::group_chat::ChatTarget::Group(gid) => {
             let Some(g) = app.state.chat_groups.get(&gid).cloned() else {
                 app.overlay.chat_with = None;
-                app.overlay.win_mut(Win::Chat).open = false;
+                app.overlay.close_panel(Win::Chat);
                 return;
             };
             let title = app.state.group_display_name(&g);

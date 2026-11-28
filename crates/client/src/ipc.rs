@@ -1459,6 +1459,19 @@ mod tests {
     }
 
     #[test]
+    fn achievement_notification_round_trip() {
+        let env = protocol::Envelope {
+            token: "t".into(),
+            pid: 1,
+            req: Request::AchievementsUnlocked {
+                unlocks: vec![protocol::AchievementToast { title: "First win".into(), icon: "first_win.jpg".into() }],
+            },
+        };
+        let back: protocol::Envelope = serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
+        assert!(matches!(back.req, Request::AchievementsUnlocked { unlocks } if unlocks[0].title == "First win"));
+    }
+
+    #[test]
     fn push_to_caps_queue_at_4096() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();

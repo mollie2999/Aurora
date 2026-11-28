@@ -27,6 +27,5 @@ eframe = { workspace = true, features = ["wayland", "x11"] }
 [target.'cfg(windows)'.dependencies]
 eframe = { workspace = true, features = ["wgpu_no_default_features"] }
 wgpu = { version = "30", default-features = false, features = ["dx12"] }
-
 [dev-dependencies]
 image = { workspace = true, features = ["gif"] }

@@ -389,10 +389,19 @@ pub fn paint_contain(ui: &Ui, rect: Rect, url: &str, align: Align2) -> bool {
     let (_, Some(texture)) = load(ui, url, rect.size(), false) else {
         return false;
     };
+    paint_contain_texture(ui, rect, texture, align);
+    true
+}
+
+fn paint_contain_texture(ui: &Ui, rect: Rect, texture: egui::load::SizedTexture, align: Align2) {
     let scale = (rect.width() / texture.size.x).min(rect.height() / texture.size.y);
     let target = align.align_size_within_rect(texture.size * scale, rect);
     egui::Image::from_texture(texture).paint_at(ui, target);
-    true
+}
+
+#[cfg(test)]
+fn decode_test_gif(bytes: &[u8]) -> Option<(Vec<egui::ColorImage>, Vec<u32>)> {
+    decode_animation(bytes, |_, _| {})
 }
 
 // ---------- animated pictures (avatars, avatar frames) ----------
@@ -662,6 +671,22 @@ pub fn paint_cover_animated(ui: &Ui, rect: Rect, url: &str, radius: CornerRadius
         }
         Ok(BytesPoll::Pending { .. }) => false,
         _ => paint_cover(ui, rect, url, radius),
+    }
+}
+
+/// Like [`paint_contain`], with animated GIF/WebP/APNG playback while visible.
+pub fn paint_contain_animated(ui: &Ui, rect: Rect, url: &str, align: Align2, max_fps: f32) -> bool {
+    let ctx = ui.ctx();
+    match ctx.try_load_bytes(url) {
+        Ok(BytesPoll::Ready { bytes, .. }) if is_animation(&bytes) => {
+            if let Ok(TexturePoll::Ready { texture }) = animation_texture(ctx, url, bytes, ui.is_rect_visible(rect), max_fps) {
+                paint_contain_texture(ui, rect, texture, align);
+                return true;
+            }
+            false
+        }
+        Ok(BytesPoll::Pending { .. }) => false,
+        _ => paint_contain(ui, rect, url, align),
     }
 }
 
@@ -1687,6 +1712,7 @@ mod markup_tests {
         assert!(frames[0].size[0].max(frames[0].size[1]) <= super::APNG_MAX_SIDE as usize);
         assert_eq!(delays, [100, 100]);
     }
+
     #[test]
     fn mix_preserves_translucent_endpoints_and_premultiplied_midpoint() {
         let a = egui::Color32::from_rgba_premultiplied(20, 40, 60, 80);

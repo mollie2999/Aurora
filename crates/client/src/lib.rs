@@ -38,6 +38,7 @@ pub mod game_servers;
 mod input_config;
 pub mod account;
 pub mod chat_groups;
+mod chat_attachments;
 mod notify;
 pub mod pads;
 pub(crate) mod vpad;
@@ -83,6 +84,19 @@ use model::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChatRecipient {
+    Friend(SteamId),
+    Group { group_id: GroupChatId, chat_id: ChatRoomId },
+}
+
+#[derive(Clone, Debug)]
+pub enum ChatAttachment {
+    Image(PathBuf),
+    LastScreenshot,
+    TradeOfferUrl,
+}
 
 #[derive(Clone)]
 pub enum Command {
@@ -132,6 +146,7 @@ pub enum Command {
     /// Start a game that isn't running with `connect` as its arguments instead.
     JoinRunningGame { app_id: AppId, friend: SteamId, connect: String },
     SendMessage { to: SteamId, text: String },
+    SendChatAttachment { recipient: ChatRecipient, attachment: ChatAttachment },
     /// Invite a friend into the running game's lobby: lets them in (private
     /// lobbies) and sends a game invite that joins it.
     InviteToLobby { app_id: AppId, lobby: u64, friend: SteamId },
@@ -308,6 +323,7 @@ pub enum Command {
     LoadAchievementProgress { app_ids: Vec<AppId> },
     /// A game's achievements with which ones you've unlocked.
     LoadAchievements { app_id: AppId, language: String },
+    CheckAchievementUnlocks { app_id: AppId, language: String, since: u64, seen: Vec<u32> },
     /// Redeem a product key (CD key).
     ActivateKey { key: String },
     /// Install or update a game (queued; one download runs at a time).
@@ -401,6 +417,7 @@ impl std::fmt::Debug for Command {
             Command::AttachGame { app_id, install_dir } => f.debug_struct("AttachGame").field("app_id", app_id).field("install_dir", install_dir).finish(),
             Command::JoinRunningGame { app_id, friend, connect } => f.debug_struct("JoinRunningGame").field("app_id", app_id).field("friend", friend).field("connect", connect).finish(),
             Command::SendMessage { to, text } => f.debug_struct("SendMessage").field("to", to).field("text", text).finish(),
+            Command::SendChatAttachment { recipient, .. } => f.debug_struct("SendChatAttachment").field("recipient", recipient).finish_non_exhaustive(),
             Command::InviteToLobby { app_id, lobby, friend } => f.debug_struct("InviteToLobby").field("app_id", app_id).field("lobby", lobby).field("friend", friend).finish(),
             Command::AddFriend { steam_id } => f.debug_struct("AddFriend").field("steam_id", steam_id).finish(),
             Command::RemoveFriend { steam_id } => f.debug_struct("RemoveFriend").field("steam_id", steam_id).finish(),
@@ -511,6 +528,7 @@ impl std::fmt::Debug for Command {
             Command::LoadPlayerGames { steam_id, language } => f.debug_struct("LoadPlayerGames").field("steam_id", steam_id).field("language", language).finish(),
             Command::LoadAchievementProgress { app_ids } => f.debug_struct("LoadAchievementProgress").field("app_ids", app_ids).finish(),
             Command::LoadAchievements { app_id, language } => f.debug_struct("LoadAchievements").field("app_id", app_id).field("language", language).finish(),
+            Command::CheckAchievementUnlocks { app_id, .. } => f.debug_struct("CheckAchievementUnlocks").field("app_id", app_id).finish(),
             Command::ActivateKey { .. } => f.debug_struct("ActivateKey").field("key", &"[REDACTED]").finish(),
             Command::Install(req) => f.debug_tuple("Install").field(req).finish(),
             Command::PauseDownload { app_id } => f.debug_struct("PauseDownload").field("app_id", app_id).finish(),
@@ -555,6 +573,7 @@ impl std::fmt::Debug for Command {
 
 #[derive(Debug, Clone)]
 pub enum Event {
+    ChatAttachmentFailed(String),
     Connecting,
     /// Show this URL as a QR code (it may be replaced by a newer one).
     QrChallenge { url: String },
@@ -727,6 +746,8 @@ pub enum Event {
     /// Your achievement progress: (game, unlocked, total).
     AchievementProgress(Vec<(AppId, u32, u32)>),
     Achievements { app_id: AppId, result: Result<Vec<model::Achievement>, String> },
+    AchievementUnlocks { app_id: AppId, since: u64, achievements: Vec<(u32, model::Achievement)> },
+    GameAchievementsUnlocked { app_id: AppId, achievements: Vec<model::Achievement> },
     /// Result of [`Command::ActivateKey`]: `Ok(items)` or `Err(reason)`.
     KeyActivated(Result<Vec<String>, String>),
     Download(model::DownloadStatus),

@@ -205,7 +205,7 @@ fn chat(app: &mut SteamApp, ui: &mut Ui, actions: &mut Vec<Action>, id: SteamId)
     });
     ui.separator();
     let h = ui.available_height();
-    actions.extend(crate::builtin::community::chat_body(ui, &t, &app.state, &app.client, id, &mut app.friends_window.input, h));
+    actions.extend(crate::builtin::community::chat_body(ui, &t, &app.state, &app.client, id, &mut app.friends_window.input, h, false));
 }
 
 fn group_panel(app: &mut SteamApp, ui: &mut Ui, actions: &mut Vec<Action>, group_id: GroupChatId) {

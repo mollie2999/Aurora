@@ -743,11 +743,12 @@ pub fn image_or_title(ui: &Ui, t: &Theme, rect: Rect, url: &str, title: &str, ra
 /// the large corner radius, instead of the tight popup-menu frame.
 pub fn modal(ctx: &egui::Context, id: egui::Id) -> egui::Modal {
     let style = ctx.global_style();
+    let r = style.visuals.window_corner_radius.nw;
     // The page color, not the control color, so buttons inside stand out.
     let frame = Frame::popup(&style)
         .fill(style.visuals.panel_fill)
         .inner_margin(Margin::same(28))
-        .corner_radius(CornerRadius::same(style.visuals.window_corner_radius.nw.max(10)));
+        .corner_radius(if r == 0 { CornerRadius::ZERO } else { CornerRadius::same(r.max(10)) });
     egui::Modal::new(id).frame(frame)
 }
 

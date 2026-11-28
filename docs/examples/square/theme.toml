@@ -1,0 +1,58 @@
+[meta]
+id = "square"
+name = "Aurora Square"
+version = "1.0.0"
+author = "Aurora"
+description = "Aurora's default interface with sharp square corners (0px radius), suited for compositors that apply native window rounding and shadows such as KDE Plasma / KWin."
+
+[theme]
+base = "NEVKO"
+radius = 0
+
+[options.palette]
+kind = "select"
+label = "Palette"
+description = "Choose one of Aurora's built-in color palettes while keeping square corners."
+default = "nevko"
+
+[[options.palette.choices]]
+value = "nevko"
+label = "NEVKO (Default)"
+[options.palette.choices.overrides.theme]
+base = "NEVKO"
+radius = 0
+
+[[options.palette.choices]]
+value = "midnight"
+label = "Midnight"
+[options.palette.choices.overrides.theme]
+base = "Midnight"
+radius = 0
+
+[[options.palette.choices]]
+value = "aurora"
+label = "Aurora"
+[options.palette.choices.overrides.theme]
+base = "Aurora"
+radius = 0
+
+[[options.palette.choices]]
+value = "classic"
+label = "Classic"
+[options.palette.choices.overrides.theme]
+base = "Classic"
+radius = 0
+
+[[options.palette.choices]]
+value = "oled"
+label = "OLED"
+[options.palette.choices.overrides.theme]
+base = "OLED"
+radius = 0
+
+[[options.palette.choices]]
+value = "daylight"
+label = "Daylight"
+[options.palette.choices.overrides.theme]
+base = "Daylight"
+radius = 0

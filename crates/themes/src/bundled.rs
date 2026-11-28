@@ -133,6 +133,19 @@ pub const BUNDLED_THEMES: &[BundledTheme] = &[
             },
         ],
     },
+    BundledTheme {
+        id: "square",
+        files: &[
+            BundledFile {
+                path: "README.md",
+                bytes: include_bytes!("../../../docs/examples/square/README.md"),
+            },
+            BundledFile {
+                path: "theme.toml",
+                bytes: include_bytes!("../../../docs/examples/square/theme.toml"),
+            },
+        ],
+    },
 ];
 
 /// Returns `true` if `id` is one of Aurora's bundled themes.
@@ -517,7 +530,7 @@ mod tests {
 
         let mut mgr = crate::ThemeManager::new(themes_dir.clone(), data_dir.clone());
         let report = mgr.sync_bundled_themes().unwrap();
-        assert_eq!(report.installed, vec!["adwaita", "steam-replica", "metro"]);
+        assert_eq!(report.installed, vec!["adwaita", "steam-replica", "metro", "square"]);
         assert!(report.updated.is_empty());
 
         mgr.scan();
@@ -542,6 +555,21 @@ mod tests {
         mgr.activate(Some("metro")).unwrap();
         assert_eq!(mgr.resolved.as_ref().unwrap().meta.id, "metro");
         assert!(mgr.resolved.as_ref().unwrap().custom_fonts.is_some());
+
+        mgr.activate(Some("square")).unwrap();
+        let square = mgr.resolved.as_ref().unwrap();
+        assert_eq!(square.meta.id, "square");
+        assert_eq!(square.theme.radius, 0);
+        assert!(square.layout.shell.is_empty());
+
+        let manifest = mgr.active_manifest().unwrap();
+        let palette_opt = manifest.options.get("palette").unwrap();
+        for choice in &palette_opt.choices {
+            let mut opts = BTreeMap::new();
+            opts.insert("palette".into(), crate::OptionValue::Text(choice.value.clone()));
+            let parts = manifest.resolve_tokens(&opts);
+            assert_eq!(parts.theme.radius, 0, "palette '{}' must keep radius = 0", choice.value);
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -579,7 +607,7 @@ mod tests {
         fs::write(data_dir.join("adwaita.json"), saved_opts).unwrap();
 
         let report = sync_bundled_themes(&themes_dir, &data_dir).unwrap();
-        assert_eq!(report.installed, vec!["steam-replica", "metro"]);
+        assert_eq!(report.installed, vec!["steam-replica", "metro", "square"]);
         assert_eq!(report.updated, vec!["adwaita"]);
 
         let updated_manifest = ThemeManifest::parse(
@@ -606,7 +634,7 @@ mod tests {
         fs::write(custom_dir.join("theme.toml"), custom_toml).unwrap();
 
         let report = sync_bundled_themes(&themes_dir, &data_dir).unwrap();
-        assert_eq!(report.installed, vec!["adwaita", "metro"]);
+        assert_eq!(report.installed, vec!["adwaita", "metro", "square"]);
         assert!(report.updated.is_empty());
         assert_eq!(
             fs::read_to_string(custom_dir.join("theme.toml")).unwrap(),

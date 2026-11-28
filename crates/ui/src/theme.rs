@@ -307,6 +307,8 @@ impl Theme {
     pub fn corner_small(&self) -> CornerRadius {
         if self.widget_style == WidgetStyle::Adwaita {
             CornerRadius::same(6)
+        } else if self.radius == 0 {
+            CornerRadius::ZERO
         } else {
             CornerRadius::same((self.radius * 2 / 3).max(2))
         }

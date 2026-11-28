@@ -29,6 +29,10 @@ pub struct Cdn {
 
 /// Servers that share the requests while being measured.
 const POOL: usize = 4;
+/// Maximum number of servers to probe when the initial pool's fastest server is slow.
+const MAX_POOL: usize = 12;
+/// Speed threshold (2 MB/s) below which we expand probing beyond [`POOL`].
+const SLOW_LEADER_BPS: f64 = 2.0 * 1_048_576.0;
 /// Downloads smaller than this say more about latency than speed.
 const MIN_SAMPLE: usize = 64 << 10;
 
@@ -43,6 +47,8 @@ impl Cdn {
     pub fn new(servers: Vec<Server>) -> Self {
         let http = reqwest::Client::builder()
             .user_agent("Valve/Steam HTTP Client 1.0")
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(60))
             .pool_max_idle_per_host(32)
             .https_only(true)
@@ -97,14 +103,28 @@ impl Cdn {
         if servers.is_empty() {
             return Err(Error::NoServers);
         }
-        let pool = servers.len().min(POOL);
         if attempt > 0 {
-            return Ok(servers[attempt % pool].0.clone());
+            return Ok(servers[attempt % servers.len()].0.clone());
         }
-        // Spread requests over the pool until each has a speed, then keep
-        // measuring the others with one request in eight.
-        let measuring = servers[..pool].iter().any(|s| s.1 == 0.0) || n % 8 == 0;
-        Ok(servers[if measuring { n % pool } else { 0 }].0.clone())
+        let base_pool = servers.len().min(POOL);
+        let pool = if servers[..base_pool].iter().all(|s| s.1 > 0.0) && servers[0].1 < SLOW_LEADER_BPS {
+            servers.len().min(MAX_POOL)
+        } else {
+            base_pool
+        };
+        // Spread requests over unmeasured servers in the active pool so already-measured
+        // slow servers aren't re-hit while unmeasured candidates remain.
+        let unmeasured: Vec<usize> =
+            servers[..pool].iter().enumerate().filter_map(|(i, s)| (s.1 == 0.0).then_some(i)).collect();
+        if !unmeasured.is_empty() {
+            return Ok(servers[unmeasured[n % unmeasured.len()]].0.clone());
+        }
+        // All servers in the active pool are measured: send 1 in 8 requests to a
+        // non-leader server so speed changes are noticed.
+        if pool > 1 && n % 8 == 0 {
+            return Ok(servers[1 + ((n / 8) % (pool - 1))].0.clone());
+        }
+        Ok(servers[0].0.clone())
     }
 
     /// A download of `bytes` from `host` took `took`: update its average
@@ -242,5 +262,66 @@ mod tests {
         let only_http = Cdn::new(vec![Server { host: "plain.example.com".into(), https: false, load: 0.0 }]);
         assert_eq!(only_http.server_count(), 0);
         assert!(matches!(only_http.pick(0), Err(Error::NoServers)));
+    }
+
+    #[test]
+    fn unmeasured_only_probing_skips_already_measured_server() {
+        let c = cdn(&["a", "b", "c", "d"]);
+        c.record("a", 1 << 20, Duration::from_secs(2)); // 0.5 MB/s
+        let picks: Vec<String> = (0..6).map(|_| c.pick(0).unwrap().host).collect();
+        assert!(!picks.iter().any(|h| h == "a"), "{picks:?}");
+        assert_eq!(picks, ["b", "c", "d", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn reprobe_hits_non_leader_servers() {
+        let c = cdn(&["a", "b", "c", "d"]);
+        c.record("a", 10 << 20, Duration::from_secs(1));
+        c.record("b", 5 << 20, Duration::from_secs(1));
+        c.record("c", 4 << 20, Duration::from_secs(1));
+        c.record("d", 3 << 20, Duration::from_secs(1));
+        let picks: Vec<String> = (0..24).map(|_| c.pick(0).unwrap().host).collect();
+        assert_eq!(picks[0], "b");
+        assert_eq!(picks[8], "c");
+        assert_eq!(picks[16], "d");
+        assert_eq!(picks.iter().filter(|h| *h == "a").count(), 21);
+    }
+
+    #[test]
+    fn slow_leader_expands_pool_beyond_initial_four() {
+        let c = cdn(&["a", "b", "c", "d", "e", "f"]);
+        c.record("a", 1 << 20, Duration::from_secs(1));
+        c.record("b", 800 << 10, Duration::from_secs(1));
+        c.record("c", 600 << 10, Duration::from_secs(1));
+        c.record("d", 400 << 10, Duration::from_secs(1));
+        let picks: Vec<String> = (0..4).map(|_| c.pick(0).unwrap().host).collect();
+        assert_eq!(picks, ["e", "f", "e", "f"]);
+
+        // Once a fast server is found, pool collapses back to the initial 4.
+        c.record("e", 10 << 20, Duration::from_secs(1));
+        let after: Vec<String> = (0..16).map(|_| c.pick(0).unwrap().host).collect();
+        assert!(!after.iter().any(|h| h == "f"), "{after:?}");
+        assert!(after.iter().filter(|h| *h == "e").count() >= 13, "{after:?}");
+    }
+
+    #[test]
+    fn fast_leader_stays_within_initial_pool() {
+        let c = cdn(&["a", "b", "c", "d", "e", "f"]);
+        c.record("a", 4 << 20, Duration::from_secs(1));
+        c.record("b", 1 << 20, Duration::from_secs(1));
+        c.record("c", 1 << 20, Duration::from_secs(1));
+        c.record("d", 1 << 20, Duration::from_secs(1));
+        let picks: Vec<String> = (0..32).map(|_| c.pick(0).unwrap().host).collect();
+        assert!(!picks.iter().any(|h| h == "e" || h == "f"), "{picks:?}");
+        assert_eq!(picks.iter().filter(|h| *h == "a").count(), 28);
+    }
+
+    #[test]
+    fn retry_attempts_reach_beyond_initial_pool() {
+        let c = cdn(&["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(c.pick(1).unwrap().host, "b");
+        assert_eq!(c.pick(4).unwrap().host, "e");
+        assert_eq!(c.pick(5).unwrap().host, "f");
+        assert_eq!(c.pick(6).unwrap().host, "a");
     }
 }

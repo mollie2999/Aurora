@@ -2760,6 +2760,9 @@ impl Library {
                 ui.label(w::text(t!("Network {net}/s · Disk {disk}/s", net = ui::bytes(d.speed), disk = ui::bytes(d.disk_speed)), 12.0, t.text_faint));
             }
         });
+        if t.name.eq_ignore_ascii_case("Metro") {
+            ui.add_space(8.0);
+        }
         if d.verifying() {
             if w::icon_button(ui, t, icons::X, t!("Cancel"), false, 0).clicked() {
                 ctx.send(Command::CancelVerify { app_id: id });

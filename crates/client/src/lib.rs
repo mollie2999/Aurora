@@ -22,6 +22,8 @@ mod installscript;
 pub mod market;
 pub mod profile_edit;
 pub mod social;
+pub mod showcases;
+pub mod profile_page;
 pub mod cloud;
 pub mod reviews;
 pub mod discovery;
@@ -238,6 +240,16 @@ pub enum Command {
     SaveSteamCollections { save: Vec<(String, collections::Entry)>, delete: Vec<String> },
     /// Comments on a profile (newest first), from `start`.
     LoadComments { steam_id: SteamId, start: u32 },
+    /// A profile's showcases (favorite game, group, artwork…). `language` is Steam's name.
+    LoadShowcases { steam_id: SteamId, language: String },
+    /// Steam's profile page: right column, top friends, recent activity.
+    LoadProfilePage { steam_id: SteamId, language: String },
+    /// A profile's previous names.
+    LoadAliases { steam_id: SteamId },
+    /// The SteamID behind a custom profile URL (steamcommunity.com/id/<vanity>).
+    ResolveProfileUrl { vanity: String },
+    /// Clear your own previous names.
+    ClearAliases,
     /// Leave a comment on a profile.
     PostComment { steam_id: SteamId, text: String },
     /// Delete a comment (on your profile, or one you wrote).
@@ -462,6 +474,11 @@ impl std::fmt::Debug for Command {
             Command::LoadSteamCollections => f.write_str("LoadSteamCollections"),
             Command::SaveSteamCollections { save, delete } => f.debug_struct("SaveSteamCollections").field("save", save).field("delete", delete).finish(),
             Command::LoadComments { steam_id, start } => f.debug_struct("LoadComments").field("steam_id", steam_id).field("start", start).finish(),
+            Command::LoadShowcases { steam_id, language } => f.debug_struct("LoadShowcases").field("steam_id", steam_id).field("language", language).finish(),
+            Command::LoadProfilePage { steam_id, language } => f.debug_struct("LoadProfilePage").field("steam_id", steam_id).field("language", language).finish(),
+            Command::LoadAliases { steam_id } => f.debug_struct("LoadAliases").field("steam_id", steam_id).finish(),
+            Command::ResolveProfileUrl { vanity } => f.debug_struct("ResolveProfileUrl").field("vanity", vanity).finish(),
+            Command::ClearAliases => f.write_str("ClearAliases"),
             Command::PostComment { steam_id, text } => f.debug_struct("PostComment").field("steam_id", steam_id).field("text", text).finish(),
             Command::DeleteComment { steam_id, comment_id } => f.debug_struct("DeleteComment").field("steam_id", steam_id).field("comment_id", comment_id).finish(),
             Command::LoadBadges { steam_id } => f.debug_struct("LoadBadges").field("steam_id", steam_id).finish(),
@@ -665,6 +682,13 @@ pub enum Event {
     SteamCollectionsSaved { save: Vec<(String, collections::Entry)>, delete: Vec<String>, result: Result<(), String> },
     /// Comments on a profile, or why they can't be shown (private, turned off).
     Comments { steam_id: SteamId, result: Result<model::Comments, String> },
+    Showcases { steam_id: SteamId, result: Result<Vec<model::Showcase>, String> },
+    ProfilePage { steam_id: SteamId, result: Result<model::ProfilePage, String> },
+    Aliases { steam_id: SteamId, result: Result<Vec<model::Alias>, String> },
+    /// A custom profile URL's SteamID (`vanity` as asked, lowercase).
+    ProfileUrlResolved { vanity: String, result: Result<SteamId, String> },
+    /// Outcome of "Clear Previous Aliases".
+    AliasesCleared(Result<(), String>),
     CommentPosted { steam_id: SteamId, result: Result<(), String> },
     ServerInfo { addr: String, result: Result<crate::a2s::ServerInfo, String> },
     GameServerList { request_id: u64, result: Result<Vec<model::GameServerEntry>, String> },

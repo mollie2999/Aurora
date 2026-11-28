@@ -50,6 +50,14 @@ pub struct State {
     /// Games whose install script is running before they start: the step.
     pub install_script: HashMap<AppId, String>,
     pub comments: crate::read_cache::ReadCache<SteamId, Result<model::Comments, String>, 64>,
+    /// Profile showcases, in the owner's order.
+    pub showcases: crate::read_cache::ReadCache<SteamId, Result<Vec<model::Showcase>, String>, 64>,
+    /// Steam's profile page data (right column, top friends, recent activity).
+    pub profile_pages: crate::read_cache::ReadCache<SteamId, Result<model::ProfilePage, String>, 64>,
+    /// Previous names per profile.
+    pub aliases: crate::read_cache::ReadCache<SteamId, Result<Vec<model::Alias>, String>, 64>,
+    /// Custom profile URLs (lowercase) resolved to SteamIDs.
+    pub vanity_ids: crate::read_cache::ReadCache<String, Result<SteamId, String>, 64>,
     pub badges: crate::read_cache::ReadCache<SteamId, Result<model::Badges, String>, 64>,
     /// Profile reviews by (profile, page).
     pub reviews: crate::read_cache::ReadCache<(SteamId, u32), Result<model::UserReviews, String>, 64>,
@@ -252,6 +260,23 @@ impl State {
             Event::Comments { steam_id, result } => {
                 self.comments.insert(*steam_id, result.clone());
             }
+            Event::Showcases { steam_id, result } => {
+                self.showcases.insert(*steam_id, result.clone());
+            }
+            Event::ProfilePage { steam_id, result } => {
+                self.profile_pages.insert(*steam_id, result.clone());
+            }
+            Event::Aliases { steam_id, result } => {
+                self.aliases.insert(*steam_id, result.clone());
+            }
+            Event::ProfileUrlResolved { vanity, result } => {
+                self.vanity_ids.insert(vanity.clone(), result.clone());
+            }
+            Event::AliasesCleared(Ok(())) => {
+                let me = self.steam_id;
+                self.aliases.insert(me, Ok(Vec::new()));
+            }
+            Event::AliasesCleared(Err(_)) => {}
             Event::Badges { steam_id, result } => {
                 self.badges.insert(*steam_id, result.clone());
             }

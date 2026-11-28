@@ -821,6 +821,331 @@ pub enum ProfileSave {
     Badge,
 }
 
+/// Profile comments shown per page.
+pub const COMMENTS_PER_PAGE: u32 = 6;
+
+/// What Steam's profile page shows besides the showcases: the right column
+/// (level, featured badge, status, badges, counts, groups, top friends) and
+/// recent activity. Texts are in the language the page was asked in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfilePage {
+    pub level: Option<u32>,
+    pub featured_badge: Option<PageBadge>,
+    /// "online", "in-game" or "offline".
+    pub status: String,
+    /// e.g. "Currently Offline".
+    pub status_header: String,
+    /// e.g. the game, or "Last Online 5 days ago".
+    pub status_detail: String,
+    /// The few badges Steam shows (newest first).
+    pub badges: Vec<PageBadge>,
+    /// The count links ("Badges 32", "Games 124"…), in Steam's order.
+    pub counts: Vec<PageCount>,
+    pub groups: Vec<PageGroup>,
+    /// Steam's top friends (by level).
+    pub friends: Vec<PageFriend>,
+    /// e.g. "47.8 hours past 2 weeks".
+    pub recent_playtime: String,
+    pub recent: Vec<RecentGame>,
+    /// The profile theme as the page's body class has it, without "Theme":
+    /// "Summer", "Cosmic", "GameProfile"… ("" = Steam's default).
+    #[serde(default)]
+    pub theme: String,
+    /// A game profile's own colors (`--gradient-right` → value), from the
+    /// page's `body.GameProfileTheme { … }` rule.
+    #[serde(default)]
+    pub theme_vars: Vec<(String, String)>,
+    /// The country flag next to the location (Steam's `countryflags/xx.gif`).
+    #[serde(default)]
+    pub country_flag: String,
+    /// Steam's "You have <a>1 group</a> in common" (HTML, in the page's
+    /// language) under Groups, and the same for friends; "" when none.
+    #[serde(default)]
+    pub groups_in_common: String,
+    #[serde(default)]
+    pub common_groups: Option<Result<Vec<UserGroup>, String>>,
+    #[serde(default)]
+    pub friends_in_common: String,
+    #[serde(default)]
+    pub mutual_friends: Option<Result<Vec<PageFriend>, String>>,
+    /// The "Join Game" link under an in-game status (e.g.
+    /// `steam://joinlobby/381210/<lobby>/<owner>`); "" when there's none.
+    #[serde(default)]
+    pub join_link: String,
+    /// Completionist showcases as the page draws them, in page order.
+    #[serde(default)]
+    pub completionist: Vec<PageCompletionist>,
+    /// Workshop showcases as the page draws them, in page order.
+    #[serde(default)]
+    pub workshop: Vec<PageWorkshop>,
+    #[serde(default)]
+    pub awards: Vec<PageAwards>,
+    #[serde(default)]
+    pub collectors: Vec<PageCollector>,
+    #[serde(default)]
+    pub guides: Vec<PageGuide>,
+    #[serde(default)]
+    pub showcase_items: Vec<(u64, String)>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PageGuide {
+    pub id: u64,
+    pub image: String,
+    pub title: String,
+    pub creator: String,
+    pub app: String,
+    pub app_icon: String,
+    pub rating_icon: String,
+    pub ratings: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PageCollector {
+    pub stats: Vec<PageStat>,
+    pub games: Vec<AppId>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PageAwards {
+    pub items: Vec<(String, String, String)>,
+    pub stats: Vec<PageStat>,
+}
+
+/// Steam's Completionist Showcase: game headers with their achievement
+/// counts, and the stats row under them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageCompletionist {
+    pub games: Vec<PageCompletedGame>,
+    /// ("10", "Completed Games"), ("38%", "Avg. Game Completion Rate")…
+    pub stats: Vec<PageStat>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageCompletedGame {
+    pub app_id: AppId,
+    /// The game's header picture (460×215).
+    pub image: String,
+    /// e.g. "49 Achievements".
+    pub achievements: String,
+    /// e.g. "10 RARE"; "" when none.
+    pub rare: String,
+    /// The profile's achievements page for this game.
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageStat {
+    pub value: String,
+    pub label: String,
+    /// Where the stat links to; "" when it doesn't.
+    pub url: String,
+    pub tooltip: String,
+}
+
+/// Steam's Workshop Showcase: the owner's workshop header, their newest
+/// items and the stats row.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageWorkshop {
+    /// e.g. "Another Duck's Workshop".
+    pub title: String,
+    pub url: String,
+    pub avatar: Option<String>,
+    pub items: Vec<PageWorkshopItem>,
+    pub stats: Vec<PageStat>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageWorkshopItem {
+    pub id: u64,
+    pub app_id: AppId,
+    /// The item's preview at its own shape.
+    pub image: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageBadge {
+    pub name: String,
+    /// e.g. "Level 3 Necesse Badge" or "100 XP".
+    pub detail: String,
+    pub icon: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageCount {
+    /// Which list: "badges", "games", "inventory", "screenshots", "videos",
+    /// "workshop", "reviews", "guides", "artwork", "groups", "friends"…
+    pub key: String,
+    pub label: String,
+    pub count: Option<u32>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageGroup {
+    pub name: String,
+    pub url: String,
+    pub avatar: Option<String>,
+    /// e.g. "2 Members".
+    pub members: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageFriend {
+    pub steam_id: SteamId,
+    pub name: String,
+    pub avatar: Option<String>,
+    /// "online", "in-game" or "offline".
+    pub status: String,
+    /// e.g. ["In-Game", "Counter-Strike 2"] or ["Last Online 6 days ago"].
+    pub lines: Vec<String>,
+    pub level: u32,
+}
+
+/// A game in a profile's Recent Activity.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecentGame {
+    pub app_id: AppId,
+    pub name: String,
+    pub capsule: Option<String>,
+    /// e.g. ["1,234 hrs on record", "last played on 25 Nov"].
+    pub details: Vec<String>,
+    /// e.g. "203 / 318 Achievements" ("" for games without them).
+    pub achievements: String,
+    /// e.g. "93 Rare".
+    pub rare: String,
+    /// Unlocked share, 0..1.
+    pub progress: f32,
+    /// (name, icon)
+    pub icons: Vec<(String, String)>,
+    /// e.g. "+198".
+    pub more: String,
+    /// e.g. "Screenshots 5".
+    pub screenshots: String,
+    /// The game's badge this profile earned, if any (e.g. "Clawing", "200 XP").
+    #[serde(default)]
+    pub badge: Option<PageBadge>,
+    /// e.g. "Review 1", if this profile reviewed the game.
+    #[serde(default)]
+    pub review: String,
+    #[serde(default)]
+    pub review_url: String,
+}
+
+/// A name a profile used before, and when it changed (Steam's wording).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Alias {
+    pub name: String,
+    pub changed: String,
+}
+
+/// A showcase on a Steam profile, in the order its owner arranged them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Showcase {
+    /// Steam's `EProfileCustomizationType`; see [`showcase`].
+    pub kind: i32,
+    /// Steam's `EProfileCustomizationStyle` (layout variant).
+    pub style: i32,
+    pub slots: Vec<ShowcaseSlot>,
+    /// The Favorite Group showcase's group.
+    pub group: Option<ShowcaseGroup>,
+    /// Achievement progress for the games this showcase shows.
+    pub games: Vec<ShowcaseGame>,
+}
+
+/// One filled slot of a showcase.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShowcaseSlot {
+    pub app_id: AppId,
+    /// A screenshot, artwork, workshop item or guide.
+    pub file: Option<ShowcaseFile>,
+    /// An inventory item: asset and context id (in `app_id`'s inventory).
+    pub asset_id: u64,
+    pub context_id: u64,
+    /// Custom text box title, or an achievement's API name.
+    pub title: String,
+    /// Custom text box body (BBCode).
+    pub notes: String,
+    pub account_id: u32,
+    pub badge_id: u32,
+    pub border_color: u32,
+    /// The achievement this slot features (achievement showcases).
+    pub achievement: Option<ShowcaseAchievement>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShowcaseFile {
+    pub id: u64,
+    pub title: String,
+    /// Picture to show (preview, or the screenshot itself).
+    pub image: Option<String>,
+    pub app_id: AppId,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShowcaseAchievement {
+    pub name: String,
+    pub description: String,
+    pub icon: String,
+    /// Share of players who have it, 0-100.
+    pub percent: f32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShowcaseGroup {
+    pub name: String,
+    #[serde(default)]
+    pub headline: String,
+    pub url: String,
+    pub avatar: Option<String>,
+    pub members: u32,
+    pub in_game: u32,
+    pub online: u32,
+    pub in_chat: u32,
+}
+
+/// A game's achievements as a profile shows them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShowcaseGame {
+    pub app_id: AppId,
+    pub unlocked: u32,
+    pub total: u32,
+    /// Unlocked achievements fewer than 10% of players have.
+    pub rare: u32,
+    /// Unlocked achievements, rarest first.
+    pub recent: Vec<ShowcaseAchievement>,
+}
+
+/// Steam's `EProfileCustomizationType` values.
+pub mod showcase {
+    pub const RARE_ACHIEVEMENTS: i32 = 1;
+    pub const GAME_COLLECTOR: i32 = 2;
+    pub const ITEMS: i32 = 3;
+    pub const TRADE: i32 = 4;
+    pub const BADGES: i32 = 5;
+    pub const FAVORITE_GAME: i32 = 6;
+    pub const SCREENSHOTS: i32 = 7;
+    pub const CUSTOM_TEXT: i32 = 8;
+    pub const FAVORITE_GROUP: i32 = 9;
+    pub const REVIEW: i32 = 10;
+    pub const WORKSHOP: i32 = 11;
+    pub const MY_WORKSHOP: i32 = 12;
+    pub const ARTWORK: i32 = 13;
+    pub const VIDEO: i32 = 14;
+    pub const GUIDES: i32 = 15;
+    pub const MY_GUIDES: i32 = 16;
+    pub const ACHIEVEMENTS: i32 = 17;
+    pub const GREENLIGHT: i32 = 18;
+    pub const MY_GREENLIGHT: i32 = 19;
+    pub const SALIEN: i32 = 20;
+    pub const REACTIONS: i32 = 21;
+    pub const SINGLE_ARTWORK: i32 = 22;
+    pub const COMPLETIONIST: i32 = 23;
+    pub const REPLAY: i32 = 24;
+}
+
 /// A comment on a profile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Comment {

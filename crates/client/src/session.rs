@@ -1303,6 +1303,36 @@ async fn online(
                     let result = crate::social::comments(web.as_deref().ok(), steam_id, start).await;
                     sink(Event::Comments { steam_id, result });
                 }),
+                Some(Command::LoadProfilePage { steam_id, language }) => st.with_web(sink, move |web, sink| async move {
+                    let result = crate::profile_page::load(web.as_deref().ok(), steam_id, &language).await;
+                    sink(Event::ProfilePage { steam_id, result });
+                }),
+                Some(Command::LoadAliases { steam_id }) => st.with_web(sink, move |web, sink| async move {
+                    let result = crate::social::aliases(web.as_deref().ok(), steam_id).await;
+                    sink(Event::Aliases { steam_id, result });
+                }),
+                Some(Command::ResolveProfileUrl { vanity }) => st.with_web(sink, move |web, sink| async move {
+                    let vanity = vanity.to_ascii_lowercase();
+                    let result = crate::social::resolve_vanity(web.as_deref().ok(), &vanity).await;
+                    sink(Event::ProfileUrlResolved { vanity, result });
+                }),
+                Some(Command::ClearAliases) => {
+                    let me = st.me;
+                    st.with_web(sink, move |web, sink| async move {
+                        let result = match web {
+                            Ok(w) => crate::social::clear_aliases(&w, me).await,
+                            Err(e) => Err(e),
+                        };
+                        sink(Event::AliasesCleared(result));
+                    })
+                }
+                Some(Command::LoadShowcases { steam_id, language }) => {
+                    let (conn, sink) = (st.conn.clone(), sink.clone());
+                    tokio::spawn(async move {
+                        let result = crate::showcases::load(&conn, steam_id, &language).await;
+                        sink(Event::Showcases { steam_id, result });
+                    });
+                }
                 Some(Command::SetNickname { steam_id, nickname }) => {
                     let nick = nickname.clone().unwrap_or_default();
                     let _ = st.conn.send(emsg::AM_CLIENT_SET_PLAYER_NICKNAME, &CMsgClientSetPlayerNickname { steamid: Some(steam_id), nickname: Some(nick) });

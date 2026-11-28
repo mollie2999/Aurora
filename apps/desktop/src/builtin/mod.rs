@@ -39,7 +39,7 @@ pub fn registry(
     r.register(library::Library::new(rt.clone(), ctx.clone(), flags.clone(), library_layout));
     r.register(community_home::CommunityHome::new(rt.clone(), ctx.clone()));
     r.register(community::Community::default());
-    r.register(profile::Profile::default());
+    r.register(profile::Profile::new(flags.clone()));
     r.register(downloads::Downloads::new(flags.clone()));
     r.register(workshop::Workshop::default());
     r.register(hub::Hub::default());

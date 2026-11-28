@@ -3,9 +3,10 @@
 
 use crate::{Theme, WidgetStyle};
 use crate::theme::{bold, medium, semibold};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use egui::{
     Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Margin, Rect, Response, RichText, Sense,
-    Stroke, StrokeKind, Ui, Vec2, load::TexturePoll, pos2, vec2,
+    Stroke, StrokeKind, Ui, Vec2, load::{Bytes, BytesPoll, LoadError, TextureLoadResult, TexturePoll}, pos2, vec2,
 };
 
 // ---------- focus ----------
@@ -146,6 +147,8 @@ pub enum ImageState {
 const STEPS: [u32; 11] = [64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048];
 const SIZED: &str = "#sir-fit=";
 pub const BLUR_BOTTOM_SUFFIX: &str = ",blur-bottom";
+/// A sized picture blurred all over (a "frosted glass" backdrop).
+pub const BLUR_SUFFIX: &str = ",blur";
 
 fn step(px: f32) -> Option<u32> {
     STEPS.iter().copied().find(|s| *s as f32 >= px.ceil())
@@ -333,6 +336,45 @@ pub fn paint_blurred_cover_first(ui: &Ui, screen: Rect, rect: Rect, urls: &[&str
     None
 }
 
+/// A Steam profile background: drawn at its own size (CSS pixels = points),
+/// centered on `center_x` from `top`, like Steam's `center top no-repeat`;
+/// or `fill_width` wide when the profile uses "Full Screen". Returns where
+/// it was drawn.
+pub fn paint_page_background(ui: &Ui, center_x: f32, top: f32, url: &str, fill_width: Option<f32>) -> Option<Rect> {
+    // Asked for at up to 4K so the decoder keeps the picture's own size.
+    let (_, texture) = load(ui, url, vec2(3840.0, 2160.0) / ui.ctx().pixels_per_point(), false);
+    let texture = texture?;
+    let size = match fill_width {
+        Some(w) => vec2(w, w * texture.size.y / texture.size.x.max(1.0)),
+        None => texture.size,
+    };
+    let rect = Rect::from_min_size(pos2(center_x - size.x / 2.0, top), size);
+    egui::Image::from_texture(texture).paint_at(ui, rect);
+    Some(rect)
+}
+
+/// A blurred copy of a [`paint_page_background`] picture drawn at `rect`,
+/// cut to `area`: Steam's frosted content on game profiles. A shape, so it
+/// can go under content drawn before it. `None` while it's being made.
+pub fn blurred_background_shape(ui: &Ui, rect: Rect, area: Rect, url: &str) -> Option<egui::Shape> {
+    let part = rect.intersect(area);
+    if !part.is_positive() {
+        return None;
+    }
+    // Blurring a smaller copy is cheaper and looks the same.
+    let px = (rect.size() * ui.ctx().pixels_per_point() * 0.5).max(vec2(16.0, 16.0));
+    let mut uri = sized_url(url, px, false);
+    if uri == url {
+        return None;
+    }
+    uri.push_str(BLUR_SUFFIX);
+    let Ok(TexturePoll::Ready { texture }) = ui.ctx().try_load_texture(&uri, egui::TextureOptions::LINEAR, egui::load::SizeHint::default()) else {
+        return None;
+    };
+    let uv = |p: egui::Pos2| pos2((p.x - rect.left()) / rect.width(), (p.y - rect.top()) / rect.height());
+    Some(egui::Shape::image(texture.id, part, Rect::from_min_max(uv(part.min), uv(part.max)), Color32::WHITE))
+}
+
 /// Start loading the image [`paint_cover_first`] would show, without drawing.
 pub fn prefetch_first(ui: &Ui, urls: &[&str], size: Vec2) {
     for url in urls {
@@ -357,43 +399,144 @@ fn paint_contain_texture(ui: &Ui, rect: Rect, texture: egui::load::SizedTexture,
     egui::Image::from_texture(texture).paint_at(ui, target);
 }
 
-/// A chat GIF decoded in the background.
-enum GifAnimation {
+#[cfg(test)]
+fn decode_test_gif(bytes: &[u8]) -> Option<(Vec<egui::ColorImage>, Vec<u32>)> {
+    decode_animation(bytes, |_, _| {})
+}
+
+// ---------- animated pictures (avatars, avatar frames) ----------
+
+/// Decoded APNG frames: Steam's animated avatar frames are APNGs, which
+/// egui's loaders show as a still picture.
+enum Apng {
     Decoding,
     Failed,
     Decoded(Vec<egui::ColorImage>, Vec<u32>, bool),
     Ready(std::sync::Arc<Vec<egui::TextureHandle>>, std::sync::Arc<Vec<u32>>, bool),
 }
 
-type AnimationCache = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, GifAnimation>>>;
-
-fn animation_cache(ctx: &egui::Context) -> AnimationCache {
-    // Native and in-game egui contexts use separate texture managers.
-    ctx.data_mut(|data| data.get_temp_mut_or_default::<AnimationCache>(egui::Id::unique("animation-cache")).clone())
-}
+static APNGS: std::sync::Mutex<Option<std::collections::HashMap<String, Apng>>> = std::sync::Mutex::new(None);
 /// Animations kept decoded at once.
-const GIF_CACHE: usize = 24;
+const APNG_CACHE: usize = 24;
 /// Frames kept per animation (longer ones skip frames) and their largest side.
-const GIF_MAX_FRAMES: usize = 300;
-const GIF_MAX_SIDE: u32 = 256;
+const APNG_MAX_FRAMES: usize = 300;
+const APNG_MAX_SIDE: u32 = 256;
+
+const MAX_ANIMATION_DIMENSION: u32 = 4096;
+const MAX_ANIMATION_ALLOC: u64 = 64 << 20;
+const MAX_ANIMATION_DECODERS: usize = 4;
+static ACTIVE_ANIMATION_DECODERS: AtomicUsize = AtomicUsize::new(0);
+
+struct AnimationDecodeSlot;
+
+impl AnimationDecodeSlot {
+    fn acquire() -> Option<Self> {
+        let slot = Self;
+        (ACTIVE_ANIMATION_DECODERS.fetch_add(1, Ordering::Relaxed) < MAX_ANIMATION_DECODERS).then_some(slot)
+    }
+}
+
+impl Drop for AnimationDecodeSlot {
+    fn drop(&mut self) {
+        ACTIVE_ANIMATION_DECODERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn is_apng(bytes: &[u8]) -> bool {
+    let Some(mut chunks) = bytes.strip_prefix(b"\x89PNG\r\n\x1a\n") else { return false };
+    while let Some(header) = chunks.get(..8) {
+        match &header[4..] {
+            b"acTL" => return true,
+            b"IDAT" | b"IEND" => return false,
+            _ => {}
+        }
+        let size = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let Some(rest) = size.checked_add(12).and_then(|end| chunks.get(end..)) else { return false };
+        chunks = rest;
+    }
+    false
+}
+
+fn is_animated_webp(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"RIFF")
+        && bytes.get(8..16) == Some(b"WEBPVP8X")
+        && bytes.get(20).is_some_and(|flags| flags & 0x02 != 0)
+}
+
+fn is_animation(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"GIF8") || is_animated_webp(bytes) || is_apng(bytes)
+}
+
+/// The chunk tag, payload and next chunk in a WebP RIFF stream.
+fn webp_chunk(bytes: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let size = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
+    let (payload, rest) = bytes.get(8..)?.split_at_checked(size)?;
+    Some((&bytes[..4], payload, rest.get(size % 2..)?))
+}
+
+/// The WebP decoder allocates lossy frame planes from the inner VP8
+/// dimensions before checking them against the animation frame header.
+fn webp_frame_dimensions_match(bytes: &[u8]) -> Option<()> {
+    let mut chunks = bytes.get(12..)?;
+    while chunks.len() >= 8 {
+        let (tag, payload, rest) = webp_chunk(chunks)?;
+        chunks = rest;
+        if tag != b"ANMF" {
+            continue;
+        }
+        // A frame header and its padded subchunks always have even length.
+        if payload.len() % 2 != 0 {
+            return None;
+        }
+        let (tag, frame, rest) = webp_chunk(payload.get(16..)?)?;
+        let (tag, frame) = if tag == b"ALPH" {
+            let (tag, frame, _) = webp_chunk(rest)?;
+            (tag, frame)
+        } else {
+            (tag, frame)
+        };
+        if tag == b"VP8 " {
+            let frame_size = |at| u32::from_le_bytes([payload[at], payload[at + 1], payload[at + 2], 0]) + 1;
+            let header = frame.get(6..10)?;
+            let vp8_size = |at| u32::from(u16::from_le_bytes([header[at], header[at + 1]]) & 0x3fff);
+            if frame_size(6) != vp8_size(0) || frame_size(9) != vp8_size(2) {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
 
 #[cfg(test)]
-fn decode_test_gif(bytes: &[u8]) -> Option<(Vec<egui::ColorImage>, Vec<u32>)> {
+fn decode_apng(bytes: &[u8]) -> Option<(Vec<egui::ColorImage>, Vec<u32>)> {
     decode_animation(bytes, |_, _| {})
 }
 
 fn decode_animation(bytes: &[u8], mut preview: impl FnMut(&[egui::ColorImage], &[u32])) -> Option<(Vec<egui::ColorImage>, Vec<u32>)> {
-    use image::AnimationDecoder;
-    use image::ImageDecoder;
-    let mut decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    use image::{AnimationDecoder, ImageDecoder};
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(4096);
-    limits.max_image_height = Some(4096);
-    limits.max_alloc = Some(64 * 1024 * 1024);
-    decoder.set_limits(limits).ok()?;
-    let frames = decoder.into_frames();
+    limits.max_image_width = Some(MAX_ANIMATION_DIMENSION);
+    limits.max_image_height = Some(MAX_ANIMATION_DIMENSION);
+    limits.max_alloc = Some(MAX_ANIMATION_ALLOC);
+    let cursor = std::io::Cursor::new(bytes);
+    let frames = if bytes.starts_with(b"GIF8") {
+        let mut decoder = image::codecs::gif::GifDecoder::new(cursor).ok()?;
+        decoder.set_limits(limits).ok()?;
+        decoder.into_frames()
+    } else if is_animated_webp(bytes) {
+        let mut decoder = image::codecs::webp::WebPDecoder::new(cursor).ok()?;
+        decoder.set_limits(limits.clone()).ok()?;
+        let (width, height) = decoder.dimensions();
+        // WebP's set_limits only checks dimensions. Budget the frame, the
+        // accumulated canvas, the output, and decoder scratch at RGBA size.
+        limits.reserve(u64::from(width) * u64::from(height) * 16).ok()?;
+        webp_frame_dimensions_match(bytes)?;
+        decoder.into_frames()
+    } else {
+        image::codecs::png::PngDecoder::with_limits(cursor, limits).ok()?.apng().ok()?.into_frames()
+    };
     let mut images = Vec::new();
-    let mut delays = Vec::new();
+    let mut delays: Vec<u32> = Vec::new();
     // Keep the whole timeline. If an exceptionally long animation exceeds
     // the frame budget, merge adjacent frames and retain their total delay.
     let mut stride = 1usize;
@@ -405,18 +548,18 @@ fn decode_animation(bytes: &[u8], mut preview: impl FnMut(&[egui::ColorImage], &
         let (n, d) = frame.delay().numer_denom_ms();
         let delay = (n / d.max(1)).max(1);
         if seen % stride != 0 {
-            if let Some(last) = delays.last_mut() { *last += delay; }
+            if let Some(last) = delays.last_mut() { *last = last.saturating_add(delay); }
             seen += 1;
             if seen % 24 == 0 { preview(&images, &delays); }
             continue;
         }
         seen += 1;
-        if images.len() == GIF_MAX_FRAMES {
-            let mut compact_images = Vec::with_capacity(GIF_MAX_FRAMES / 2);
-            let mut compact_delays = Vec::with_capacity(GIF_MAX_FRAMES / 2);
+        if images.len() == APNG_MAX_FRAMES {
+            let mut compact_images = Vec::with_capacity(APNG_MAX_FRAMES / 2);
+            let mut compact_delays: Vec<u32> = Vec::with_capacity(APNG_MAX_FRAMES / 2);
             for (i, (image, delay)) in images.drain(..).zip(delays.drain(..)).enumerate() {
                 if i % 2 == 0 { compact_images.push(image); compact_delays.push(delay); }
-                else if let Some(last) = compact_delays.last_mut() { *last += delay; }
+                else if let Some(last) = compact_delays.last_mut() { *last = last.saturating_add(delay); }
             }
             images = compact_images;
             delays = compact_delays;
@@ -424,8 +567,8 @@ fn decode_animation(bytes: &[u8], mut preview: impl FnMut(&[egui::ColorImage], &
         }
         let mut buf = frame.into_buffer();
         let (w, h) = buf.dimensions();
-        if w.max(h) > GIF_MAX_SIDE {
-            let k = GIF_MAX_SIDE as f32 / w.max(h) as f32;
+        if w.max(h) > APNG_MAX_SIDE {
+            let k = APNG_MAX_SIDE as f32 / w.max(h) as f32;
             buf = image::imageops::resize(&buf, ((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1), image::imageops::FilterType::Triangle);
         }
         images.push(egui::ColorImage::from_rgba_unmultiplied([buf.width() as usize, buf.height() as usize], buf.as_raw()));
@@ -450,37 +593,49 @@ fn frame_at(delays: &[u32], time: f64) -> (usize, u64) {
     (0, delays.first().copied().unwrap_or(100) as u64)
 }
 
-/// The current GIF frame of `url`, decoding it in the background the first
-/// time. `None` while it decodes or when the GIF can't be decoded.
-fn chat_gif_frame(ctx: &egui::Context, url: &str, bytes: &std::sync::Arc<[u8]>, animate: bool, max_fps: f32) -> Option<egui::load::SizedTexture> {
-    let cache = animation_cache(ctx);
-    let mut map = cache.lock().unwrap();
+/// The current frame of an animation, decoding it in the background.
+fn animation_texture(ctx: &egui::Context, url: &str, bytes: Bytes, animate: bool, max_fps: f32) -> TextureLoadResult {
+    let mut guard = APNGS.lock().unwrap();
+    let map = guard.get_or_insert_with(Default::default);
     if !map.contains_key(url) {
-        if map.len() >= GIF_CACHE {
-            map.clear();
+        let Some(slot) = AnimationDecodeSlot::acquire() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return Ok(TexturePoll::Pending { size: None });
+        };
+        if map.len() >= APNG_CACHE {
+            // Active decoders also own their preview entries until they finish.
+            map.retain(|_, entry| matches!(entry, Apng::Decoding | Apng::Decoded(_, _, false) | Apng::Ready(_, _, false)));
         }
-        map.insert(url.to_string(), GifAnimation::Decoding);
-        let (ctx, url, bytes) = (ctx.clone(), url.to_string(), bytes.clone());
-        let cache = cache.clone();
-        std::thread::spawn(move || {
+        let worker_ctx = ctx.clone();
+        let worker_url = url.to_string();
+        std::thread::Builder::new().spawn(move || {
             let result = decode_animation(&bytes, |images, delays| {
-                cache.lock().unwrap().insert(url.clone(), GifAnimation::Decoded(images.to_vec(), delays.to_vec(), false));
-                ctx.request_repaint();
+                if let Some(map) = APNGS.lock().unwrap().as_mut() {
+                    map.insert(worker_url.clone(), Apng::Decoded(images.to_vec(), delays.to_vec(), false));
+                }
+                worker_ctx.request_repaint();
             });
-            cache.lock().unwrap().insert(url, match result {
-                Some((images, delays)) => GifAnimation::Decoded(images, delays, true),
-                None => GifAnimation::Failed,
-            });
-            ctx.request_repaint();
-        });
-        return None;
+            if let Some(map) = APNGS.lock().unwrap().as_mut() {
+                map.insert(worker_url, match result {
+                    Some((images, delays)) => Apng::Decoded(images, delays, true),
+                    None => Apng::Failed,
+                });
+            }
+            drop(slot);
+            worker_ctx.request_repaint();
+        }).map_err(|err| LoadError::Loading(err.to_string()))?;
+        map.insert(url.to_string(), Apng::Decoding);
+        return Ok(TexturePoll::Pending { size: None });
     }
-    let entry = map.get_mut(url)?;
-    if let GifAnimation::Decoded(images, delays, complete) = entry {
-        let textures: Vec<_> = images.drain(..).enumerate().map(|(i, img)| ctx.load_texture(format!("{url}#chat-gif{i}"), img, egui::TextureOptions::LINEAR)).collect();
-        *entry = GifAnimation::Ready(std::sync::Arc::new(textures), std::sync::Arc::new(std::mem::take(delays)), *complete);
+    let entry = map.get_mut(url).unwrap();
+    if matches!(entry, Apng::Failed) {
+        return Err(LoadError::Loading("Could not decode animation".into()));
     }
-    let GifAnimation::Ready(textures, delays, complete) = entry else { return None };
+    if let Apng::Decoded(images, delays, complete) = entry {
+        let textures: Vec<_> = images.drain(..).enumerate().map(|(i, img)| ctx.load_texture(format!("{url}#apng{i}"), img, egui::TextureOptions::LINEAR)).collect();
+        *entry = Apng::Ready(std::sync::Arc::new(textures), std::sync::Arc::new(std::mem::take(delays)), *complete);
+    }
+    let Apng::Ready(textures, delays, complete) = entry else { return Ok(TexturePoll::Pending { size: None }) };
     let index = if animate {
         let now = ctx.input(|i| i.time);
         let clock_id = egui::Id::unique(("animation-clock", url));
@@ -499,49 +654,56 @@ fn chat_gif_frame(ctx: &egui::Context, url: &str, bytes: &std::sync::Arc<[u8]>, 
     } else {
         0
     };
-    textures.get(index).map(|t| egui::load::SizedTexture::from_handle(t))
+    Ok(TexturePoll::Ready { texture: egui::load::SizedTexture::from_handle(&textures[index]) })
 }
 
-fn animated_picture_texture(ui: &Ui, rect: Rect, url: &str, max_fps: f32) -> Option<TexturePoll> {
-    let egui::load::BytesPoll::Ready { bytes: egui::load::Bytes::Shared(bytes), .. } = ui.ctx().try_load_bytes(url).ok()? else {
-        return None;
-    };
-    if bytes.starts_with(b"GIF8") {
-        Some(chat_gif_frame(ui.ctx(), url, &bytes, ui.is_rect_visible(rect), max_fps)
-            .map_or(TexturePoll::Pending { size: None }, |texture| TexturePoll::Ready { texture }))
-    } else {
-        None
+/// Like [`paint_cover`], but animated GIFs, WebPs and APNGs play, at most
+/// `max_fps` frames a second and only while `rect` is on screen.
+pub fn paint_cover_animated(ui: &Ui, rect: Rect, url: &str, radius: CornerRadius, max_fps: f32) -> bool {
+    let ctx = ui.ctx();
+    match ctx.try_load_bytes(url) {
+        Ok(BytesPoll::Ready { bytes, .. }) if is_animation(&bytes) => {
+            if let Ok(TexturePoll::Ready { texture }) = animation_texture(ctx, url, bytes, ui.is_rect_visible(rect), max_fps) {
+                paint_cover_texture(ui, rect, texture, radius);
+                return true;
+            }
+            false
+        }
+        Ok(BytesPoll::Pending { .. }) => false,
+        _ => paint_cover(ui, rect, url, radius),
     }
 }
 
-/// Like [`paint_contain`], with GIF playback while visible.
+/// Like [`paint_contain`], with animated GIF/WebP/APNG playback while visible.
 pub fn paint_contain_animated(ui: &Ui, rect: Rect, url: &str, align: Align2, max_fps: f32) -> bool {
-    match animated_picture_texture(ui, rect, url, max_fps) {
-        Some(TexturePoll::Ready { texture }) => {
-            paint_contain_texture(ui, rect, texture, align);
-            true
+    let ctx = ui.ctx();
+    match ctx.try_load_bytes(url) {
+        Ok(BytesPoll::Ready { bytes, .. }) if is_animation(&bytes) => {
+            if let Ok(TexturePoll::Ready { texture }) = animation_texture(ctx, url, bytes, ui.is_rect_visible(rect), max_fps) {
+                paint_contain_texture(ui, rect, texture, align);
+                return true;
+            }
+            false
         }
-        Some(TexturePoll::Pending { .. }) => false,
-        None => paint_contain(ui, rect, url, align),
+        Ok(BytesPoll::Pending { .. }) => false,
+        _ => paint_contain(ui, rect, url, align),
     }
 }
 
 /// A remote picture `width` wide at its own shape (no cropping), at most
-/// `max_height` tall. GIFs animate, at most `max_fps` frames a second and
+/// `max_height` tall. Animations play at most `max_fps` frames a second and
 /// only while on screen. Shows a 16:9 placeholder until it loads.
 pub fn picture_fit_width(ui: &mut Ui, t: &Theme, url: &str, width: f32, max_height: f32, max_fps: f32) -> Response {
-    let ctx = ui.ctx().clone();
-    // Sized URIs are handled by the image loader; probing them as raw
-    // network URLs creates a second cache entry for the same image.
-    let sized = parse_sized(url);
-    let original = sized.map(|(original, _, _, _)| original).unwrap_or(url);
+    let ctx = ui.ctx();
+    let original = parse_sized(url).map_or(url, |(original, _, _, _)| original);
     let ahead = Rect::from_min_size(ui.cursor().min, vec2(width, max_height));
-    let texture = if let Some(texture) = animated_picture_texture(ui, ahead, original, max_fps) {
-        Ok(texture)
-    } else if sized.is_some() {
-        ctx.try_load_texture(url, egui::TextureOptions::LINEAR, egui::load::SizeHint::default())
-    } else {
-        egui::Image::new(url).load_for_size(&ctx, vec2(width, max_height))
+    let texture = match ctx.try_load_bytes(original) {
+        Ok(BytesPoll::Ready { bytes, .. }) if is_animation(&bytes) => {
+            animation_texture(ctx, original, bytes, ui.is_rect_visible(ahead), max_fps)
+        }
+        Ok(BytesPoll::Pending { size }) => Ok(TexturePoll::Pending { size }),
+        // Recognized animations always stay on the bounded decoder path.
+        _ => egui::Image::new(url).load_for_size(ctx, vec2(width, max_height)),
     };
     match texture {
         Ok(egui::load::TexturePoll::Ready { texture }) if texture.size.x > 0.0 => {
@@ -1421,6 +1583,134 @@ pub fn markup_label(ui: &mut Ui, text: &str, size: f32, color: Color32) -> Respo
 
 #[cfg(test)]
 mod markup_tests {
+
+    #[test]
+    fn animation_decoder_slots_are_bounded_and_reusable() {
+        let mut slots: Vec<_> = (0..4).map(|_| super::AnimationDecodeSlot::acquire().unwrap()).collect();
+        assert!(super::AnimationDecodeSlot::acquire().is_none());
+        drop(slots.pop());
+        assert!(super::AnimationDecodeSlot::acquire().is_some());
+    }
+
+    #[test]
+    fn animation_decodes_lossy_webp_frames() {
+        // Two 8x8 frames, red and blue, encoded as VP8 chunks.
+        let bytes = b"\
+            \x52\x49\x46\x46\xc0\x00\x00\x00\x57\x45\x42\x50\x56\x50\x38\x58\
+            \x0a\x00\x00\x00\x02\x00\x00\x00\x07\x00\x00\x07\x00\x00\x41\x4e\
+            \x49\x4d\x06\x00\x00\x00\xff\xff\xff\xff\x00\x00\x41\x4e\x4d\x46\
+            \x48\x00\x00\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x07\x00\x00\
+            \x64\x00\x00\x02\x56\x50\x38\x20\x30\x00\x00\x00\xd0\x01\x00\x9d\
+            \x01\x2a\x08\x00\x08\x00\x02\x00\x34\x25\xa0\x02\x74\xba\x01\xf8\
+            \x00\x03\xb0\x00\xfe\xf0\xe8\xf7\xff\x20\xb9\x61\x75\xc8\xd7\xff\
+            \x20\x3f\xe4\x07\xfc\x80\xff\xf8\xf2\x00\x00\x00\x41\x4e\x4d\x46\
+            \x44\x00\x00\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x07\x00\x00\
+            \x64\x00\x00\x00\x56\x50\x38\x20\x2c\x00\x00\x00\x94\x01\x00\x9d\
+            \x01\x2a\x08\x00\x08\x00\x00\x00\x34\x25\xa0\x02\x74\xba\x00\x03\
+            \x98\x00\xfe\xf9\x93\x6f\xff\x90\x1f\xff\x90\x1f\xff\x90\x1f\xff\
+            \x20\x3f\xe2\x17\x7b\x20\x30\x00";
+        assert!(super::is_animation(bytes));
+        let (frames, delays) = super::decode_apng(bytes).unwrap();
+        assert_eq!(delays, [100, 100]);
+        assert!(frames[0].pixels[0].r() > 200);
+        assert!(frames[1].pixels[0].b() > 200);
+    }
+
+    #[test]
+    fn animation_rejects_oversized_canvas() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            let image = image::RgbaImage::from_pixel(4097, 1, image::Rgba([0, 0, 0, 255]));
+            encoder.encode_frame(image::Frame::new(image)).unwrap();
+        }
+        assert!(super::decode_apng(&bytes).is_none());
+    }
+    #[test]
+    fn animation_state_repaints_and_loops_after_completion() {
+        use std::sync::Arc;
+        let ctx = egui::Context::default();
+        let url = "test-animation-loop-state";
+        let textures: Vec<_> = [egui::Color32::RED, egui::Color32::BLUE].into_iter().map(|color| {
+            ctx.load_texture("loop-frame", egui::ColorImage::filled([2, 2], color), egui::TextureOptions::LINEAR)
+        }).collect();
+        let ids: Vec<_> = textures.iter().map(|t| t.id()).collect();
+        super::APNGS.lock().unwrap().get_or_insert_with(Default::default).insert(url.into(), super::Apng::Ready(Arc::new(textures), Arc::new(vec![100, 100]), true));
+        let mut seen = Vec::new();
+        for time in [0.0, 0.1, 0.2, 0.3] {
+            let input = egui::RawInput { time: Some(time), ..Default::default() };
+            let mut output = ctx.run_ui(input, |_ui| {
+                let Ok(egui::load::TexturePoll::Ready { texture }) = super::animation_texture(&ctx, url, egui::load::Bytes::Static(&[]), true, 240.0) else {
+                    panic!("expected a ready animation frame");
+                };
+                seen.push(texture.id);
+            });
+            output.textures_delta.clear();
+        }
+        assert_eq!(seen, [ids[0], ids[1], ids[0], ids[1]]);
+        super::APNGS.lock().unwrap().as_mut().unwrap().remove(url);
+    }
+
+    #[test]
+    fn animation_keeps_valid_frames_before_a_damaged_trailer() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for i in 0..10 {
+                let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([i * 20, 0, 0, 255]));
+                encoder.encode_frame(image::Frame::from_parts(image, 0, 0, image::Delay::from_numer_denom_ms(30, 1))).unwrap();
+            }
+        }
+        bytes.truncate(bytes.len() - 5);
+        let (images, delays) = super::decode_apng(&bytes).expect("valid earlier frames should survive");
+        assert!(images.len() >= 8);
+        assert!(delays.iter().sum::<u32>() >= 240);
+    }
+
+    #[test]
+    fn animation_loops_only_after_full_duration() {
+        let delays = [100, 200, 300];
+        assert_eq!(super::frame_at(&delays, 0.0).0, 0);
+        assert_eq!(super::frame_at(&delays, 0.15).0, 1);
+        assert_eq!(super::frame_at(&delays, 0.599).0, 2);
+        assert_eq!(super::frame_at(&delays, 0.6).0, 0);
+        assert_eq!(super::frame_at(&delays, 0.75).0, 1);
+    }
+
+    #[test]
+    fn long_gif_preserves_full_duration() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for i in 0..320 {
+                let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([i as u8, 0, 0, 255]));
+                encoder.encode_frame(image::Frame::from_parts(image, 0, 0, image::Delay::from_numer_denom_ms(10, 1))).unwrap();
+            }
+        }
+        let mut preview_frames = 0;
+        let (frames, delays) = super::decode_animation(&bytes, |frames, _| preview_frames = frames.len()).unwrap();
+        assert_eq!(preview_frames, 156);
+        assert!(frames.len() <= super::APNG_MAX_FRAMES);
+        assert_eq!(delays.iter().sum::<u32>(), 3200);
+        assert!(frames.last().unwrap().pixels[0].r() > 40);
+    }
+
+    #[test]
+    fn workshop_gif_decodes_bounded_animated_frames() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+                let image = image::RgbaImage::from_pixel(300, 400, image::Rgba(color));
+                encoder.encode_frame(image::Frame::from_parts(image, 0, 0, image::Delay::from_numer_denom_ms(100, 1))).unwrap();
+            }
+        }
+        let (frames, delays) = super::decode_apng(&bytes).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_ne!(frames[0].pixels[0], frames[1].pixels[0]);
+        assert!(frames[0].size[0].max(frames[0].size[1]) <= super::APNG_MAX_SIDE as usize);
+        assert_eq!(delays, [100, 100]);
+    }
     #[test]
     fn animation_state_repaints_and_loops_after_completion() {
         use std::sync::Arc;

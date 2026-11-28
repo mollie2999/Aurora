@@ -42,6 +42,8 @@ pub struct Prefs {
     /// Show the "What's new" news shelf on the library home.
     #[serde(default = "yes")]
     pub show_whats_new: bool,
+    #[serde(default)]
+    pub steam_profile_ui: bool,
     /// Account to sign in automatically at startup (cleared on log out).
     pub auto_login: Option<String>,
     /// Interface language code; `None` follows the system.
@@ -143,6 +145,7 @@ impl Default for Prefs {
             fps_counter: crate::builtin::settings::FpsCorner::Off,
             fps_high_contrast: false,
             show_whats_new: true,
+            steam_profile_ui: false,
             auto_login: None,
             language: None,
             language_asked: false,
@@ -384,6 +387,7 @@ impl SteamApp {
             fps_counter: prefs.fps_counter,
             fps_high_contrast: prefs.fps_high_contrast,
             show_whats_new: prefs.show_whats_new,
+            steam_profile_ui: prefs.steam_profile_ui,
         }));
         client::set_proton_override(prefs.proton_override.clone());
         client::set_app_protons(prefs.proton_per_app.clone());
@@ -1415,6 +1419,7 @@ impl eframe::App for SteamApp {
             self.prefs.fps_counter = f.fps_counter;
             self.prefs.fps_high_contrast = f.fps_high_contrast;
             self.prefs.show_whats_new = f.show_whats_new;
+            self.prefs.steam_profile_ui = f.steam_profile_ui;
             #[cfg(not(windows))]
             {
                 self.prefs.precompile_shaders = client::shaders::precompile();
@@ -1699,6 +1704,7 @@ impl eframe::App for SteamApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.sync_client_preferences(true);
+        self.prefs.steam_profile_ui = self.flags.lock().unwrap().steam_profile_ui;
         self.prefs.ext_data = self.registry.save_all().into_iter().collect();
         eframe::set_value(storage, "prefs", &self.prefs);
         // eframe restores its own "window" entry even with persist_window
@@ -1828,6 +1834,17 @@ mod tests {
         let restored: Prefs = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.controller, prefs.controller);
         assert_eq!(restored.controller_bindings, prefs.controller_bindings);
+    }
+
+    #[test]
+    fn steam_profile_ui_defaults_to_classic_and_roundtrips() {
+        let legacy: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.steam_profile_ui);
+        assert!(!Prefs::default().steam_profile_ui);
+
+        let prefs = Prefs { steam_profile_ui: true, ..Prefs::default() };
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(serde_json::from_str::<Prefs>(&json).unwrap().steam_profile_ui);
     }
 
     #[test]

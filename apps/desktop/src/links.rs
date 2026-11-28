@@ -48,24 +48,6 @@ pub fn open_http(url: &str) -> bool {
     open::that_detached(parsed.as_str()).is_ok()
 }
 
-/// Right-clicking empty space on a page offers "Copy page URL" (its address
-/// on Steam), like a browser. Call it before drawing the page: its widgets
-/// are added after, so they keep their own clicks and menus.
-pub fn page_url_menu(ui: &mut egui::Ui, url: &str) {
-    let resp = ui.interact(ui.max_rect(), ui.id().with("aurora-page-url-menu"), egui::Sense::click());
-    resp.context_menu(|ui| {
-        if ui.button(format!("{}  {}", ui::icons::COPY, i18n::t!("Copy page URL"))).clicked() {
-            ui.ctx().copy_text(url.to_string());
-            ui.close();
-        }
-    });
-}
-
-/// `base` with these query parameters, encoded.
-pub fn with_query(base: &str, params: &[(&str, &str)]) -> String {
-    reqwest::Url::parse_with_params(base, params).map(String::from).unwrap_or_else(|_| base.to_string())
-}
-
 /// The page in Aurora a Steam web link stands for, if Aurora has one:
 /// profiles (`/profiles/<id>` and custom `/id/<name>` URLs), store pages,
 /// and the community pages the hub shows (workshop, guides, discussions…).
@@ -105,6 +87,7 @@ pub fn in_app(url: &str) -> Option<(String, Option<String>)> {
                 Some("badges") => "/badges",
                 Some("recommended" | "reviews") => "/reviews",
                 Some("groups") => "/groups",
+                Some("groupscommon") => "/groupscommon",
                 _ => "",
             };
             let who = if kind.eq_ignore_ascii_case("id") { format!("id:{who}") } else { who.parse::<u64>().ok()?.to_string() };
@@ -117,6 +100,34 @@ pub fn in_app(url: &str) -> Option<(String, Option<String>)> {
     }
     let view = crate::builtin::hub::route(url)?;
     Some(view.to_page())
+}
+
+/// Where a link clicked in Steam text goes: a page in Aurora when it has one
+/// (see [`in_app`]), otherwise the browser.
+pub fn web_action(url: &str) -> Option<extensions::Action> {
+    if let Some((page, arg)) = in_app(url) {
+        return Some(extensions::Action::Navigate { page, arg });
+    }
+    open_http(url);
+    None
+}
+
+/// Right-clicking empty space on a page offers "Copy page URL" (its address
+/// on Steam), like a browser. Call it before drawing the page: its widgets
+/// are added after, so they keep their own clicks and menus.
+pub fn page_url_menu(ui: &mut egui::Ui, url: &str) {
+    let resp = ui.interact(ui.max_rect(), ui.id().with("aurora-page-url-menu"), egui::Sense::click());
+    resp.context_menu(|ui| {
+        if ui.button(format!("{}  {}", ui::icons::COPY, i18n::t!("Copy page URL"))).clicked() {
+            ui.ctx().copy_text(url.to_string());
+            ui.close();
+        }
+    });
+}
+
+/// `base` with these query parameters, encoded.
+pub fn with_query(base: &str, params: &[(&str, &str)]) -> String {
+    reqwest::Url::parse_with_params(base, params).map(String::from).unwrap_or_else(|_| base.to_string())
 }
 
 /// Whether Aurora can open this Steam destination.
@@ -741,6 +752,21 @@ pub fn game_icon(app: Option<&model::OwnedApp>, install_dir: &std::path::Path) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steam_web_links_open_in_aurora() {
+        let page = |u: &str| in_app(u).map(|(p, a)| (p, a.unwrap_or_default()));
+        let p = |page: &str, arg: &str| Some((page.to_string(), arg.to_string()));
+        assert_eq!(page("https://steamcommunity.com/profiles/76561198000000001"), p("profile", "76561198000000001"));
+        // Custom profile URLs keep their name's case for Steam to resolve.
+        assert_eq!(page("https://steamcommunity.com/id/MissColourz/"), p("profile", "id:MissColourz"));
+        assert_eq!(page("https://steamcommunity.com/id/yayazzli/groupscommon/"), p("profile", "id:yayazzli/groupscommon"));
+        assert_eq!(page("https://www.steamcommunity.com/id/x/games/?tab=all"), p("profile", "id:x/games"));
+        assert_eq!(page("https://store.steampowered.com/app/570/Dota_2/"), p("store", "app:570"));
+        assert_eq!(page("https://steamcommunity.com/sharedfiles/filedetails/?id=123"), p("workshop_item", "123"));
+        assert_eq!(page("https://example.com/id/x"), None);
+        assert_eq!(page("https://steamcommunity.com/profiles/notanumber"), None);
+    }
 
     #[test]
     fn parses_links() {

@@ -256,13 +256,16 @@ pub fn resize_handles(ctx: &egui::Context) {
         (Rect::from_min_size(egui::pos2(r - c, b - c), Vec2::splat(c)), ResizeDirection::SouthEast, CursorIcon::ResizeNwSe),
     ];
     for (i, (rect, dir, cursor)) in handles.into_iter().enumerate() {
+        if !rect.is_positive() {
+            continue;
+        }
         egui::Area::new(Id::unique(("resize-handle", i)))
             .order(egui::Order::Foreground)
             .fixed_pos(rect.min)
             .default_size(rect.size())
             .constrain(false)
             .show(ctx, |ui| {
-                let resp = ui.allocate_rect(Rect::from_min_size(rect.min, rect.size()), Sense::drag());
+                let (_, resp) = ui.allocate_exact_size(rect.size(), Sense::drag());
                 if resp.hovered() || resp.dragged() {
                     ui.ctx().set_cursor_icon(cursor);
                 }
@@ -326,5 +329,111 @@ pub fn resize_edges(ui: &mut Ui) {
         if resp.drag_started() {
             ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Context, Event, PointerButton, Pos2, RawInput, ViewportInfo, pos2};
+
+    fn run_frame(
+        ctx: &Context,
+        size: Vec2,
+        maximized: bool,
+        events: Vec<Event>,
+        btn_pos: Pos2,
+    ) -> (bool, bool, CursorIcon) {
+        let mut raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        };
+        raw.viewports.insert(
+            egui::ViewportId::ROOT,
+            ViewportInfo {
+                maximized: Some(maximized),
+                ..Default::default()
+            },
+        );
+        let mut hovered = false;
+        let mut clicked = false;
+        let mut out = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let resp = ui.interact(
+                    Rect::from_center_size(btn_pos, vec2(120.0, 34.0)),
+                    Id::unique("test-btn"),
+                    Sense::click(),
+                );
+                hovered = resp.hovered();
+                clicked = resp.clicked();
+            });
+            resize_handles(ui.ctx());
+        });
+        out.textures_delta.clear();
+        (hovered, clicked, out.platform_output.cursor_icon)
+    }
+
+    #[test]
+    fn resize_handles_stay_thin_and_do_not_block_clicks() {
+        let ctx = Context::default();
+        // Simulate Splash -> Main -> shrink -> maximize -> unmaximize.
+        let stages = [
+            (vec2(380.0, 250.0), false),
+            (vec2(380.0, 250.0), false),
+            (vec2(1266.0, 758.0), false),
+            (vec2(1266.0, 758.0), false),
+            (vec2(1060.0, 680.0), false),
+            (vec2(1060.0, 680.0), false),
+            (vec2(1920.0, 1080.0), true),
+            (vec2(1266.0, 758.0), false),
+            (vec2(1266.0, 758.0), false),
+        ];
+        for (size, max) in stages {
+            let _ = run_frame(&ctx, size, max, vec![], pos2(100.0, 450.0));
+        }
+
+        // South and East handle areas must stay within their thin edge strips,
+        // not bloat to default_area_size (600x400).
+        let south = ctx.memory(|m| m.area_rect(Id::unique(("resize-handle", 1)))).expect("south handle");
+        let east = ctx.memory(|m| m.area_rect(Id::unique(("resize-handle", 3)))).expect("east handle");
+        assert!(south.height() <= 8.0, "south resize handle bloated: {south:?}");
+        assert!(east.width() <= 8.0, "east resize handle bloated: {east:?}");
+
+        // Buttons in the bottom-left (Settings nav), bottom-center (Appearance),
+        // and right half must all receive hover and clicks.
+        for pos in [pos2(100.0, 450.0), pos2(600.0, 650.0), pos2(900.0, 250.0)] {
+            let _ = run_frame(&ctx, vec2(1266.0, 758.0), false, vec![Event::PointerMoved(pos)], pos);
+            let (hov, _, _) = run_frame(&ctx, vec2(1266.0, 758.0), false, vec![Event::PointerMoved(pos)], pos);
+            assert!(hov, "button at {pos:?} was not hovered");
+
+            let _ = run_frame(
+                &ctx,
+                vec2(1266.0, 758.0),
+                false,
+                vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                ],
+                pos,
+            );
+            let (_, clicked, _) = run_frame(
+                &ctx,
+                vec2(1266.0, 758.0),
+                false,
+                vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers: Default::default() },
+                ],
+                pos,
+            );
+            assert!(clicked, "button at {pos:?} was not clicked");
+        }
+
+        // Hovering the actual South edge strip still shows the vertical resize cursor.
+        let edge = pos2(500.0, 756.0);
+        let _ = run_frame(&ctx, vec2(1266.0, 758.0), false, vec![Event::PointerMoved(edge)], pos2(100.0, 100.0));
+        let (_, _, cursor) = run_frame(&ctx, vec2(1266.0, 758.0), false, vec![Event::PointerMoved(edge)], pos2(100.0, 100.0));
+        assert_eq!(cursor, CursorIcon::ResizeVertical);
     }
 }

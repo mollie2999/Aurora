@@ -104,6 +104,35 @@ pub const BUNDLED_THEMES: &[BundledTheme] = &[
             },
         ],
     },
+    BundledTheme {
+        id: "metro",
+        files: &[
+            BundledFile {
+                path: "README.md",
+                bytes: include_bytes!("../../../docs/examples/metro/README.md"),
+            },
+            BundledFile {
+                path: "theme.toml",
+                bytes: include_bytes!("../../../docs/examples/metro/theme.toml"),
+            },
+            BundledFile {
+                path: "layout.toml",
+                bytes: include_bytes!("../../../docs/examples/metro/layout.toml"),
+            },
+            BundledFile {
+                path: "assets/fonts/Selawik-Regular.ttf",
+                bytes: include_bytes!("../../../docs/examples/metro/assets/fonts/Selawik-Regular.ttf"),
+            },
+            BundledFile {
+                path: "assets/fonts/Selawik-Semibold.ttf",
+                bytes: include_bytes!("../../../docs/examples/metro/assets/fonts/Selawik-Semibold.ttf"),
+            },
+            BundledFile {
+                path: "assets/fonts/OFL.txt",
+                bytes: include_bytes!("../../../docs/examples/metro/assets/fonts/OFL.txt"),
+            },
+        ],
+    },
 ];
 
 /// Returns `true` if `id` is one of Aurora's bundled themes.
@@ -488,7 +517,7 @@ mod tests {
 
         let mut mgr = crate::ThemeManager::new(themes_dir.clone(), data_dir.clone());
         let report = mgr.sync_bundled_themes().unwrap();
-        assert_eq!(report.installed, vec!["adwaita", "steam-replica"]);
+        assert_eq!(report.installed, vec!["adwaita", "steam-replica", "metro"]);
         assert!(report.updated.is_empty());
 
         mgr.scan();
@@ -509,6 +538,10 @@ mod tests {
         mgr.activate(Some("steam-replica")).unwrap();
         assert_eq!(mgr.resolved.as_ref().unwrap().meta.id, "steam-replica");
         assert!(mgr.resolved.as_ref().unwrap().script.is_some());
+
+        mgr.activate(Some("metro")).unwrap();
+        assert_eq!(mgr.resolved.as_ref().unwrap().meta.id, "metro");
+        assert!(mgr.resolved.as_ref().unwrap().custom_fonts.is_some());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -546,7 +579,7 @@ mod tests {
         fs::write(data_dir.join("adwaita.json"), saved_opts).unwrap();
 
         let report = sync_bundled_themes(&themes_dir, &data_dir).unwrap();
-        assert_eq!(report.installed, vec!["steam-replica"]);
+        assert_eq!(report.installed, vec!["steam-replica", "metro"]);
         assert_eq!(report.updated, vec!["adwaita"]);
 
         let updated_manifest = ThemeManifest::parse(
@@ -573,7 +606,7 @@ mod tests {
         fs::write(custom_dir.join("theme.toml"), custom_toml).unwrap();
 
         let report = sync_bundled_themes(&themes_dir, &data_dir).unwrap();
-        assert_eq!(report.installed, vec!["adwaita"]);
+        assert_eq!(report.installed, vec!["adwaita", "metro"]);
         assert!(report.updated.is_empty());
         assert_eq!(
             fs::read_to_string(custom_dir.join("theme.toml")).unwrap(),

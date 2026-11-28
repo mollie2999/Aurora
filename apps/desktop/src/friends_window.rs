@@ -118,6 +118,7 @@ fn viewport_ui(app: &mut SteamApp, ui: &mut Ui, actions: &mut Vec<Action>) {
     crate::chrome::border(&ctx, &t);
     crate::shell::friend_dialogs(app, &ctx);
     group_chat::modals(&ctx, &t, &app.state, &app.client, &mut app.friends_window.group_ui);
+    crate::builtin::chat_render::show_lightbox(&ctx, &t);
 }
 
 fn list(app: &mut SteamApp, ui: &mut Ui, actions: &mut Vec<Action>) {

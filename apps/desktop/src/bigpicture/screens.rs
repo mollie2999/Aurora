@@ -70,14 +70,10 @@ pub fn draw(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, pos: f32) -> f32 {
 /// What X does on this page, for the hints.
 pub fn x_hint(bp: &BigPicture) -> Option<String> {
     match bp.page() {
-        Page::Tab(Tab::Library) if bp.library_search_open => Some(t!("Delete").into()),
         Page::Tab(Tab::Library) => Some(t!("Change filter").into()),
         Page::Game(_) => Some(t!("Favorite").into()),
         Page::Install(_) => Some(t!("Desktop shortcut").into()),
-        Page::Profile(_) if bp.profile.comment_open => Some(t!("Delete").into()),
-        Page::ProfileGames(_) if bp.profile.games_search_open => Some(t!("Delete").into()),
-        Page::ProfileEdit if bp.profile.edit_typing() => Some(t!("Delete").into()),
-        Page::Search | Page::Chat(_) => Some(t!("Delete").into()),
+        Page::Search | Page::Chat(_) => Some(t!("Keyboard").into()),
         _ => None,
     }
 }
@@ -85,14 +81,9 @@ pub fn x_hint(bp: &BigPicture) -> Option<String> {
 /// What Y does on this page, for the hints.
 pub fn y_hint(bp: &BigPicture) -> Option<String> {
     match bp.page() {
-        Page::Tab(Tab::Library) if bp.library_search_open => Some(t!("Space").into()),
         Page::Tab(Tab::Library) => Some(t!("Sort").into()),
         Page::Game(_) => Some(t!("Manage").into()),
-        Page::Profile(_) if bp.profile.comment_open => Some(t!("Space").into()),
-        Page::ProfileGames(_) if bp.profile.games_search_open => Some(t!("Space").into()),
         Page::ProfileGames(_) => Some(t!("Sort").into()),
-        Page::ProfileEdit if bp.profile.edit_typing() => Some(t!("Space").into()),
-        Page::Search | Page::Chat(_) => Some(t!("Space").into()),
         _ => None,
     }
 }
@@ -163,7 +154,8 @@ fn capsule(bp: &mut BigPicture, ui: &mut Ui, f: &Frame, r: Rect, hit: &Hit, orde
     let color = w::mix(f.t.text_dim, f.t.text, hit.glow);
     paint::line(c.painter(), pos2(r.left(), text_y), Align2::LEFT_TOP, name, w::font_semibold(19.0 * f.s), color, r.width());
     if !caption.is_empty() {
-        paint::line(c.painter(), pos2(r.left(), text_y + 26.0 * f.s), Align2::LEFT_TOP, caption, w::font(16.0 * f.s), f.t.text_faint, r.width());
+        let caption_size = if f.view.width() <= 1400.0 { 18.0 } else { 16.0 };
+        paint::line(c.painter(), pos2(r.left(), text_y + 26.0 * f.s), Align2::LEFT_TOP, caption, w::font(caption_size * f.s), f.t.text_faint, r.width());
     }
 }
 
@@ -396,7 +388,7 @@ fn home(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f32) -> f32 {
     let shelf_games: Vec<(AppId, String, u64)> = recent.iter().filter(|g| Some(g.0) != first).take(20).cloned().collect();
     if !shelf_games.is_empty() {
         heading(ui, f, &mut y, t!("Recently played"));
-        let tile = vec2(200.0 * s, 300.0 * s);
+        let tile = if f.view.width() <= 1400.0 { vec2(220.0, 330.0) } else { vec2(200.0, 300.0) } * s;
         let tiles = shelf(bp, ui, f, &mut y, "recent", shelf_games.len(), tile, |i| Id::unique(("bp-recent", shelf_games[i].0)));
         for (i, r, hit) in tiles {
             let (id, name, when) = &shelf_games[i];
@@ -734,14 +726,7 @@ fn library_tab(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f32) -> f32
         LibraryFilter::Installed
     };
 
-    if bp.library_search_open {
-        if f.x {
-            bp.library_query.pop();
-        }
-        if f.y {
-            bp.library_query.push(' ');
-        }
-    } else {
+    if !bp.library_search_open {
         if f.x {
             let idx = chips.iter().position(|c| c.0 == current).unwrap_or(0);
             let next = chips[(idx + 1) % chips.len()].0.clone();
@@ -799,36 +784,47 @@ fn library_tab(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f32) -> f32
         if bp.library_search_open || !bp.library_query.is_empty() { Kind::Primary } else { Kind::Secondary },
         &mut x,
         &mut y,
-    ) {
+    ) || (f.x && bp.focus.current == Some(Id::unique("bp-lib-search-btn"))) {
         bp.library_search_open = !bp.library_search_open;
+        if bp.library_search_open {
+            bp.osk.reset_focus();
+        }
     }
     y += 72.0 * s + 24.0 * s;
 
-    // Inline local library search box + OSK when open.
-    if bp.library_search_open {
+    // Inline local library filter box (typing uses the bottom overlay OSK).
+    if bp.library_search_open || !bp.library_query.is_empty() {
         let field_w = (right - left).min(960.0 * s);
         let field = Rect::from_min_size(pos2(left, y), vec2(field_w, 72.0 * s));
+        if bp.library_search_open {
+            bp.osk.field_rect = Some(field);
+        }
+        let hit = bp.focus.item(ui, Id::unique("bp-lib-filter-box"), field, ui.clip_rect(), Place::Page);
         let p = ui.painter().clone();
         p.rect_filled(field, paint::radius(36.0 * s), Color32::from_black_alpha(125));
-        p.rect_stroke(field, paint::radius(36.0 * s), egui::Stroke::new(2.0 * s, f.t.accent.gamma_multiply(0.75)), egui::StrokeKind::Inside);
+        p.rect_stroke(field, paint::radius(36.0 * s), egui::Stroke::new(2.0 * s, f.t.accent.gamma_multiply(if bp.library_search_open { 0.85 } else { 0.45 })), egui::StrokeKind::Inside);
         p.text(pos2(field.left() + 30.0 * s, field.center().y), Align2::LEFT_CENTER, icons::SEARCH, w::font(26.0 * s), f.t.text_dim);
-        let tx = field.left() + 72.0 * s;
-        if bp.library_query.is_empty() {
-            p.text(pos2(tx, field.center().y), Align2::LEFT_CENTER, t!("Filter your library…"), w::font(26.0 * s), f.t.text_faint);
-        } else {
-            paint::line(&p, pos2(tx, field.center().y), Align2::LEFT_CENTER, &bp.library_query, w::font_semibold(26.0 * s), f.t.text, field.right() - tx - 28.0 * s);
+        let inner = Rect::from_min_max(pos2(field.left() + 72.0 * s, field.top() + 10.0 * s), pos2(field.right() - 28.0 * s, field.bottom() - 10.0 * s));
+        super::osk::paint_single_line_field(
+            &p,
+            inner,
+            &bp.library_query,
+            t!("Filter your library…"),
+            w::font_semibold(26.0 * s),
+            &f.t,
+            f.now,
+            bp.library_search_open,
+            if bp.library_search_open { bp.osk.caret } else { bp.library_query.chars().count() },
+            bp.library_search_open && bp.osk.selected_all,
+        );
+        if hit.focused {
+            bp.focus.ring_around(field, 36.0 * s);
+        }
+        if hit.activated || (hit.focused && f.x) {
+            bp.library_search_open = true;
+            bp.osk.reset_focus();
         }
         y += 88.0 * s;
-        match super::osk::draw(bp, ui, f, left, right - left, &mut y, t!("Done")) {
-            Some(super::osk::Key::Char(ch)) => bp.library_query.push(ch),
-            Some(super::osk::Key::Del) => {
-                bp.library_query.pop();
-            }
-            Some(super::osk::Key::Clear) => bp.library_query.clear(),
-            Some(super::osk::Key::Go) => bp.library_search_open = false,
-            None => {}
-        }
-        y += 22.0 * s;
     }
 
     // LT / RT fast-jump through large libraries.
@@ -1858,68 +1854,51 @@ fn shots(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, id: AppId, i: usize) -
 
 // ---------- Search with the shared on-screen keyboard ----------
 
+pub(super) fn search_input_id() -> Id {
+    Id::unique("bp-search-box")
+}
+
 fn search(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f32) -> f32 {
     let s = f.s;
     let mut y = top + 16.0 * s;
     let left = f.view.left() + f.pad;
     let width = f.view.width() - 2.0 * f.pad;
-    // X deletes, Y types a space (on a controller).
-    if f.x && bp.query.pop().is_some() {
-        bp.query_changed = f.now;
-    }
-    if f.y {
-        bp.query.push(' ');
-        bp.query_changed = f.now;
-    }
     // Search a moment after typing stops.
     let q = bp.query.trim().to_string();
     if q != bp.submitted && f.now - bp.query_changed > 0.6 && (q.chars().count() >= 2 || q.is_empty()) {
         bp.submitted = q;
     }
 
-    // The text box.
+    // The search box: focusable & clickable to reopen the overlay OSK after browsing results.
+    let box_id = search_input_id();
     let field = Rect::from_min_size(pos2(left, y), vec2(width.min(1100.0 * s), 80.0 * s));
+    let hit = bp.focus.item(ui, box_id, field, ui.clip_rect(), Place::Page);
     let p = ui.painter().clone();
     p.rect_filled(field, paint::radius(40.0 * s), Color32::from_black_alpha(120));
-    p.rect_stroke(field, paint::radius(40.0 * s), egui::Stroke::new(2.0 * s, f.t.accent.gamma_multiply(0.7)), egui::StrokeKind::Inside);
+    p.rect_stroke(field, paint::radius(40.0 * s), egui::Stroke::new(2.0 * s, f.t.accent.gamma_multiply(if bp.search_osk_open || hit.focused { 0.85 } else { 0.5 })), egui::StrokeKind::Inside);
     p.text(pos2(field.left() + 34.0 * s, field.center().y), Align2::LEFT_CENTER, icons::SEARCH, w::font(28.0 * s), f.t.text_dim);
-    let tx = field.left() + 80.0 * s;
-    let typed = if bp.query.is_empty() {
-        p.text(pos2(tx, field.center().y), Align2::LEFT_CENTER, t!("Type a game's name"), w::font(28.0 * s), f.t.text_faint);
-        Rect::from_min_size(pos2(tx, field.center().y), Vec2::ZERO)
-    } else {
-        // Long text: the end stays in view (the start slides out to the left).
-        let room = field.right() - tx - 40.0 * s;
-        let galley = p.layout_no_wrap(bp.query.clone(), w::font_semibold(30.0 * s), f.t.text);
-        let x = tx - (galley.size().x - room).max(0.0);
-        let rect = Align2::LEFT_CENTER.anchor_size(pos2(x, field.center().y), galley.size());
-        p.with_clip_rect(Rect::from_min_max(pos2(tx, field.top()), pos2(tx + room + 8.0 * s, field.bottom()))).galley(rect.min, galley, f.t.text);
-        rect
-    };
-    let blink = if ((f.now * 2.0) as u64).is_multiple_of(2) { 1.0 } else { 0.25 };
-    p.vline(typed.right() + 4.0 * s, (field.center().y - 18.0 * s)..=(field.center().y + 18.0 * s), egui::Stroke::new(3.0 * s, f.t.accent.gamma_multiply(blink)));
-    y += 80.0 * s + 30.0 * s;
-
-    // The shared on-screen keyboard.
-    match super::osk::draw(bp, ui, f, left, width, &mut y, t!("Search")) {
-        Some(super::osk::Key::Char(ch)) => {
-            bp.query.push(ch);
-            bp.query_changed = f.now;
-        }
-        Some(super::osk::Key::Del) => {
-            bp.query.pop();
-            bp.query_changed = f.now;
-        }
-        Some(super::osk::Key::Clear) => {
-            bp.query.clear();
-            bp.submitted.clear();
-            bp.query_changed = f.now;
-        }
-        Some(super::osk::Key::Go) => bp.submitted = bp.query.trim().to_string(),
-        None => {}
+    let inner = Rect::from_min_max(pos2(field.left() + 80.0 * s, field.top() + 12.0 * s), pos2(field.right() - 32.0 * s, field.bottom() - 12.0 * s));
+    super::osk::paint_single_line_field(
+        &p,
+        inner,
+        &bp.query,
+        t!("Type a game's name"),
+        w::font_semibold(30.0 * s),
+        &f.t,
+        f.now,
+        bp.search_osk_open || hit.focused,
+        bp.osk.caret,
+        (bp.search_osk_open || hit.focused) && bp.osk.selected_all,
+    );
+    if hit.focused {
+        bp.focus.ring_around(field, 40.0 * s);
     }
-    y += 32.0 * s;
-    bp.preferred = Some(Id::unique(("bp-key", 1, 0)));
+    if hit.activated || (hit.focused && !bp.search_osk_open && f.x) {
+        bp.search_osk_open = true;
+        bp.osk.reset_focus();
+    }
+    y += 80.0 * s + 32.0 * s;
+    bp.preferred = Some(box_id);
 
     // Results (semantic AppId focus IDs).
     if bp.submitted.is_empty() {
@@ -2326,7 +2305,7 @@ pub fn chat_history_id() -> Id {
 }
 
 /// The chat's message box (selecting it brings up the keyboard).
-fn chat_input_id() -> Id {
+pub(super) fn chat_input_id() -> Id {
     Id::unique("bp-chat-input")
 }
 
@@ -2381,43 +2360,16 @@ fn chat_page(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, _top: f32, target:
     paint::line(&p, pos2(tx, av.center().y + 4.0 * s), Align2::LEFT_TOP, &status, w::font_medium(20.0 * s), color, right - tx);
     let head_bottom = av.bottom() + 18.0 * s;
 
-    // Opening the keyboard is an action. Pointer focus may change as it moves.
     let input_id = chat_input_id();
-    let want_keys = bp.chat_keys;
-    let k = super::focus::ease(ui.ctx().animate_bool_with_time(Id::unique(("bp-chat-keys", target)), want_keys, 0.25));
-    let keys_max_w = (right - left).min(960.0 * s);
-    let keys_h = super::osk::panel_height(s, keys_max_w, bp.osk);
-    let panel_top = f.view.bottom() - keys_h * k;
+    let screen = ui.max_rect();
+    let input_bottom = if bp.chat_keys {
+        screen.bottom() - super::osk::overlay_height(screen, s, &bp.osk)
+    } else {
+        f.view.bottom()
+    };
     let mut send = std::mem::take(&mut bp.send_now);
-    if k > 0.01 {
-        let screen = ui.max_rect();
-        let panel = Rect::from_min_max(pos2(screen.left(), panel_top), pos2(screen.right(), f.view.bottom() + keys_h));
-        p.rect_filled(panel, 0.0, f.t.chrome.gamma_multiply(0.96));
-        let edge = Rect::from_min_size(panel.min, vec2(panel.width(), 2.0 * s));
-        w::gradient(&p, edge, f.t.accent.gamma_multiply(0.0), f.t.accent.gamma_multiply(0.8), true);
-        let mut ky = panel_top + 22.0 * s;
-        let mut keys_ui = paint::faded(ui, panel, k);
-        if !want_keys {
-            keys_ui.disable();
-        }
-        match super::osk::draw(bp, &mut keys_ui, f, f.view.center().x - keys_max_w / 2.0, keys_max_w, &mut ky, t!("Send")) {
-            Some(super::osk::Key::Char(ch)) => bp.message.push(ch),
-            Some(super::osk::Key::Del) => {
-                bp.message.pop();
-            }
-            Some(super::osk::Key::Clear) => bp.message.clear(),
-            Some(super::osk::Key::Go) => send = true,
-            None => {}
-        }
-    }
 
-    // The message box: grows to four lines, then shows the end of the text.
-    if f.x {
-        bp.message.pop();
-    }
-    if f.y {
-        bp.message.push(' ');
-    }
+    // The message box grows to four lines and keeps the caret visible.
     let send_label = t!("Send");
     let send_w = paint::pill_width(ui, true, send_label, s);
     let field_w = right - left - send_w - 18.0 * s;
@@ -2427,7 +2379,7 @@ fn chat_page(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, _top: f32, target:
     let line_h = ui.fonts_mut(|fonts| fonts.row_height(&font));
     let lines = (galley.size().y / line_h).round().clamp(1.0, 4.0);
     let field_h = (lines * line_h + 34.0 * s).max(72.0 * s);
-    let bottom = panel_top - 20.0 * s;
+    let bottom = input_bottom - 20.0 * s;
     let field = Rect::from_min_max(pos2(left, bottom - field_h), pos2(left + field_w, bottom));
     let hit = bp.focus.item(ui, input_id, field, ui.clip_rect(), Place::Page);
     let r = (36.0 * s).min(field.height() / 2.0);
@@ -2442,20 +2394,23 @@ fn chat_page(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, _top: f32, target:
         p.text(pos2(inner.left(), inner.bottom() - line_h / 2.0), Align2::LEFT_CENTER, t!("Message {name}", name = name), w::font(26.0 * s), f.t.text_faint);
         Rect::from_min_size(pos2(inner.left(), inner.bottom() - line_h), vec2(0.0, line_h))
     } else {
-        // The last lines stay in view (the start scrolls up out of the box).
-        let at = pos2(inner.left(), inner.bottom() - galley.size().y);
-        let end = galley.pos_from_cursor(egui::text::CCursor::new(bp.message.chars().count()));
-        p.with_clip_rect(inner.expand2(vec2(4.0 * s, 0.0))).galley(at, galley, f.t.text);
-        end.translate(at.to_vec2())
+        let cursor = galley.pos_from_cursor(egui::text::CCursor::new(bp.osk.caret));
+        let scroll = (cursor.bottom() - inner.height())
+            .max(0.0)
+            .min(cursor.top());
+        let at = pos2(inner.left(), inner.top() - scroll);
+        let painter = p.with_clip_rect(inner);
+        if bp.osk.selected_all {
+            painter.rect_filled(inner, 3.0, f.t.accent.gamma_multiply(0.30));
+        }
+        painter.galley(at, galley, f.t.text);
+        cursor.translate(at.to_vec2())
     };
     let blink = ((f.now * 3.0).sin() as f32 * 0.5 + 0.5).powf(0.6);
     p.vline(caret.right() + 3.0 * s, (caret.top() + 3.0 * s)..=(caret.bottom() - 3.0 * s), egui::Stroke::new(3.0 * s, f.t.accent.gamma_multiply(blink)));
-    // A on the box: straight to the letters.
-    if hit.activated {
+    if hit.activated || (hit.focused && f.x) {
         bp.chat_keys = true;
-        if want_keys {
-            bp.focus.current = Some(Id::unique(("bp-key", 1, 0)));
-        }
+        bp.osk.reset_focus();
     }
     let empty_box = bp.message.trim().is_empty();
     let (_, send_hit) = button(bp, ui, f, Id::unique(("bp-chat-send", target)), pos2(field.right() + 18.0 * s, bottom - 72.0 * s), send_w, Some(icons::SEND), send_label, if empty_box { Kind::Secondary } else { Kind::Primary }, None);

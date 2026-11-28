@@ -59,23 +59,64 @@ pub fn servers(r: &CMsgGmsClientServerQueryResponse) -> Vec<GameServer> {
 }
 
 pub async fn list(conn: &Connection, app_id: AppId, filter: &str, max: u32) -> Reply {
-    let filter = if filter.contains("\\appid\\") { filter.to_string() } else { format!("\\appid\\{app_id}{filter}") };
-    let req = CGameServersMasterServerQueryRequest {
-        appid: Some(app_id),
-        query_data: Some(CMsgClientGmsServerQuery { app_id: Some(app_id), filter_text: Some(filter), max_servers: Some(if max == 0 { MAX_SERVERS } else { max.min(MAX_SERVERS) }), ..Default::default() }),
-    };
-    match conn.call::<_, CGameServersMasterServerQueryResponse>("GameServers.MasterServerQuery#1", &req).await {
-        Ok(r) => {
-            let r = r.query_response.unwrap_or_default();
-            if !r.error().is_empty() {
-                tracing::info!("server list for {app_id}: {}", r.error());
-            }
-            Reply::Servers { servers: servers(&r) }
-        }
+    match browse(conn, app_id, filter, max).await {
+        Ok(servers) => Reply::Servers { servers },
         Err(e) => {
             tracing::info!("server list for {app_id}: {e}");
             Reply::Servers { servers: Vec::new() }
         }
+    }
+}
+
+/// Query Steam's master server list returning a typed result for desktop UI browsing.
+pub async fn browse(conn: &Connection, app_id: AppId, filter: &str, max: u32) -> Result<Vec<GameServer>, String> {
+    let filter = if filter.contains("\\appid\\") || app_id == 0 {
+        filter.to_string()
+    } else {
+        format!("\\appid\\{app_id}{filter}")
+    };
+    let req = CGameServersMasterServerQueryRequest {
+        appid: Some(app_id),
+        query_data: Some(CMsgClientGmsServerQuery {
+            app_id: Some(app_id),
+            filter_text: Some(filter),
+            max_servers: Some(if max == 0 { MAX_SERVERS } else { max.min(MAX_SERVERS) }),
+            ..Default::default()
+        }),
+    };
+    let r = conn
+        .call::<_, CGameServersMasterServerQueryResponse>("GameServers.MasterServerQuery#1", &req)
+        .await
+        .map_err(|e| e.to_string())?;
+    let r = r.query_response.unwrap_or_default();
+    if !r.error().is_empty() {
+        return Err(r.error().to_string());
+    }
+    Ok(servers(&r))
+}
+
+/// Convert a protocol [`GameServer`] row into a UI [`model::GameServerEntry`].
+pub fn entry_from_wire(s: GameServer) -> model::GameServerEntry {
+    let port = if s.query_port != 0 { s.query_port } else { s.game_port };
+    let addr = local::servers::format_ipv4_port(s.ip, port);
+    model::GameServerEntry {
+        addr,
+        ip: s.ip,
+        game_port: s.game_port,
+        query_port: s.query_port,
+        steam_id: s.steam_id,
+        app_id: s.app_id,
+        name: s.name,
+        map: s.map,
+        game_dir: s.game_dir,
+        description: s.description,
+        players: s.players,
+        max_players: s.max_players,
+        bots: s.bots,
+        password: s.password,
+        secure: s.secure,
+        ping_ms: s.ping,
+        tags: s.tags,
     }
 }
 

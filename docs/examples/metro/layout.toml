@@ -1,0 +1,204 @@
+# MetroSteam layout for Aurora.
+# Metro folds Steam's title bar, menus, nav and bottom bar into ONE flat 38px
+# black strip: root menu | nav | ... | friends · downloads · bell | ACCOUNT | ─ □ ×
+# There is no bottom bar.
+
+# ============================================================================
+# SHELL
+# ============================================================================
+
+[[shell]]
+type = "panel"
+side = "top"
+size = 38
+drag_window = true
+style = { bg = "$chrome", border_bottom = { width = 1, color = "$border" } }
+
+[[shell.children]]
+type = "row"
+align = "center"
+style = { height = 38, padding = 0, gap = 0 }
+
+# Collapsed root menu (Metro shrinks Steam's menu bar to a 28px button).
+[[shell.children.children]]
+type = "menu"
+label = ""
+icon = "menu"
+style = { width = 28, height = 38, radius = 0, bg = "transparent", hover_bg = "$text@0.05", color = "$text", font_size = 14 }
+items = [
+    { label = "Settings", icon = "gear", action = "navigate:settings" },
+    { label = "Downloads", icon = "download", action = "navigate:downloads" },
+    { label = "Friends & Chat", icon = "users", action = "open_friends" },
+    "separator",
+    { label = "Add a Non-Steam Game...", icon = "plus", action = "add_game" },
+    { label = "Activate a Product on Steam...", icon = "key", action = "activate_product" },
+    { label = "Check for Updates...", icon = "refresh", action = "check_updates" },
+    "separator",
+    { label = "Steam Support", icon = "support", action = "open_url:https://help.steampowered.com" },
+    "separator",
+    { label = "Change Account...", action = "logout" },
+    { label = "Exit", icon = "power", action = "exit" },
+]
+
+[[shell.children.children]]
+type = "spacer"
+size = 4
+
+[[shell.children.children]]
+type = "back_forward"
+size = 28
+style = { color = "$text@0.5", hover_color = "$text", font_size = 13 }
+
+# Steam supernav: 13px, white50 -> white75 on hover -> white when selected,
+# 11/8/10 padding, no underline, white05 hover fill.
+[[shell.children.children]]
+type = "nav_tabs"
+direction = "horizontal"
+show_icons = false
+uppercase = true
+profile_as_username = true
+indicator = "none"
+tab_gap = 0
+style = { height = 38, radius = 0, padding = [11, 8, 10, 8], font_size = 13, font_weight = "regular", color = "$text_dim", hover_color = "$text@0.75", active_color = "$text", hover_bg = "$text@0.05" }
+
+[[shell.children.children]]
+type = "spacer"
+flex = true
+
+[[shell.children.children]]
+type = "friends_button"
+icon = "users"
+size = 38
+style = { width = 30, bg = "transparent", hover_bg = "$text@0.05", color = "$text", radius = 0 }
+
+[[shell.children.children]]
+type = "button"
+label = ""
+icon = "download"
+action = "navigate:downloads"
+style = { width = 27, height = 38, radius = 0, bg = "transparent", hover_bg = "$text@0.05", color = "$text", font_size = 13 }
+
+[[shell.children.children]]
+type = "notifications"
+size = 38
+highlight_unread_bg = "$accent"
+style = { width = 30, bg = "transparent", color = "$text", radius = 0 }
+
+[[shell.children.children]]
+type = "account"
+show_avatar = true
+show_name = true
+show_wallet = true
+show_caret = false
+avatar_size = 34
+avatar_radius = 0
+style = { height = 38, radius = 0, padding = [2, 2, 2, 11], gap = 11, font_size = 13, uppercase = true, bg = "transparent", hover_bg = "$text@0.05", color = "$text" }
+
+[[shell.children.children]]
+type = "window_controls"
+variant = "windows"
+height = 38
+
+[[shell]]
+type = "friends_drawer"
+width = 290
+style = { bg = "$bg" }
+
+[[shell]]
+type = "panel"
+side = "center"
+style = { bg = "$bg" }
+
+[[shell.children]]
+type = "page_content"
+
+# ============================================================================
+# LIBRARY
+# ============================================================================
+
+# Black game list: no Home/collections bar (Metro hides it), dropdown with a
+# white12 hairline, boxed search field, solid-accent selection.
+[[library]]
+type = "panel"
+side = "left"
+size = 270
+style = { bg = "$bg", border_right = { width = 1, color = "$border" }, padding = [6, 0, 0, 0], gap = 0 }
+
+[[library.children]]
+type = "box"
+style = { padding = [0, 6, 0, 6] }
+
+[[library.children.children]]
+type = "library_filters"
+variant = "dropdown_icons"
+
+[[library.children]]
+type = "spacer"
+size = 6
+
+[[library.children]]
+type = "box"
+style = { bg = "$bg", border_top = { width = 1, color = "$border" }, border_bottom = { width = 1, color = "$border" }, padding = [3, 6, 3, 6] }
+
+[[library.children.children]]
+type = "library_search"
+placeholder = "Search"
+show_filter_button = true
+style = { bg = "$text@0.10", radius = 0, height = 26 }
+
+[[library.children]]
+type = "library_list"
+group_by = "installed"
+row_height = 24
+icon_size = 16
+group_headers = true
+show_counts = true
+style = { font_size = 13.5, radius = 0, active_bg = "$accent", active_color = "$on_accent", hover_bg = "$text@0.05" }
+
+# Library home: flat black, no glass, square cards.
+[[library]]
+type = "panel"
+side = "center"
+style = { bg = "$bg" }
+
+[[library.children]]
+type = "library_home_or_detail"
+
+[[library.children.children]]
+type = "scroll"
+direction = "vertical"
+
+[[library.children.children.children]]
+type = "box"
+style = { bg = "$bg", padding = [16, 24, 24, 24], gap = 32 }
+
+[[library.children.children.children.children]]
+type = "whats_new_shelf"
+title = "What's New"
+card_width = 318
+card_height = 179
+card_radius = 0
+date_above = true
+max_items = 12
+gap = 12
+
+[[library.children.children.children.children]]
+type = "recent_games_shelf"
+title = "Recent Games"
+featured_first = true
+featured_width = 376
+capsule_width = 179
+capsule_height = 268
+card_radius = 0
+gap = 12
+
+[[library.children.children.children.children]]
+type = "all_games_grid"
+title = "All Games"
+show_count = true
+show_sort = true
+card_aspect = "capsule"
+card_width = 179
+card_height = 268
+card_radius = 0
+gap = 12

@@ -11,12 +11,13 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::ifaces::{This, copy_out, put, slice, text};
-use crate::protocol::{GameEvent, Lobby, LobbyFilter, LobbyMember, Reply, Request};
+use crate::protocol::{FavoriteServer, GameEvent, Lobby, LobbyFilter, LobbyMember, Reply, Request};
 use crate::state::{self, Bytes, lock};
 use crate::vt::Fp;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_char;
 use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub fn imp(name: &str) -> Option<Fp> {
     macro_rules! f {
@@ -25,6 +26,10 @@ pub fn imp(name: &str) -> Option<Fp> {
         };
     }
     match name {
+        "GetFavoriteGameCount" => f!(fav_count),
+        "GetFavoriteGame" => f!(fav_get),
+        "AddFavoriteGame" => f!(fav_add),
+        "RemoveFavoriteGame" => f!(fav_remove),
         "RequestLobbyList" => f!(request_list),
         "AddRequestLobbyListStringFilter" => f!(filter_string),
         "AddRequestLobbyListNumericalFilter" => f!(filter_number),
@@ -85,6 +90,8 @@ struct Lobbies {
     /// Data we changed that Steam hasn't confirmed yet: pushes of older
     /// state mustn't overwrite it.
     unsent: HashSet<(u64, bool)>,
+    favorites: Vec<FavoriteServer>,
+    favorites_fetched: Option<Instant>,
 }
 
 static L: LazyLock<Mutex<Lobbies>> = LazyLock::new(Default::default);
@@ -135,6 +142,120 @@ fn set_pair(pairs: &mut Vec<(String, String)>, key: String, value: String) {
         Some(p) => p.1 = value,
         None => pairs.push((key, value)),
     }
+}
+
+// ------------------------------------------------------ favorites
+
+fn refresh_favorites_if_needed() {
+    let stale = lobbies()
+        .favorites_fetched
+        .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+    if !stale {
+        return;
+    }
+    let favs = match crate::ipc::request(Request::FavoriteServers { history: false }) {
+        Some(Reply::FavoriteServers { servers }) => servers,
+        _ => return,
+    };
+    let mut l = lobbies();
+    l.favorites = favs;
+    l.favorites_fetched = Some(Instant::now());
+}
+
+extern "C" fn fav_count(_t: This) -> i32 {
+    refresh_favorites_if_needed();
+    lobbies().favorites.len() as i32
+}
+
+extern "C" fn fav_get(
+    _t: This,
+    game: i32,
+    app_id: *mut u32,
+    ip: *mut u32,
+    conn_port: *mut u16,
+    query_port: *mut u16,
+    flags: *mut u32,
+    last_played: *mut u32,
+) -> bool {
+    let Ok(idx) = usize::try_from(game) else {
+        return false;
+    };
+    refresh_favorites_if_needed();
+    let Some(entry) = lobbies().favorites.get(idx).cloned() else {
+        return false;
+    };
+    put(app_id, entry.app_id);
+    put(ip, entry.ip);
+    put(conn_port, entry.conn_port);
+    put(query_port, entry.query_port);
+    put(flags, entry.flags);
+    put(last_played, entry.last_played);
+    true
+}
+
+extern "C" fn fav_add(
+    _t: This,
+    app_id: u32,
+    ip: u32,
+    conn_port: u16,
+    query_port: u16,
+    flags: u32,
+    last_played: u32,
+) -> i32 {
+    let entry = FavoriteServer {
+        app_id,
+        ip,
+        conn_port,
+        query_port,
+        flags,
+        last_played,
+    };
+    let idx = {
+        let mut l = lobbies();
+        if let Some(pos) = l
+            .favorites
+            .iter()
+            .position(|f| f.ip == ip && (f.query_port == query_port || f.conn_port == conn_port))
+        {
+            l.favorites[pos] = entry.clone();
+            pos as i32
+        } else {
+            l.favorites.push(entry.clone());
+            l.favorites_fetched = Some(Instant::now());
+            (l.favorites.len() - 1) as i32
+        }
+    };
+    std::thread::spawn(move || {
+        crate::ipc::request(Request::FavoriteServerAdd(entry));
+    });
+    idx
+}
+
+extern "C" fn fav_remove(
+    _t: This,
+    app_id: u32,
+    ip: u32,
+    conn_port: u16,
+    query_port: u16,
+    flags: u32,
+) -> bool {
+    let had = {
+        let mut l = lobbies();
+        let before = l.favorites.len();
+        l.favorites
+            .retain(|f| !(f.ip == ip && (f.query_port == query_port || f.conn_port == conn_port)));
+        l.favorites.len() < before
+    };
+    std::thread::spawn(move || {
+        crate::ipc::request(Request::FavoriteServerRemove {
+            app_id,
+            ip,
+            conn_port,
+            query_port,
+            flags,
+        });
+    });
+    had
 }
 
 // ------------------------------------------------------------ searching

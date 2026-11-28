@@ -109,6 +109,16 @@ pub enum Request {
     /// Game servers from Steam's master server: `filter` in Steam's
     /// "\key\value" form. Answered with [`Reply::Servers`].
     ServerList { filter: String, max: u32 },
+    /// Favorite (`history = false`) or recently played (`history = true`) servers from VDF.
+    FavoriteServers { history: bool },
+    /// Add or update a Favorite/History server entry.
+    FavoriteServerAdd(FavoriteServer),
+    /// Remove a Favorite/History server entry.
+    FavoriteServerRemove { app_id: u32, ip: u32, conn_port: u16, query_port: u16, flags: u32 },
+    /// Servers friends are currently playing (`app_id == 0` = any game).
+    FriendServers { app_id: u32 },
+    /// Mark a player as recently played with (`ISteamFriends::SetPlayedWith`).
+    PlayedWith { steam_id: u64 },
     /// Steam Input bindings for an Xbox-style pad: answered with [`Reply::InputConfig`].
     InputConfig,
     /// Read the currently selected bindings when the launch revision changes.
@@ -132,6 +142,18 @@ pub enum Request {
     /// A SteamNetworkingSockets signal (serialized
     /// `CMsgSteamNetworkingP2PRendezvous`) for another player, through Steam.
     Rendezvous { to: u64, data: Vec<u8> },
+}
+
+/// A saved Favorite or History server entry (`ISteamMatchmaking` / VDF).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FavoriteServer {
+    pub app_id: u32,
+    pub ip: u32,
+    pub conn_port: u16,
+    pub query_port: u16,
+    /// Bit 1 = Favorite, Bit 2 = History.
+    pub flags: u32,
+    pub last_played: u32,
 }
 
 /// A game server as Steam's server browser lists it.
@@ -380,6 +402,7 @@ pub enum Reply {
     ItemDefs { defs: Vec<(i32, Vec<(String, String)>)> },
     PromoItems { eresult: i32, defs: Vec<i32> },
     Servers { servers: Vec<GameServer> },
+    FavoriteServers { servers: Vec<FavoriteServer> },
     /// A controller_mappings VDF (empty: none found) and where it came from.
     InputConfig { bindings: String, source: String },
     InputLayout { revision: u64, bindings: String, source: String },

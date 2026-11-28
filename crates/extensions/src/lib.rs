@@ -129,6 +129,10 @@ pub enum Action {
     ReloadThemes,
     /// Set a user-configurable option on an installed theme.
     SetThemeOption { theme_id: String, key: String, value: String },
+    /// Toggle compact single-column library Small Mode.
+    ToggleSmallMode,
+    /// Enter Big Picture Mode.
+    EnterBigPicture,
 }
 
 /// Read-only info about an installed extension.

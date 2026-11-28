@@ -65,13 +65,17 @@ pub fn events(local: &local::LocalState) -> Vec<Event> {
     ];
     let mut history: Vec<ChatMessage> = chat
         .iter()
-        .map(|(from, text, ago)| ChatMessage {
-            friend: ferris,
-            from: *from,
-            text: (*text).into(),
-            time: now - ago,
-            invite: None,
-            group_invite: None,
+        .map(|(from, text, ago)| {
+            let parsed = model::chat::parse_message(text);
+            ChatMessage {
+                friend: ferris,
+                from: *from,
+                text: parsed.text,
+                time: now - ago,
+                invite: parsed.invite,
+                group_invite: parsed.group_invite,
+                media: parsed.media,
+            }
         })
         .collect();
     history.push(ChatMessage {
@@ -81,6 +85,7 @@ pub fn events(local: &local::LocalState) -> Vec<Event> {
         time: now - 420,
         invite: None,
         group_invite: Some(GroupInviteRef::Link { code: "DEMO99".into() }),
+        media: Vec::new(),
     });
     events.push(Event::History { friend: ferris, messages: history });
     let summary = "Collector of indie gems and long co-op nights.\n\nCurrently: replaying Hades on the hardest heat, slowly finishing Stardew Valley's community center, and trying every Portal 2 workshop map my friends send me.\n\nAdd me if you want to play co-op, trade cards or just chat about games. I'm usually online in the evenings.";
@@ -104,6 +109,7 @@ pub fn events(local: &local::LocalState) -> Vec<Event> {
         time: now - 30,
         invite: None,
         group_invite: None,
+        media: Vec::new(),
     }));
     events.extend(group_chats(me, now));
     events.extend(inventory(me, now));
@@ -228,6 +234,7 @@ fn group_chats(me: u64, now: u64) -> Vec<Event> {
                     server_msg: Some(GroupServerMessage { kind: 4, string_param: String::new(), account_id_param: steam_id_to_account(quartz) }),
                     reactions: vec![],
                     mentioned_me: false,
+                    media: vec![],
                 },
                 GroupMessage {
                     group_id: gid1,
@@ -245,6 +252,7 @@ fn group_chats(me: u64, now: u64) -> Vec<Event> {
                         MessageReaction { reaction_type: 1, reaction: "🎉".into(), count: 2, reacted: false },
                     ],
                     mentioned_me: true,
+                    media: vec![],
                 },
                 GroupMessage {
                     group_id: gid1,
@@ -259,6 +267,7 @@ fn group_chats(me: u64, now: u64) -> Vec<Event> {
                     server_msg: None,
                     reactions: vec![MessageReaction { reaction_type: 1, reaction: "🔥".into(), count: 1, reacted: false }],
                     mentioned_me: false,
+                    media: vec![],
                 },
             ],
         },
@@ -280,6 +289,7 @@ fn group_chats(me: u64, now: u64) -> Vec<Event> {
                 server_msg: None,
                 reactions: vec![],
                 mentioned_me: false,
+                media: vec![],
             }],
         },
         Event::GroupInviteLinks {
@@ -739,15 +749,35 @@ pub fn spawn(rt: &tokio::runtime::Handle, local: &local::LocalState, sink: clien
         let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                Command::SendMessage { to, text } => sink(Event::Message(ChatMessage {
-                    friend: to, from: me, text, time: now(), invite: None, group_invite: None,
-                })),
+                Command::SendMessage { to, text } => {
+                    let parsed = model::chat::parse_message(&text);
+                    sink(Event::Message(ChatMessage {
+                        friend: to,
+                        from: me,
+                        text: parsed.text,
+                        time: now(),
+                        invite: parsed.invite,
+                        group_invite: parsed.group_invite,
+                        media: parsed.media,
+                    }));
+                }
                 Command::SendGroupMessage { group_id, chat_id, text } => {
                     ordinal += 1;
+                    let parsed = model::chat::parse_message(&text);
                     sink(Event::GroupMessage(GroupMessage {
-                        group_id, chat_id, from: me, text, time: now(), ordinal,
-                        invite: None, group_invite: None, deleted: false, server_msg: None,
-                        reactions: Vec::new(), mentioned_me: false,
+                        group_id,
+                        chat_id,
+                        from: me,
+                        text: parsed.text,
+                        time: now(),
+                        ordinal,
+                        invite: parsed.invite,
+                        group_invite: parsed.group_invite,
+                        deleted: false,
+                        server_msg: None,
+                        reactions: Vec::new(),
+                        mentioned_me: false,
+                        media: parsed.media,
                     }));
                 }
                 Command::LoadProfileEdit { .. } => sink(Event::ProfileEdit(Ok(demo_edit.clone()))),

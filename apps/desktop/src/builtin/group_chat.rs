@@ -453,7 +453,7 @@ fn message_feed(
                         last = None;
                         continue;
                     }
-                    if m.text.is_empty() && m.invite.is_none() && m.group_invite.is_none() {
+                    if m.text.is_empty() && m.media.is_empty() && m.invite.is_none() && m.group_invite.is_none() {
                         continue;
                     }
                     let new_group = last.is_none_or(|(from, time)| from != m.from || m.time.saturating_sub(time) > 300);
@@ -609,14 +609,41 @@ fn group_message_body(
     _ui_state: &mut GroupUiState,
     actions: &mut Vec<Action>,
 ) {
+    let can_delete = m.from == state.steam_id || perms.can_kick;
+    let populate_menu = |ui: &mut Ui| {
+        ui.horizontal(|ui| {
+            for emoji in QUICK_REACTIONS {
+                if ui.small_button(*emoji).clicked() {
+                    let already = m.reactions.iter().any(|r| r.reaction == *emoji && r.reacted);
+                    client.send(Command::UpdateGroupReaction {
+                        group_id: g.id,
+                        chat_id,
+                        timestamp: m.time as u32,
+                        ordinal: m.ordinal,
+                        reaction_type: 1,
+                        reaction: (*emoji).to_string(),
+                        add: !already,
+                    });
+                    ui.close();
+                }
+            }
+        });
+        super::chat_render::context_menu_items(ui, t, &m.text, &m.media);
+        if can_delete && m.ordinal > 0 && ui.button(w::text(format!("{}  {}", icons::TRASH, t!("Delete message")), 13.5, t.danger)).clicked() {
+            client.send(Command::DeleteGroupMessages { group_id: g.id, chat_id, messages: vec![(m.time as u32, m.ordinal)] });
+            ui.close();
+        }
+    };
+    let mut text_resp = None;
     let resp = egui::Frame::new()
         .fill(if m.mentioned_me { t.accent.gamma_multiply(0.10) } else { Color32::TRANSPARENT })
         .corner_radius(t.corner_small())
         .inner_margin(if m.mentioned_me { Margin::symmetric(6, 2) } else { Margin::ZERO })
         .show(ui, |ui| {
             if !m.text.is_empty() {
-                ui.add(egui::Label::new(w::text(&m.text, 14.0, t.text)).wrap());
+                text_resp = Some(super::chat_render::render_message_text(ui, t, &m.text, &m.media, t.text));
             }
+            super::chat_render::render_media(ui, t, &m.text, &m.media);
             if let Some(inv) = &m.invite {
                 let mut join = None;
                 game_invite_card(ui, t, state, inv, m.from == state.steam_id, &mut join);
@@ -654,34 +681,10 @@ fn group_message_body(
         })
         .response;
 
-    let can_delete = m.from == state.steam_id || perms.can_kick;
-    resp.context_menu(|ui| {
-        ui.horizontal(|ui| {
-            for emoji in QUICK_REACTIONS {
-                if ui.small_button(*emoji).clicked() {
-                    let already = m.reactions.iter().any(|r| r.reaction == *emoji && r.reacted);
-                    client.send(Command::UpdateGroupReaction {
-                        group_id: g.id,
-                        chat_id,
-                        timestamp: m.time as u32,
-                        ordinal: m.ordinal,
-                        reaction_type: 1,
-                        reaction: (*emoji).to_string(),
-                        add: !already,
-                    });
-                    ui.close();
-                }
-            }
-        });
-        if !m.text.is_empty() && ui.button(format!("{}  {}", icons::COPY, t!("Copy"))).clicked() {
-            ui.ctx().copy_text(m.text.clone());
-            ui.close();
-        }
-        if can_delete && m.ordinal > 0 && ui.button(w::text(format!("{}  {}", icons::TRASH, t!("Delete message")), 13.5, t.danger)).clicked() {
-            client.send(Command::DeleteGroupMessages { group_id: g.id, chat_id, messages: vec![(m.time as u32, m.ordinal)] });
-            ui.close();
-        }
-    });
+    if let Some(tr) = text_resp {
+        tr.context_menu(populate_menu);
+    }
+    resp.context_menu(populate_menu);
 }
 
 /// Inline group chat invite card shared by 1:1 chat and group chat messages.
@@ -1264,6 +1267,7 @@ mod tests {
                 server_msg: None,
                 reactions: Vec::new(),
                 mentioned_me: false,
+                media: Vec::new(),
             }));
         }
         let mut ui_state = GroupUiState::default();

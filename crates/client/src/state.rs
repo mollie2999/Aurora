@@ -50,6 +50,14 @@ pub struct State {
     /// Games whose install script is running before they start: the step.
     pub install_script: HashMap<AppId, String>,
     pub comments: crate::read_cache::ReadCache<SteamId, Result<model::Comments, String>, 64>,
+    /// Profile showcases, in the owner's order.
+    pub showcases: crate::read_cache::ReadCache<SteamId, Result<Vec<model::Showcase>, String>, 64>,
+    /// Steam's profile page data (right column, top friends, recent activity).
+    pub profile_pages: crate::read_cache::ReadCache<SteamId, Result<model::ProfilePage, String>, 64>,
+    /// Previous names per profile.
+    pub aliases: crate::read_cache::ReadCache<SteamId, Result<Vec<model::Alias>, String>, 64>,
+    /// Custom profile URLs (lowercase) resolved to SteamIDs.
+    pub vanity_ids: crate::read_cache::ReadCache<String, Result<SteamId, String>, 64>,
     pub badges: crate::read_cache::ReadCache<SteamId, Result<model::Badges, String>, 64>,
     /// Profile reviews by (profile, page).
     pub reviews: crate::read_cache::ReadCache<(SteamId, u32), Result<model::UserReviews, String>, 64>,
@@ -88,6 +96,14 @@ pub struct State {
     pub achievements: HashMap<AppId, (u32, u32)>,
     /// Game server details asked for with "View server info".
     pub servers: HashMap<String, Result<crate::a2s::ServerInfo, String>>,
+    /// Cached A2S_PLAYER lists keyed by `"ip:port"`.
+    pub server_players: HashMap<String, Result<Vec<crate::a2s::ServerPlayer>, String>>,
+    /// Cached A2S_RULES key/value lists keyed by `"ip:port"`.
+    pub server_rules: HashMap<String, Result<Vec<(String, String)>, String>>,
+    /// Steam Community "Recently Played With" coplay list.
+    pub recent_players: Option<Result<Vec<model::RecentPlayer>, String>>,
+    /// Players seen in-session via `ISteamFriends::SetPlayedWith`.
+    pub session_coplay: Vec<(SteamId, AppId, u64)>,
     /// A game's achievement list, once loaded.
     pub achievement_list: crate::read_cache::ReadCache<AppId, Result<Vec<model::Achievement>, String>, 64>,
     pub downloads: HashMap<AppId, model::DownloadStatus>,
@@ -198,6 +214,10 @@ impl State {
                 *self = State { last_error: Some(msg.clone()), ..Default::default() };
             }
             Event::LoggedIn { steam_id, account } => {
+                if self.steam_id != *steam_id {
+                    self.family = None;
+                    self.family_action = None;
+                }
                 self.phase = Phase::LoggedIn;
                 self.steam_id = *steam_id;
                 self.account = account.clone();
@@ -240,6 +260,23 @@ impl State {
             Event::Comments { steam_id, result } => {
                 self.comments.insert(*steam_id, result.clone());
             }
+            Event::Showcases { steam_id, result } => {
+                self.showcases.insert(*steam_id, result.clone());
+            }
+            Event::ProfilePage { steam_id, result } => {
+                self.profile_pages.insert(*steam_id, result.clone());
+            }
+            Event::Aliases { steam_id, result } => {
+                self.aliases.insert(*steam_id, result.clone());
+            }
+            Event::ProfileUrlResolved { vanity, result } => {
+                self.vanity_ids.insert(vanity.clone(), result.clone());
+            }
+            Event::AliasesCleared(Ok(())) => {
+                let me = self.steam_id;
+                self.aliases.insert(me, Ok(Vec::new()));
+            }
+            Event::AliasesCleared(Err(_)) => {}
             Event::Badges { steam_id, result } => {
                 self.badges.insert(*steam_id, result.clone());
             }
@@ -347,7 +384,22 @@ impl State {
                 _ => self.purchases = Some(result.clone()),
             },
             Event::LicenseList(r) => self.licenses = Some(r.clone()),
-            Event::Family(r) => self.family = Some(r.clone()),
+            Event::Family { steam_id, result } => {
+                if self.phase == Phase::LoggedIn && self.steam_id == *steam_id {
+                    self.family = Some(result.clone());
+                }
+            }
+            Event::PreferredCopyChanged { steam_id, family_id, app_id, lender, result, .. } => {
+                if self.phase == Phase::LoggedIn
+                    && self.steam_id == *steam_id
+                    && result.is_ok()
+                    && let Some(Ok(status)) = self.family.as_mut()
+                    && let Some(family) = status.family.as_mut()
+                    && family.id == *family_id
+                {
+                    family.set_preferred_copy(*app_id, *lender);
+                }
+            }
             Event::FamilyAction(r) => {
                 let seq = self.family_action.as_ref().map_or(1, |(s, _)| s.saturating_add(1));
                 self.family_action = Some((seq, r.clone()));
@@ -403,7 +455,21 @@ impl State {
             Event::Friends(list) => self.friends = list.iter().copied().collect(),
             Event::Personas(list) => {
                 for p in list {
-                    self.personas.insert(p.steam_id, p.clone());
+                    let mut p = p.clone();
+                    if p.steam_id == self.steam_id {
+                        if p.state == model::PersonaState::Invisible {
+                            // Invisible: friends don't see our game, so we
+                            // don't show it on our own status either.
+                            hide_game(&mut p);
+                        } else if !p.in_game() {
+                            // Steam's echoes of our own persona often leave
+                            // the game out; keep the game we know is running
+                            // so our status stays "In game" (green) instead
+                            // of falling back to Online.
+                            p.game_app_id = self.playing;
+                        }
+                    }
+                    self.personas.insert(p.steam_id, p);
                 }
             }
             Event::Message(m) => {
@@ -667,9 +733,13 @@ impl State {
                 self.playing = Some(*app_id);
                 self.game_lobby = None;
                 self.game_connect = None;
-                // Show it on our own status right away, like Steam.
+                // Show it on our own status right away, like Steam (unless
+                // we're invisible).
                 let me = self.steam_id;
-                self.personas.entry(me).or_insert_with(|| Persona { steam_id: me, ..Default::default() }).game_app_id = Some(*app_id);
+                let p = self.personas.entry(me).or_insert_with(|| Persona { steam_id: me, ..Default::default() });
+                if p.state != model::PersonaState::Invisible {
+                    p.game_app_id = Some(*app_id);
+                }
             }
             Event::GameStopped { app_id } => {
                 if self.launching == Some(*app_id) {
@@ -771,6 +841,21 @@ impl State {
             | Event::ControllerLayoutDownloaded { .. }
             | Event::ControllerLayoutRoute { .. }
             | Event::ControllerLayoutApplied { .. } => {}
+            Event::GameServerList { .. } | Event::LanServerList { .. } => {}
+            Event::ServerPlayers { addr, result } => {
+                self.server_players.insert(addr.clone(), result.clone());
+            }
+            Event::ServerRules { addr, result } => {
+                self.server_rules.insert(addr.clone(), result.clone());
+            }
+            Event::RecentPlayers(r) => {
+                self.recent_players = Some(r.clone());
+            }
+            Event::CoplayRecorded { steam_id, app_id, time } => {
+                self.session_coplay.retain(|(id, _, _)| *id != *steam_id);
+                self.session_coplay.insert(0, (*steam_id, *app_id, *time));
+                self.session_coplay.truncate(200);
+            }
         }
     }
 
@@ -882,6 +967,16 @@ impl State {
     }
 }
 
+/// Drop everything that says what a persona is playing.
+fn hide_game(p: &mut Persona) {
+    p.game_app_id = None;
+    p.game_name = None;
+    p.rich_status = None;
+    p.server = None;
+    p.lobby = None;
+    p.connect = None;
+}
+
 fn same_group_msg(a: &GroupMessage, b: &GroupMessage) -> bool {
     if a.ordinal != 0 && b.ordinal != 0 {
         a.time == b.time && a.ordinal == b.ordinal
@@ -977,6 +1072,54 @@ fn merge_group(dst: &mut ChatGroup, prev: &ChatGroup, summary_only: bool) {
 }
 
 #[cfg(test)]
+mod family_tests {
+    use super::*;
+    use model::{Family, FamilyStatus, SharedApp};
+
+    fn snapshot(steam_id: SteamId) -> Event {
+        let family = Family {
+            id: 5,
+            shared: vec![SharedApp { app_id: 10, name: "Game".into(), owners: vec![20, 30], excluded: false }],
+            shared_available: true,
+            ..Default::default()
+        };
+        Event::Family { steam_id, result: Ok(FamilyStatus { family: Some(family), ..Default::default() }) }
+    }
+
+    #[test]
+    fn account_switch_discards_late_family_snapshots() {
+        let mut state = State::default();
+        state.apply(&Event::LoggedIn { steam_id: 20, account: "first".into() });
+        state.apply(&snapshot(20));
+        assert!(state.family.is_some());
+
+        state.apply(&Event::LoggedIn { steam_id: 30, account: "second".into() });
+        state.apply(&snapshot(20));
+        assert!(state.family.is_none());
+        state.apply(&snapshot(30));
+        assert!(state.family.is_some());
+    }
+
+    #[test]
+    fn preferred_copy_changes_only_when_steam_accepts_for_this_family() {
+        let mut state = State::default();
+        state.apply(&Event::LoggedIn { steam_id: 20, account: "me".into() });
+        state.apply(&snapshot(20));
+        let reply = |steam_id, family_id, result| Event::PreferredCopyChanged {
+            request_id: 1, steam_id, family_id, app_id: 10, lender: 30, result,
+        };
+        let preferred = |state: &State| state.family.as_ref().unwrap().as_ref().unwrap().family.as_ref().unwrap().preferred_copy(10);
+
+        for event in [reply(20, 5, Err("rejected".into())), reply(30, 5, Ok(())), reply(20, 6, Ok(()))] {
+            state.apply(&event);
+            assert_eq!(preferred(&state), None);
+        }
+        state.apply(&reply(20, 5, Ok(())));
+        assert_eq!(preferred(&state), Some(30));
+    }
+}
+
+#[cfg(test)]
 mod notification_tests {
     use super::*;
     use model::{Notification, Notifications};
@@ -1027,6 +1170,7 @@ mod group_tests {
             server_msg: None,
             reactions: Vec::new(),
             mentioned_me: false,
+            media: Vec::new(),
         };
         s.apply(&Event::GroupMessage(msg.clone()));
         // Duplicate delivery is ignored.
@@ -1077,6 +1221,49 @@ mod group_tests {
         assert_eq!(r.fraction(), 0.8);
         s.apply(&Event::RestoreFinished { result: Err("cancelled".into()) });
         assert!(s.restoring.is_none());
+    }
+
+    #[test]
+    fn own_persona_stays_in_game_while_playing() {
+        let mut s = State { steam_id: 7, ..Default::default() };
+        s.apply(&Event::GameStarted { app_id: 730 });
+        // Steam echoes our persona without the game.
+        s.apply(&Event::Personas(vec![Persona { steam_id: 7, state: model::PersonaState::Online, ..Default::default() }]));
+        assert_eq!(s.me().unwrap().game_app_id, Some(730));
+        // Friends are taken as Steam sends them.
+        s.apply(&Event::Personas(vec![Persona { steam_id: 8, ..Default::default() }]));
+        assert!(!s.persona(8).in_game());
+        // Once the game closes, a later echo shows plain Online again.
+        s.apply(&Event::GameStopped { app_id: 730 });
+        s.apply(&Event::Personas(vec![Persona { steam_id: 7, ..Default::default() }]));
+        assert!(!s.me().unwrap().in_game());
+    }
+
+    #[test]
+    fn own_persona_hides_game_while_invisible() {
+        use model::PersonaState::{Invisible, Online};
+        let mut s = State { steam_id: 7, ..Default::default() };
+        s.apply(&Event::Personas(vec![Persona { steam_id: 7, state: Invisible, ..Default::default() }]));
+        // Starting a game while invisible doesn't show it.
+        s.apply(&Event::GameStarted { app_id: 730 });
+        assert!(!s.me().unwrap().in_game());
+        // Nor does an echo that carries the game.
+        s.apply(&Event::Personas(vec![Persona {
+            steam_id: 7,
+            state: Invisible,
+            game_app_id: Some(730),
+            rich_status: Some("In a match".into()),
+            ..Default::default()
+        }]));
+        let me = s.me().unwrap();
+        assert!(!me.in_game());
+        assert!(me.rich_status.is_none());
+        // Going online again while still playing shows the game.
+        s.apply(&Event::Personas(vec![Persona { steam_id: 7, state: Online, ..Default::default() }]));
+        assert_eq!(s.me().unwrap().game_app_id, Some(730));
+        // Going invisible mid-game hides it again.
+        s.apply(&Event::Personas(vec![Persona { steam_id: 7, state: Invisible, game_app_id: Some(730), ..Default::default() }]));
+        assert!(!s.me().unwrap().in_game());
     }
 
     #[test]

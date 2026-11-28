@@ -821,6 +821,331 @@ pub enum ProfileSave {
     Badge,
 }
 
+/// Profile comments shown per page.
+pub const COMMENTS_PER_PAGE: u32 = 6;
+
+/// What Steam's profile page shows besides the showcases: the right column
+/// (level, featured badge, status, badges, counts, groups, top friends) and
+/// recent activity. Texts are in the language the page was asked in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfilePage {
+    pub level: Option<u32>,
+    pub featured_badge: Option<PageBadge>,
+    /// "online", "in-game" or "offline".
+    pub status: String,
+    /// e.g. "Currently Offline".
+    pub status_header: String,
+    /// e.g. the game, or "Last Online 5 days ago".
+    pub status_detail: String,
+    /// The few badges Steam shows (newest first).
+    pub badges: Vec<PageBadge>,
+    /// The count links ("Badges 32", "Games 124"…), in Steam's order.
+    pub counts: Vec<PageCount>,
+    pub groups: Vec<PageGroup>,
+    /// Steam's top friends (by level).
+    pub friends: Vec<PageFriend>,
+    /// e.g. "47.8 hours past 2 weeks".
+    pub recent_playtime: String,
+    pub recent: Vec<RecentGame>,
+    /// The profile theme as the page's body class has it, without "Theme":
+    /// "Summer", "Cosmic", "GameProfile"… ("" = Steam's default).
+    #[serde(default)]
+    pub theme: String,
+    /// A game profile's own colors (`--gradient-right` → value), from the
+    /// page's `body.GameProfileTheme { … }` rule.
+    #[serde(default)]
+    pub theme_vars: Vec<(String, String)>,
+    /// The country flag next to the location (Steam's `countryflags/xx.gif`).
+    #[serde(default)]
+    pub country_flag: String,
+    /// Steam's "You have <a>1 group</a> in common" (HTML, in the page's
+    /// language) under Groups, and the same for friends; "" when none.
+    #[serde(default)]
+    pub groups_in_common: String,
+    #[serde(default)]
+    pub common_groups: Option<Result<Vec<UserGroup>, String>>,
+    #[serde(default)]
+    pub friends_in_common: String,
+    #[serde(default)]
+    pub mutual_friends: Option<Result<Vec<PageFriend>, String>>,
+    /// The "Join Game" link under an in-game status (e.g.
+    /// `steam://joinlobby/381210/<lobby>/<owner>`); "" when there's none.
+    #[serde(default)]
+    pub join_link: String,
+    /// Completionist showcases as the page draws them, in page order.
+    #[serde(default)]
+    pub completionist: Vec<PageCompletionist>,
+    /// Workshop showcases as the page draws them, in page order.
+    #[serde(default)]
+    pub workshop: Vec<PageWorkshop>,
+    #[serde(default)]
+    pub awards: Vec<PageAwards>,
+    #[serde(default)]
+    pub collectors: Vec<PageCollector>,
+    #[serde(default)]
+    pub guides: Vec<PageGuide>,
+    #[serde(default)]
+    pub showcase_items: Vec<(u64, String)>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PageGuide {
+    pub id: u64,
+    pub image: String,
+    pub title: String,
+    pub creator: String,
+    pub app: String,
+    pub app_icon: String,
+    pub rating_icon: String,
+    pub ratings: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PageCollector {
+    pub stats: Vec<PageStat>,
+    pub games: Vec<AppId>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PageAwards {
+    pub items: Vec<(String, String, String)>,
+    pub stats: Vec<PageStat>,
+}
+
+/// Steam's Completionist Showcase: game headers with their achievement
+/// counts, and the stats row under them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageCompletionist {
+    pub games: Vec<PageCompletedGame>,
+    /// ("10", "Completed Games"), ("38%", "Avg. Game Completion Rate")…
+    pub stats: Vec<PageStat>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageCompletedGame {
+    pub app_id: AppId,
+    /// The game's header picture (460×215).
+    pub image: String,
+    /// e.g. "49 Achievements".
+    pub achievements: String,
+    /// e.g. "10 RARE"; "" when none.
+    pub rare: String,
+    /// The profile's achievements page for this game.
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageStat {
+    pub value: String,
+    pub label: String,
+    /// Where the stat links to; "" when it doesn't.
+    pub url: String,
+    pub tooltip: String,
+}
+
+/// Steam's Workshop Showcase: the owner's workshop header, their newest
+/// items and the stats row.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageWorkshop {
+    /// e.g. "Another Duck's Workshop".
+    pub title: String,
+    pub url: String,
+    pub avatar: Option<String>,
+    pub items: Vec<PageWorkshopItem>,
+    pub stats: Vec<PageStat>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageWorkshopItem {
+    pub id: u64,
+    pub app_id: AppId,
+    /// The item's preview at its own shape.
+    pub image: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageBadge {
+    pub name: String,
+    /// e.g. "Level 3 Necesse Badge" or "100 XP".
+    pub detail: String,
+    pub icon: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageCount {
+    /// Which list: "badges", "games", "inventory", "screenshots", "videos",
+    /// "workshop", "reviews", "guides", "artwork", "groups", "friends"…
+    pub key: String,
+    pub label: String,
+    pub count: Option<u32>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageGroup {
+    pub name: String,
+    pub url: String,
+    pub avatar: Option<String>,
+    /// e.g. "2 Members".
+    pub members: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageFriend {
+    pub steam_id: SteamId,
+    pub name: String,
+    pub avatar: Option<String>,
+    /// "online", "in-game" or "offline".
+    pub status: String,
+    /// e.g. ["In-Game", "Counter-Strike 2"] or ["Last Online 6 days ago"].
+    pub lines: Vec<String>,
+    pub level: u32,
+}
+
+/// A game in a profile's Recent Activity.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecentGame {
+    pub app_id: AppId,
+    pub name: String,
+    pub capsule: Option<String>,
+    /// e.g. ["1,234 hrs on record", "last played on 25 Nov"].
+    pub details: Vec<String>,
+    /// e.g. "203 / 318 Achievements" ("" for games without them).
+    pub achievements: String,
+    /// e.g. "93 Rare".
+    pub rare: String,
+    /// Unlocked share, 0..1.
+    pub progress: f32,
+    /// (name, icon)
+    pub icons: Vec<(String, String)>,
+    /// e.g. "+198".
+    pub more: String,
+    /// e.g. "Screenshots 5".
+    pub screenshots: String,
+    /// The game's badge this profile earned, if any (e.g. "Clawing", "200 XP").
+    #[serde(default)]
+    pub badge: Option<PageBadge>,
+    /// e.g. "Review 1", if this profile reviewed the game.
+    #[serde(default)]
+    pub review: String,
+    #[serde(default)]
+    pub review_url: String,
+}
+
+/// A name a profile used before, and when it changed (Steam's wording).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Alias {
+    pub name: String,
+    pub changed: String,
+}
+
+/// A showcase on a Steam profile, in the order its owner arranged them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Showcase {
+    /// Steam's `EProfileCustomizationType`; see [`showcase`].
+    pub kind: i32,
+    /// Steam's `EProfileCustomizationStyle` (layout variant).
+    pub style: i32,
+    pub slots: Vec<ShowcaseSlot>,
+    /// The Favorite Group showcase's group.
+    pub group: Option<ShowcaseGroup>,
+    /// Achievement progress for the games this showcase shows.
+    pub games: Vec<ShowcaseGame>,
+}
+
+/// One filled slot of a showcase.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShowcaseSlot {
+    pub app_id: AppId,
+    /// A screenshot, artwork, workshop item or guide.
+    pub file: Option<ShowcaseFile>,
+    /// An inventory item: asset and context id (in `app_id`'s inventory).
+    pub asset_id: u64,
+    pub context_id: u64,
+    /// Custom text box title, or an achievement's API name.
+    pub title: String,
+    /// Custom text box body (BBCode).
+    pub notes: String,
+    pub account_id: u32,
+    pub badge_id: u32,
+    pub border_color: u32,
+    /// The achievement this slot features (achievement showcases).
+    pub achievement: Option<ShowcaseAchievement>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShowcaseFile {
+    pub id: u64,
+    pub title: String,
+    /// Picture to show (preview, or the screenshot itself).
+    pub image: Option<String>,
+    pub app_id: AppId,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShowcaseAchievement {
+    pub name: String,
+    pub description: String,
+    pub icon: String,
+    /// Share of players who have it, 0-100.
+    pub percent: f32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShowcaseGroup {
+    pub name: String,
+    #[serde(default)]
+    pub headline: String,
+    pub url: String,
+    pub avatar: Option<String>,
+    pub members: u32,
+    pub in_game: u32,
+    pub online: u32,
+    pub in_chat: u32,
+}
+
+/// A game's achievements as a profile shows them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShowcaseGame {
+    pub app_id: AppId,
+    pub unlocked: u32,
+    pub total: u32,
+    /// Unlocked achievements fewer than 10% of players have.
+    pub rare: u32,
+    /// Unlocked achievements, rarest first.
+    pub recent: Vec<ShowcaseAchievement>,
+}
+
+/// Steam's `EProfileCustomizationType` values.
+pub mod showcase {
+    pub const RARE_ACHIEVEMENTS: i32 = 1;
+    pub const GAME_COLLECTOR: i32 = 2;
+    pub const ITEMS: i32 = 3;
+    pub const TRADE: i32 = 4;
+    pub const BADGES: i32 = 5;
+    pub const FAVORITE_GAME: i32 = 6;
+    pub const SCREENSHOTS: i32 = 7;
+    pub const CUSTOM_TEXT: i32 = 8;
+    pub const FAVORITE_GROUP: i32 = 9;
+    pub const REVIEW: i32 = 10;
+    pub const WORKSHOP: i32 = 11;
+    pub const MY_WORKSHOP: i32 = 12;
+    pub const ARTWORK: i32 = 13;
+    pub const VIDEO: i32 = 14;
+    pub const GUIDES: i32 = 15;
+    pub const MY_GUIDES: i32 = 16;
+    pub const ACHIEVEMENTS: i32 = 17;
+    pub const GREENLIGHT: i32 = 18;
+    pub const MY_GREENLIGHT: i32 = 19;
+    pub const SALIEN: i32 = 20;
+    pub const REACTIONS: i32 = 21;
+    pub const SINGLE_ARTWORK: i32 = 22;
+    pub const COMPLETIONIST: i32 = 23;
+    pub const REPLAY: i32 = 24;
+}
+
 /// A comment on a profile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Comment {
@@ -1175,6 +1500,71 @@ pub struct Family {
     pub slot_cooldown: u32,
     /// Games shared in the family, with who owns them.
     pub shared: Vec<SharedApp>,
+    /// Whether Steam returned its shared library successfully.
+    #[serde(default)]
+    pub shared_available: bool,
+    /// DLC owned in the family, with the game each belongs to.
+    #[serde(default)]
+    pub shared_dlc: Vec<SharedDlc>,
+    /// Whether the DLC list includes all entries returned by Steam.
+    #[serde(default)]
+    pub shared_dlc_complete: bool,
+    /// Your preferred copy per game: (app, lender).
+    #[serde(default)]
+    pub preferred: Vec<(AppId, SteamId)>,
+}
+
+impl Family {
+    fn shareable_app(&self, app_id: AppId) -> Option<&SharedApp> {
+        self.shared.iter().find(|a| a.app_id == app_id && !a.excluded)
+    }
+
+    /// The copy Steam has saved as preferred, if it is still shareable.
+    pub fn preferred_copy(&self, app_id: AppId) -> Option<SteamId> {
+        let app = self.shareable_app(app_id)?;
+        self.preferred
+            .iter()
+            .find(|(a, owner)| *a == app_id && app.owners.contains(owner))
+            .map(|(_, owner)| *owner)
+    }
+
+    /// The saved preference, or the sole owner when there is no choice.
+    pub fn active_copy(&self, app_id: AppId) -> Option<SteamId> {
+        self.preferred_copy(app_id).or_else(|| {
+            let [owner] = self.shareable_app(app_id)?.owners.as_slice() else { return None };
+            Some(*owner)
+        })
+    }
+
+    /// Record an accepted change without reloading unrelated family metadata.
+    pub fn set_preferred_copy(&mut self, app_id: AppId, owner: SteamId) {
+        self.preferred.retain(|(id, _)| *id != app_id);
+        self.preferred.push((app_id, owner));
+    }
+
+    /// Every selectable copy of the game in the family, yours first.
+    pub fn copies(&self, app_id: AppId, me: SteamId) -> Vec<SteamId> {
+        let Some(app) = self.shareable_app(app_id) else { return Vec::new() };
+        let mut v = app.owners.clone();
+        v.sort_by_key(|o| *o != me);
+        v
+    }
+
+    /// DLC for `app_id` that `owner` has, sorted by name.
+    pub fn dlc_of(&self, app_id: AppId, owner: SteamId) -> Vec<&SharedDlc> {
+        let mut v: Vec<&SharedDlc> = self.shared_dlc.iter().filter(|d| d.parent == app_id && d.owners.contains(&owner)).collect();
+        v.sort_by_key(|d| d.name.to_lowercase());
+        v
+    }
+}
+
+/// A DLC owned by one or more family members.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SharedDlc {
+    pub app_id: AppId,
+    pub parent: AppId,
+    pub name: String,
+    pub owners: Vec<SteamId>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1619,6 +2009,70 @@ pub fn format_price(cents: i64, iso: &str) -> String {
 }
 
 #[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    fn family() -> Family {
+        let dlc = |app_id, name: &str, owners: Vec<SteamId>| SharedDlc { app_id, parent: 10, name: name.into(), owners };
+        Family {
+            shared: vec![SharedApp { app_id: 10, name: "Game".into(), owners: vec![1, 2, 3], excluded: false }],
+            shared_dlc: vec![dlc(12, "b pack", vec![2]), dlc(11, "A pack", vec![2, 3]), dlc(13, "Other", vec![1])],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn saved_copy_must_still_be_owned_and_shareable() {
+        let mut f = family();
+        f.preferred = vec![(10, 7), (10, 3)];
+        assert_eq!(f.preferred_copy(10), Some(3));
+        assert_eq!(f.active_copy(10), Some(3));
+
+        f.set_preferred_copy(10, 2);
+        assert_eq!(f.preferred, [(10, 2)]);
+        assert_eq!(f.preferred_copy(10), Some(2));
+
+        f.shared[0].owners = vec![3];
+        assert_eq!(f.preferred_copy(10), None);
+        assert_eq!(f.active_copy(10), Some(3));
+        assert_eq!(f.active_copy(99), None);
+    }
+
+    #[test]
+    fn several_owners_do_not_imply_an_active_or_preferred_copy() {
+        let f = family();
+        assert_eq!(f.active_copy(10), None);
+        assert_eq!(f.preferred_copy(10), None);
+    }
+
+    #[test]
+    fn excluded_games_offer_no_shared_copies() {
+        let mut f = family();
+        f.shared[0].excluded = true;
+        f.preferred = vec![(10, 2)];
+        assert_eq!(f.preferred_copy(10), None);
+        assert_eq!(f.active_copy(10), None);
+        assert!(f.copies(10, 2).is_empty());
+    }
+
+    #[test]
+    fn copies_list_yours_first() {
+        let f = family();
+        assert_eq!(f.copies(10, 2), [2, 1, 3]);
+        assert_eq!(f.copies(10, 9), [1, 2, 3]);
+        assert!(f.copies(99, 2).is_empty());
+    }
+
+    #[test]
+    fn dlc_of_filters_by_owner_and_sorts_by_name() {
+        let f = family();
+        let names: Vec<&str> = f.dlc_of(10, 2).iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["A pack", "b pack"]);
+        assert!(f.dlc_of(10, 4).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod price_tests {
     use super::format_price;
 
@@ -1633,6 +2087,26 @@ mod price_tests {
         assert_eq!(format_price(199_850, "KZT"), "1 998,50₸");
         assert_eq!(format_price(198_000, "JPY"), "¥ 1,980");
     }
+}
+
+/// Media item extracted from chat BBCode (`[img]`, `[url]`) or message URLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChatMediaKind {
+    Image,
+    Video,
+    Link,
+}
+
+/// Extracted link or media preview attached to a chat message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMedia {
+    pub kind: ChatMediaKind,
+    pub url: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// True for trusted Steam CDN / YouTube thumbnail hosts that can auto-load.
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 /// One chat message in a 1:1 conversation.
@@ -1653,6 +2127,9 @@ pub struct ChatMessage {
     /// shown as a card with a Join button.
     #[serde(default)]
     pub group_invite: Option<GroupInviteRef>,
+    /// Embedded media/link previews parsed from BBCode and URLs.
+    #[serde(default)]
+    pub media: Vec<ChatMedia>,
 }
 
 /// Reference to a group chat invitation embedded in a message.
@@ -1969,6 +2446,8 @@ pub struct GroupMessage {
     pub reactions: Vec<MessageReaction>,
     #[serde(default)]
     pub mentioned_me: bool,
+    #[serde(default)]
+    pub media: Vec<ChatMedia>,
 }
 
 /// An active invite link for a group chat.
@@ -2022,13 +2501,209 @@ impl GameInvite {
 /// Steam chat markup ("BBCode") to plain text plus any embedded game or
 /// group-chat invite.
 pub mod chat {
-    use super::{GameInvite, GroupInviteRef};
+    use super::{ChatMedia, ChatMediaKind, GameInvite, GroupInviteRef};
+
+    const MAX_CHAT_MEDIA: usize = 8;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ParsedChat {
         pub text: String,
         pub invite: Option<GameInvite>,
         pub group_invite: Option<GroupInviteRef>,
+        pub media: Vec<ChatMedia>,
+    }
+
+    const TRUSTED_MEDIA_HOSTS: &[&str] = &[
+        "steamusercontent.com",
+        "steamstatic.com",
+        "steamcdn-a.akamaihd.net",
+        "steamcommunity.com",
+        "media.steampowered.com",
+        "i.ytimg.com",
+        "img.youtube.com",
+    ];
+
+    /// Return true when `host` is an allowed Steam CDN or YouTube thumbnail host.
+    pub fn is_trusted_media_host(host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        TRUSTED_MEDIA_HOSTS.iter().any(|allowed| {
+            host == *allowed
+                || (host.len() > allowed.len()
+                    && host.ends_with(allowed)
+                    && host.as_bytes()[host.len() - allowed.len() - 1] == b'.')
+        })
+    }
+
+    fn http_rest(raw: &str) -> Option<&str> {
+        let s = raw.trim();
+        if s.chars().any(char::is_control) {
+            return None;
+        }
+        if s.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
+            Some(&s[8..])
+        } else if s.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) {
+            Some(&s[7..])
+        } else {
+            None
+        }
+    }
+
+    /// Extract the host portion of an `http://` or `https://` URL.
+    pub fn url_host(raw: &str) -> Option<&str> {
+        let rest = http_rest(raw)?;
+        let authority = rest.split(['/', '?', '#']).next()?;
+        if authority.is_empty() || authority.contains('\\') || authority.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+        if host_port.is_empty() {
+            return None;
+        }
+        let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+            bracketed.split(']').next()?
+        } else {
+            host_port.split(':').next()?
+        };
+        (!host.is_empty()).then_some(host)
+    }
+
+    fn is_safe_http_url(raw: &str) -> bool {
+        url_host(raw).is_some()
+    }
+
+    fn has_image_extension(url: &str) -> bool {
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        let lower = path.to_ascii_lowercase();
+        [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+    }
+
+    fn valid_yt_id(id: &str) -> bool {
+        id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }
+
+    /// Extract a validated 11-character YouTube video ID from common watch/short/embed URLs.
+    pub fn youtube_id_from_url(url: &str) -> Option<String> {
+        let host = url_host(url)?.to_ascii_lowercase();
+        let host = host.strip_prefix("www.").or_else(|| host.strip_prefix("m.")).unwrap_or(&host);
+        let rest = http_rest(url)?;
+        let path_and_query = match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => "",
+        };
+        let without_frag = path_and_query.split('#').next().unwrap_or("");
+        let (path, query) = without_frag.split_once('?').unwrap_or((without_frag, ""));
+        if host == "youtu.be" {
+            let seg = path.trim_start_matches('/').split('/').next().unwrap_or("");
+            return valid_yt_id(seg).then(|| seg.to_string());
+        }
+        if host == "youtube.com" || host == "youtube-nocookie.com" {
+            let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+            if segs.first() == Some(&"watch") || segs.is_empty() {
+                for pair in query.split('&') {
+                    if let Some(v) = pair.strip_prefix("v=") {
+                        if valid_yt_id(v) {
+                            return Some(v.to_string());
+                        }
+                    }
+                }
+            }
+            if let [kind, id, ..] = segs.as_slice() {
+                if matches!(*kind, "shorts" | "embed" | "live" | "v") && valid_yt_id(id) {
+                    return Some((*id).to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn trim_trailing_url_punct(raw: &str) -> &str {
+        let mut s = raw;
+        while let Some(last) = s.chars().last() {
+            let strip = match last {
+                '.' | ',' | '!' | '?' | ';' | ':' | '"' | '\'' | '>' => true,
+                ')' => s.chars().filter(|&c| c == ')').count() > s.chars().filter(|&c| c == '(').count(),
+                ']' => s.chars().filter(|&c| c == ']').count() > s.chars().filter(|&c| c == '[').count(),
+                _ => false,
+            };
+            if strip {
+                s = &s[..s.len() - last.len_utf8()];
+            } else {
+                break;
+            }
+        }
+        s
+    }
+
+    /// Find all `http://` and `https://` URLs with their byte spans in `text`.
+    pub fn find_http_urls(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+        let mut out = Vec::new();
+        let bytes = text.as_bytes();
+        let mut idx = 0;
+        while idx < text.len() {
+            let slice = &text[idx..];
+            let next_rel = slice
+                .find("https://")
+                .into_iter()
+                .chain(slice.find("http://"))
+                .min();
+            let Some(rel) = next_rel else { break };
+            let start = idx + rel;
+            if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+                idx = start + 4;
+                continue;
+            }
+            let rest = &text[start..];
+            let end_rel = rest
+                .char_indices()
+                .find(|&(_, ch)| ch.is_whitespace() || matches!(ch, '<' | '"'))
+                .map(|(i, _)| i)
+                .unwrap_or(rest.len());
+            let candidate = trim_trailing_url_punct(&rest[..end_rel]);
+            if is_safe_http_url(candidate) {
+                let end = start + candidate.len();
+                out.push((start..end, candidate.to_string()));
+                idx = end.max(start + 1);
+            } else {
+                idx = start + 7.min(rest.len());
+            }
+        }
+        out
+    }
+
+    /// Extract validated `http(s)://` URL strings from plain message text.
+    pub fn extract_http_urls(text: &str) -> Vec<String> {
+        find_http_urls(text).into_iter().map(|(_, u)| u).collect()
+    }
+
+    fn push_media_classified(media: &mut Vec<ChatMedia>, url: &str, label: Option<String>, force_image: bool) {
+        if media.len() >= MAX_CHAT_MEDIA {
+            return;
+        }
+        let trimmed = url.trim();
+        let Some(host) = url_host(trimmed) else { return };
+        if media.iter().any(|m| m.url == trimmed) {
+            return;
+        }
+        let (kind, trusted) = if force_image {
+            (ChatMediaKind::Image, is_trusted_media_host(host))
+        } else if youtube_id_from_url(trimmed).is_some() {
+            (ChatMediaKind::Video, true)
+        } else if has_image_extension(trimmed) {
+            (ChatMediaKind::Image, is_trusted_media_host(host))
+        } else {
+            (ChatMediaKind::Link, is_trusted_media_host(host))
+        };
+        media.push(ChatMedia {
+            kind,
+            url: trimmed.to_string(),
+            label: label.filter(|l| !l.trim().is_empty() && l.trim() != trimmed),
+            trusted,
+        });
     }
 
     /// `name="value"` (or `name=value`) from inside a tag.
@@ -2084,16 +2759,24 @@ pub mod chat {
         None
     }
 
-    /// Parse Steam chat markup into display text plus optional game or group-chat invite.
+    /// Parse Steam chat markup into display text plus optional invites and media/link previews.
     pub fn parse_message(raw: &str) -> ParsedChat {
         let mut out = String::new();
         let mut invite = None;
         let mut group_invite = None;
+        let mut media = Vec::new();
+        let mut open_url: Option<(Option<String>, usize)> = None;
+        let mut open_img: Option<(Option<String>, String)> = None;
         let mut rest = raw;
         while let Some(c) = rest.chars().next() {
             // Steam escapes a literal "[" as "\[".
             if let Some(after) = rest.strip_prefix("\\[").or_else(|| rest.strip_prefix("\\\\")) {
-                out.push(rest.as_bytes()[1] as char);
+                let ch = rest.as_bytes()[1] as char;
+                if let Some((_, buf)) = &mut open_img {
+                    buf.push(ch);
+                } else {
+                    out.push(ch);
+                }
                 rest = after;
                 continue;
             }
@@ -2103,11 +2786,46 @@ pub mod chat {
                     let closing = tag.starts_with('/');
                     let name = tag.trim_start_matches('/').split(|c: char| c.is_whitespace() || c == '=').next().unwrap_or("");
                     if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                        match name {
+                        let lower_name = name.to_ascii_lowercase();
+                        match lower_name.as_str() {
                             "gameinvite" | "lobbyinvite" if !closing => invite = invite.or_else(|| invite_from(tag)),
                             "invite" | "inviteurl" if !closing => group_invite = group_invite.or_else(|| group_invite_from(tag)),
                             "emoticon" => out.push(':'),
                             "sticker" if !closing => out.push_str(&format!("[{}]", attr(tag, "type").unwrap_or_else(|| "sticker".into()))),
+                            "img" if !closing => {
+                                let src = tag
+                                    .strip_prefix(name)
+                                    .and_then(|t| t.trim_start().strip_prefix('='))
+                                    .map(|v| v.trim().trim_matches('"').to_string())
+                                    .filter(|v| !v.is_empty())
+                                    .or_else(|| attr(tag, "src"));
+                                open_img = Some((src, String::new()));
+                            }
+                            "img" if closing => {
+                                if let Some((src, inner)) = open_img.take() {
+                                    let url = src.filter(|s| !s.is_empty()).unwrap_or(inner);
+                                    push_media_classified(&mut media, &url, None, true);
+                                }
+                            }
+                            "url" if !closing => {
+                                let href = tag
+                                    .strip_prefix(name)
+                                    .and_then(|t| t.trim_start().strip_prefix('='))
+                                    .map(|v| v.trim().trim_matches('"').to_string())
+                                    .filter(|v| !v.is_empty())
+                                    .or_else(|| attr(tag, "href"));
+                                open_url = Some((href, out.len()));
+                            }
+                            "url" if closing => {
+                                if let Some((href_opt, start)) = open_url.take() {
+                                    let label = out[start..].trim().to_string();
+                                    let href = href_opt.unwrap_or_else(|| label.clone());
+                                    if label.is_empty() && !href.is_empty() && is_safe_http_url(&href) {
+                                        out.push_str(&href);
+                                    }
+                                    push_media_classified(&mut media, &href, Some(label), false);
+                                }
+                            }
                             _ => {}
                         }
                         rest = &rest[end + 1..];
@@ -2115,8 +2833,21 @@ pub mod chat {
                     }
                 }
             }
-            out.push(c);
+            if let Some((_, buf)) = &mut open_img {
+                buf.push(c);
+            } else {
+                out.push(c);
+            }
             rest = &rest[c.len_utf8()..];
+        }
+        if let Some((src, inner)) = open_img.take() {
+            let url = src.filter(|s| !s.is_empty()).unwrap_or(inner);
+            push_media_classified(&mut media, &url, None, true);
+        }
+        if let Some((href_opt, start)) = open_url.take() {
+            let label = out[start..].trim().to_string();
+            let href = href_opt.unwrap_or_else(|| label.clone());
+            push_media_classified(&mut media, &href, Some(label), false);
         }
         let text = out.trim().to_string();
         // Aurora's invites: "Play X with me! steam://run/123//+args".
@@ -2126,7 +2857,15 @@ pub mod chat {
         if group_invite.is_none() {
             group_invite = link_group_invite(&text);
         }
-        ParsedChat { text, invite, group_invite }
+        for url in extract_http_urls(&text) {
+            if group_invite.is_some()
+                && (url.contains("s.team/chat/") || url.contains("steamcommunity.com/chat/invite/"))
+            {
+                continue;
+            }
+            push_media_classified(&mut media, &url, None, false);
+        }
+        ParsedChat { text, invite, group_invite, media }
     }
 
     /// Plain text for display, and the game invite in it.
@@ -2257,6 +2996,48 @@ pub mod chat {
             let (text, inv) = parse("Сыграем в Human Fall Flat? steam://run/477160");
             assert_eq!(text, "Сыграем в Human Fall Flat? steam://run/477160");
             assert_eq!(inv, Some(GameInvite { app_id: 477160, connect: String::new() }));
+        }
+
+        #[test]
+        fn media_links_images_and_youtube() {
+            let p_img = parse_message("[img]https://images.steamusercontent.com/ugc/1234/shot.png[/img]");
+            assert_eq!(p_img.text, "");
+            assert_eq!(p_img.media.len(), 1);
+            assert_eq!(p_img.media[0].kind, ChatMediaKind::Image);
+            assert!(p_img.media[0].trusted);
+
+            let p_ext = parse_message("look https://example.com/pic.jpg.");
+            assert_eq!(p_ext.media.len(), 1);
+            assert_eq!(p_ext.media[0].url, "https://example.com/pic.jpg");
+            assert_eq!(p_ext.media[0].kind, ChatMediaKind::Image);
+            assert!(!p_ext.media[0].trusted);
+
+            let p_evil_suffix = parse_message("https://evil-steamstatic.com/x.png");
+            assert!(!p_evil_suffix.media[0].trusted);
+
+            let p_url = parse_message("[url=https://store.steampowered.com/app/620]Portal 2[/url]");
+            assert_eq!(p_url.text, "Portal 2");
+            assert_eq!(p_url.media[0].kind, ChatMediaKind::Link);
+            assert_eq!(p_url.media[0].url, "https://store.steampowered.com/app/620");
+            assert_eq!(p_url.media[0].label.as_deref(), Some("Portal 2"));
+
+            let p_yt = parse_message("watch https://youtu.be/dQw4w9WgXcQ!");
+            assert_eq!(p_yt.media[0].kind, ChatMediaKind::Video);
+            assert_eq!(p_yt.media[0].url, "https://youtu.be/dQw4w9WgXcQ");
+            assert_eq!(youtube_id_from_url(&p_yt.media[0].url).as_deref(), Some("dQw4w9WgXcQ"));
+
+            // Bad schemes ignored
+            let p_bad = parse_message("[img]file:///etc/passwd[/img] [url=javascript:alert(1)]bad[/url]");
+            assert!(p_bad.media.is_empty());
+
+            // Deduplicates and caps at MAX_CHAT_MEDIA
+            let mut raw = String::from("https://example.com/1 https://example.com/1 ");
+            for i in 2..15 {
+                raw.push_str(&format!("https://example.com/{i} "));
+            }
+            let p_cap = parse_message(&raw);
+            assert_eq!(p_cap.media.len(), MAX_CHAT_MEDIA);
+            assert_eq!(p_cap.media[0].url, "https://example.com/1");
         }
     }
 }
@@ -2389,6 +3170,43 @@ mod trade_url_tests {
         };
         assert_eq!(fallback.join_args().as_deref(), Some("+connect_lobby 42"));
     }
+}
+
+/// Entry in Aurora's Game Servers browser (master server, Favorites, History, LAN, Friends).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameServerEntry {
+    pub addr: String,
+    pub ip: u32,
+    pub game_port: u16,
+    pub query_port: u16,
+    pub steam_id: u64,
+    pub app_id: u32,
+    pub name: String,
+    pub map: String,
+    pub game_dir: String,
+    pub description: String,
+    pub players: u32,
+    pub max_players: u32,
+    pub bots: u32,
+    pub password: bool,
+    pub secure: bool,
+    pub ping_ms: u32,
+    pub tags: String,
+}
+
+/// Player recently played with (`View -> Players` / `/friends/coplay`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentPlayer {
+    pub steam_id: SteamId,
+    pub name: String,
+    #[serde(default)]
+    pub avatar: String,
+    #[serde(default)]
+    pub app_id: Option<AppId>,
+    #[serde(default)]
+    pub game_name: String,
+    #[serde(default)]
+    pub played_at: String,
 }
 
 /// Compare names as lowercase text, with no allocation for ASCII names.

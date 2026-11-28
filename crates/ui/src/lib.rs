@@ -5,6 +5,7 @@ pub mod brand;
 pub mod icons;
 pub mod native;
 pub mod native_style;
+pub mod steam_text;
 pub mod theme;
 pub mod widgets;
 

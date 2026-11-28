@@ -436,6 +436,30 @@ impl Store {
         self.open(View::Search(q));
     }
 
+    /// This view's address on Steam's store (for "Copy page URL").
+    fn page_url(&self, me: model::SteamId) -> String {
+        const STORE: &str = "https://store.steampowered.com";
+        let app = |id: AppId| format!("{STORE}/app/{id}/");
+        match &self.view {
+            View::Home => format!("{STORE}/"),
+            View::Section(id) => match id.as_str() {
+                "specials" => format!("{STORE}/specials"),
+                "top_sellers" => format!("{STORE}/charts/topselling"),
+                "new_releases" => format!("{STORE}/explore/new/"),
+                "coming_soon" => format!("{STORE}/explore/upcoming/"),
+                _ => format!("{STORE}/"),
+            },
+            View::Search(q) => crate::links::with_query(&format!("{STORE}/search/"), &[("term", q)]),
+            View::Creator(kind, name) => crate::links::with_query(&format!("{STORE}/search/"), &[(if kind == "publisher" { "publisher" } else { "developer" }, name)]),
+            View::App(id) => app(*id),
+            View::Browse => format!("{STORE}/search/"),
+            View::Discovery(pos) => self.discovery.as_ref().and_then(|r| r.as_ref().ok()).and_then(|q| q.get(*pos).copied()).map(app).unwrap_or_else(|| format!("{STORE}/explore/")),
+            View::Points => format!("{STORE}/points/shop"),
+            View::Wishlist => format!("{STORE}/wishlist/profiles/{me}/"),
+            View::Cart => format!("{STORE}/cart/"),
+        }
+    }
+
     pub(super) fn wishlist_entries(&self, ctx: &Ctx) -> Option<Vec<(AppId, u64)>> {
         let base = ctx.state.wishlist.as_ref()?;
         if ctx.state.account != "demo" {
@@ -690,6 +714,8 @@ impl Extension for Store {
             let api = self.api.clone();
             self.front = Some(self.fetch(async move { api.front().await.map(Arc::new) }));
         }
+        let url = self.page_url(ctx.state.steam_id);
+        crate::links::page_url_menu(ui, &url);
         egui::ScrollArea::vertical().id_salt(("store", view_key(&self.view))).auto_shrink([false, false]).show(ui, |ui| {
             // Paint game background art from the very top of the page so the
             // Store sub-bar and Discovery Queue bar merge seamlessly into it.

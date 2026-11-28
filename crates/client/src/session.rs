@@ -493,6 +493,11 @@ fn cloud_lock(account: SteamId, app: AppId) -> std::sync::Arc<tokio::sync::Mutex
     lock
 }
 
+enum GameProcessEvent {
+    HeadlessStarted(AppId),
+    Exited(AppId, Option<std::path::PathBuf>),
+}
+
 /// Data the online loop keeps between messages.
 struct Online {
     conn: Connection,
@@ -544,6 +549,8 @@ struct Online {
     launch_layouts: HashMap<AppId, std::sync::Arc<tokio::sync::Mutex<crate::input_config::LaunchLayout>>>,
     /// Games we read non-Xbox controllers for (see pads.rs).
     pad_users: HashSet<AppId>,
+    /// Games backed by OS virtual Xbox 360 pads (`app_id -> include_xbox`).
+    vpad_users: HashMap<AppId, bool>,
     /// Games the official Steam client runs (anti-cheat), by install folder.
     official: HashMap<AppId, std::path::PathBuf>,
     /// Games stopped because their Steam DRM refused our steamclient: Play
@@ -644,6 +651,8 @@ async fn online(
             (Connection::closed(), rx, Logon { steam_id: account.steam_id, heartbeat: 9, cell_id: 0, public_ip: 0 })
         }
     };
+    // Publish family snapshots and accepted preferences in order.
+    let family_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let me = info.steam_id;
     let mut st = Online {
         conn: conn.clone(),
@@ -677,6 +686,7 @@ async fn online(
         launch_tokens: HashMap::new(),
         launch_layouts: HashMap::new(),
         pad_users: HashSet::new(),
+        vpad_users: HashMap::new(),
         official: HashMap::new(),
         drm_relaunch: Default::default(),
         country: String::new(),
@@ -700,7 +710,7 @@ async fn online(
     };
     let (dl_tx, mut dl_rx) = mpsc::unbounded_channel::<(AppId, Result<String, String>)>();
     let (apps_tx, mut apps_rx) = mpsc::unbounded_channel::<Vec<OwnedApp>>();
-    let (exit_tx, mut exit_rx) = mpsc::unbounded_channel::<(AppId, Option<std::path::PathBuf>)>();
+    let (process_tx, mut process_rx) = mpsc::unbounded_channel::<GameProcessEvent>();
     // Launches that waited for a Steam Cloud download.
     let (launch_tx, mut launch_rx) = mpsc::unbounded_channel::<(AppId, std::path::PathBuf, crate::LaunchArgs)>();
     // Launches that waited for Workshop downloads (Steam Cloud comes next).
@@ -834,13 +844,13 @@ async fn online(
                         });
                     }
                     None => {
-                        let _ = st.launch(app_id, &install_dir, &args, sink, &exit_tx);
+                        let _ = st.launch(app_id, &install_dir, &args, sink, &process_tx);
                     }
                 }
             }
             #[cfg(windows)]
             {
-                let _ = st.launch(app_id, &install_dir, &args, sink, &exit_tx);
+                let _ = st.launch(app_id, &install_dir, &args, sink, &process_tx);
             }
             }
             }
@@ -1300,6 +1310,36 @@ async fn online(
                     let result = crate::social::comments(web.as_deref().ok(), steam_id, start).await;
                     sink(Event::Comments { steam_id, result });
                 }),
+                Some(Command::LoadProfilePage { steam_id, language }) => st.with_web(sink, move |web, sink| async move {
+                    let result = crate::profile_page::load(web.as_deref().ok(), steam_id, &language).await;
+                    sink(Event::ProfilePage { steam_id, result });
+                }),
+                Some(Command::LoadAliases { steam_id }) => st.with_web(sink, move |web, sink| async move {
+                    let result = crate::social::aliases(web.as_deref().ok(), steam_id).await;
+                    sink(Event::Aliases { steam_id, result });
+                }),
+                Some(Command::ResolveProfileUrl { vanity }) => st.with_web(sink, move |web, sink| async move {
+                    let vanity = vanity.to_ascii_lowercase();
+                    let result = crate::social::resolve_vanity(web.as_deref().ok(), &vanity).await;
+                    sink(Event::ProfileUrlResolved { vanity, result });
+                }),
+                Some(Command::ClearAliases) => {
+                    let me = st.me;
+                    st.with_web(sink, move |web, sink| async move {
+                        let result = match web {
+                            Ok(w) => crate::social::clear_aliases(&w, me).await,
+                            Err(e) => Err(e),
+                        };
+                        sink(Event::AliasesCleared(result));
+                    })
+                }
+                Some(Command::LoadShowcases { steam_id, language }) => {
+                    let (conn, sink) = (st.conn.clone(), sink.clone());
+                    tokio::spawn(async move {
+                        let result = crate::showcases::load(&conn, steam_id, &language).await;
+                        sink(Event::Showcases { steam_id, result });
+                    });
+                }
                 Some(Command::SetNickname { steam_id, nickname }) => {
                     let nick = nickname.clone().unwrap_or_default();
                     let _ = st.conn.send(emsg::AM_CLIENT_SET_PLAYER_NICKNAME, &CMsgClientSetPlayerNickname { steamid: Some(steam_id), nickname: Some(nick) });
@@ -1323,6 +1363,77 @@ async fn online(
                     tokio::task::spawn_blocking(move || {
                         let result = crate::a2s::query(&addr);
                         sink(Event::ServerInfo { addr, result });
+                    });
+                }
+                Some(Command::BrowseGameServers { request_id, filter, max }) => {
+                    let conn = st.conn.clone();
+                    let sink = sink.clone();
+                    let app_id = filter
+                        .split('\\')
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .find(|w| w[0].eq_ignore_ascii_case("appid"))
+                        .and_then(|w| w[1].parse::<AppId>().ok())
+                        .unwrap_or(0);
+                    tokio::spawn(async move {
+                        let result = crate::game_servers::browse(&conn, app_id, &filter, max)
+                            .await
+                            .map(|list| list.into_iter().map(crate::game_servers::entry_from_wire).collect());
+                        sink(Event::GameServerList { request_id, result });
+                    });
+                }
+                Some(Command::DiscoverLanServers { request_id }) => {
+                    let sink = sink.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let found = crate::a2s::discover_lan(Duration::from_millis(1500));
+                        let servers = found
+                            .into_iter()
+                            .map(|(addr, info)| {
+                                let port = addr
+                                    .rsplit_once(':')
+                                    .and_then(|(_, p)| p.parse::<u16>().ok())
+                                    .unwrap_or(27015);
+                                let ip = local::servers::parse_ipv4_port(&addr).map(|(ip, _)| ip).unwrap_or(0);
+                                model::GameServerEntry {
+                                    addr,
+                                    ip,
+                                    game_port: port,
+                                    query_port: port,
+                                    steam_id: 0,
+                                    app_id: 0,
+                                    name: info.name,
+                                    map: info.map,
+                                    game_dir: String::new(),
+                                    description: info.game,
+                                    players: u32::from(info.players),
+                                    max_players: u32::from(info.max_players),
+                                    bots: u32::from(info.bots),
+                                    password: info.password,
+                                    secure: info.vac,
+                                    ping_ms: info.ping_ms,
+                                    tags: String::new(),
+                                }
+                            })
+                            .collect();
+                        sink(Event::LanServerList { request_id, servers });
+                    });
+                }
+                Some(Command::QueryServerDetails { addr }) => {
+                    let sink = sink.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let info = crate::a2s::query(&addr);
+                        sink(Event::ServerInfo { addr: addr.clone(), result: info });
+                        let players = crate::a2s::query_players(&addr);
+                        sink(Event::ServerPlayers { addr: addr.clone(), result: players });
+                        let rules = crate::a2s::query_rules(&addr);
+                        sink(Event::ServerRules { addr, result: rules });
+                    });
+                }
+                Some(Command::LoadRecentPlayers) => {
+                    let me = st.me;
+                    st.with_web(sink, move |web, sink| async move {
+                        let result = crate::social::recent_players(web.as_deref().ok(), me).await;
+                        sink(Event::RecentPlayers(result));
                     });
                 }
                 Some(Command::PostComment { steam_id, text }) => st.with_web(sink, move |web, sink| async move {
@@ -1440,52 +1551,52 @@ async fn online(
                     tokio::spawn(async move { sink(Event::AccountSecurity(crate::account::security(&conn).await)) });
                 }
                 Some(Command::LoadFamily { language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
-                    tokio::spawn(async move { reload_family(&conn, &sink, me, &language).await });
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
+                    tokio::spawn(async move { reload_family(&family_gate, &conn, &sink, me, &language).await });
                 }
                 Some(Command::CreateFamily { name, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::create_family(&conn, me, &name).await {
                             Ok(_) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::Created)));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
                     });
                 }
                 Some(Command::RenameFamily { family_id, name, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::rename_family(&conn, family_id, &name).await {
                             Ok(()) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::Renamed)));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
                     });
                 }
                 Some(Command::InviteToFamily { family_id, steam_id, role, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::invite_to_family(&conn, family_id, steam_id, role).await {
                             Ok(needs_2fa) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::Invited { needs_2fa })));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
                     });
                 }
                 Some(Command::CancelFamilyInvite { family_id, steam_id, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::cancel_family_invite(&conn, family_id, steam_id).await {
                             Ok(()) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::InviteCancelled)));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
@@ -1501,40 +1612,48 @@ async fn online(
                     });
                 }
                 Some(Command::JoinFamily { family_id, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::join_family(&conn, family_id).await {
                             Ok(needs_2fa) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::Joined { needs_2fa })));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
                     });
                 }
                 Some(Command::RemoveFromFamily { family_id, steam_id, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::remove_from_family(&conn, family_id, steam_id).await {
                             Ok(()) => {
                                 let done = if steam_id == me { model::FamilyActionDone::Left } else { model::FamilyActionDone::Removed };
                                 sink(Event::FamilyAction(Ok(done)));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
                     });
                 }
                 Some(Command::DeleteFamily { family_id, language }) => {
-                    let (conn, sink, me) = (st.conn.clone(), sink.clone(), st.me);
+                    let (conn, sink, me, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
                     tokio::spawn(async move {
                         match crate::account::delete_family(&conn, family_id).await {
                             Ok(()) => {
                                 sink(Event::FamilyAction(Ok(model::FamilyActionDone::Deleted)));
-                                reload_family(&conn, &sink, me, &language).await;
+                                reload_family(&family_gate, &conn, &sink, me, &language).await;
                             }
                             Err(e) => sink(Event::FamilyAction(Err(e))),
                         }
+                    });
+                }
+                Some(Command::SetPreferredLender { request_id, family_id, app_id, lender }) => {
+                    let (conn, sink, steam_id, family_gate) = (st.conn.clone(), sink.clone(), st.me, family_gate.clone());
+                    tokio::spawn(async move {
+                        let _guard = family_gate.lock().await;
+                        let result = crate::account::set_preferred_lender(&conn, family_id, app_id, lender).await;
+                        sink(Event::PreferredCopyChanged { request_id, steam_id, family_id, app_id, lender, result });
                     });
                 }
                 Some(Command::LoadPurchases { language, cursor }) => st.with_web(sink, move |web, sink| async move {
@@ -1746,7 +1865,7 @@ async fn online(
             Some((app_id, dir, args)) = launch_rx.recv() => launch_now!(app_id, dir, args),
             Some((app_id, dir, args)) = sh_rx.recv() => {
                 st.shader_jobs.remove(&app_id);
-                let _ = st.launch(app_id, &dir, &args, sink, &exit_tx);
+                let _ = st.launch(app_id, &dir, &args, sink, &process_tx);
             }
             Some((app_id, dir, args)) = ws_rx.recv() => launch_cloud!(app_id, dir, args),
             Some((app_id, report)) = vf_rx.recv() => {
@@ -1754,13 +1873,29 @@ async fn online(
                 sink(Event::VerifyFinished { app_id, result: Ok(report) });
             }
             Some(call) = ipc_rx.recv() => st.ipc_call(call, sink),
-            Some((app_id, host_cloud_dir)) = exit_rx.recv() => {
+            Some(event) = process_rx.recv() => {
+                let (app_id, host_cloud_dir) = match event {
+                    GameProcessEvent::HeadlessStarted(app_id) => {
+                        st.playing = Some(app_id);
+                        if st.link == Link::Online {
+                            if let Err(e) = games_played(&st.conn, Some(app_id)) {
+                                tracing::warn!("could not announce headless game {app_id}: {e}");
+                            }
+                        }
+                        sink(Event::GameStarted { app_id });
+                        continue;
+                    }
+                    GameProcessEvent::Exited(app_id, dir) => (app_id, dir),
+                };
                 st.running.remove(&app_id);
                 st.stop_flags.remove(&app_id);
                 st.launch_layouts.remove(&app_id);
                 st.official.remove(&app_id);
                 if st.pad_users.remove(&app_id) {
                     crate::pads::stop();
+                }
+                if let Some(include_xbox) = st.vpad_users.remove(&app_id) {
+                    crate::pads::stop_virtual_pads(include_xbox);
                 }
                 if let Some(token) = st.launch_tokens.remove(&app_id) {
                     launch::swap_exited(&token);
@@ -2142,7 +2277,7 @@ impl Online {
                         1 => {
                             // The markup keeps invites (game, lobby, group); the plain text loses them.
                             let parsed = model::chat::parse_message(n.message());
-                            let text = if parsed.text.is_empty() && parsed.invite.is_none() && parsed.group_invite.is_none() {
+                            let text = if parsed.text.is_empty() && parsed.invite.is_none() && parsed.group_invite.is_none() && parsed.media.is_empty() {
                                 n.message_no_bbcode().to_string()
                             } else {
                                 parsed.text
@@ -2154,6 +2289,7 @@ impl Online {
                                 time: n.rtime32_server_timestamp() as u64,
                                 invite: parsed.invite,
                                 group_invite: parsed.group_invite,
+                                media: parsed.media,
                             }))
                         }
                         2 => sink(Event::Typing { from: n.steamid_friend() }),
@@ -2216,6 +2352,7 @@ impl Online {
                         time: r.server_timestamp() as u64,
                         invite: parsed.invite,
                         group_invite: parsed.group_invite,
+                        media: parsed.media,
                     }))
                 }
                 Err(e) => sink(Event::Error(format!("Message not sent: {e}"))),
@@ -2989,6 +3126,7 @@ impl Online {
                                 time: m.timestamp() as u64,
                                 invite: parsed.invite,
                                 group_invite: parsed.group_invite,
+                                media: parsed.media,
                             }
                         })
                         .collect();
@@ -3030,7 +3168,7 @@ impl Online {
         dir: &std::path::Path,
         args: &crate::LaunchArgs,
         sink: &Sink,
-        exit_tx: &mpsc::UnboundedSender<(AppId, Option<std::path::PathBuf>)>,
+        process_tx: &mpsc::UnboundedSender<GameProcessEvent>,
     ) -> Result<(), Error> {
         if let Err(e) = launch::safe_connect_args(&args.connect) {
             sink(Event::Error(e));
@@ -3061,20 +3199,19 @@ impl Online {
                 self.running.insert(app_id, 0);
                 self.stop_flags.insert(app_id, stop_flag);
                 self.official.insert(app_id, dir.to_path_buf());
-                let (tx, sink, args, me, offline) = (exit_tx.clone(), sink.clone(), args.clone(), self.me, self.link != Link::Online);
+                let (tx, sink, args, me, offline) = (process_tx.clone(), sink.clone(), args.clone(), self.me, self.link != Link::Online);
                 tokio::task::spawn_blocking(move || {
                     let started = || sink(Event::GameStarted { app_id });
                     if let Err(e) = launch::run_through_steam(app_id, &args, me, offline, started) {
                         sink(Event::Error(e));
                     }
-                    let _ = tx.send((app_id, None));
+                    let _ = tx.send(GameProcessEvent::Exited(app_id, None));
                 });
                 return Ok(());
             }
             crate::LaunchMode::HeadlessHost { steam_drm } => {
-                // The user's own Steam engine, headless, runs it; we follow
-                // along like the official-client case (the engine sends its
-                // own presence/stats). It needs the live refresh token.
+                // Aurora spawns the game after the headless engine signs in.
+                // Announce it to Steam once the spawn succeeds.
                 let app = app.clone();
                 let (account, token, me) = (self.account.clone(), self.refresh_token.clone(), self.me);
                 self.running.insert(app_id, 0);
@@ -3092,11 +3229,39 @@ impl Online {
                 };
                 #[cfg(windows)]
                 let overlay: Option<(u16, String)> = None;
-                let (tx, sink, args, dir2) = (exit_tx.clone(), sink.clone(), args.clone(), dir.to_path_buf());
+                let needs_vpad = launch::needs_aurora_input_route(app_id, args.controller);
+                let ctrl_override = crate::pads::effective_controller_override(app_id, args.controller);
+                let include_xbox = ctrl_override == 1
+                    || crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+                let vpad_started = if needs_vpad {
+                    if crate::pads::start_virtual_pads(include_xbox) {
+                        self.vpad_users.insert(app_id, include_xbox);
+                        tracing::info!(
+                            "controllers: HeadlessHost launch for {} using {} virtual Xbox 360 pad",
+                            app.name,
+                            crate::pads::virtual_pad_backend()
+                        );
+                        true
+                    } else {
+                        tracing::warn!(
+                            "controllers: HeadlessHost launch for {} needs controller translation, but {} is unavailable ({})",
+                            app.name,
+                            crate::pads::virtual_pad_backend(),
+                            crate::pads::virtual_pad_hint()
+                        );
+                        false
+                    }
+                } else {
+                    false
+                };
+                sink(Event::ControllerLayoutRoute { app_id, enabled: false });
+                let (tx, sink, args, dir2) = (process_tx.clone(), sink.clone(), args.clone(), dir.to_path_buf());
                 tokio::task::spawn_blocking(move || {
-                    let started = || sink(Event::GameStarted { app_id });
+                    let started = || {
+                        let _ = tx.send(GameProcessEvent::HeadlessStarted(app_id));
+                    };
                     let ov = overlay.as_ref().map(|(p, t)| (*p, t.as_str()));
-                    let cloud_dir = match launch::run_through_host_cancellable(&app, &dir2, &args, &account, &token, me, ov, Some(&stop_flag), started) {
+                    let cloud_dir = match launch::run_through_host_cancellable(&app, &dir2, &args, &account, &token, me, ov, vpad_started, Some(&stop_flag), started) {
                         Ok(()) if !steam_drm => Some(dir2),
                         Ok(()) => None,
                         Err(e) => {
@@ -3104,7 +3269,7 @@ impl Online {
                             None
                         }
                     };
-                    let _ = tx.send((app_id, cloud_dir));
+                    let _ = tx.send(GameProcessEvent::Exited(app_id, cloud_dir));
                 });
                 return Ok(());
             }
@@ -3125,6 +3290,18 @@ impl Online {
                 let pads = (swapped.is_ok() && input_decision.enabled && input_decision.use_shm_bridge)
                     .then(crate::pads::start)
                     .flatten();
+                #[cfg(not(windows))]
+                let (vpad_started, vpad_include_xbox) = {
+                    let include_xbox = ctrl_override == 1
+                        || crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+                    let ok = swapped.is_ok()
+                        && input_decision.enabled
+                        && launch::needs_aurora_input_route(app_id, args.controller)
+                        && crate::pads::start_virtual_pads(include_xbox);
+                    (ok, include_xbox)
+                };
+                #[cfg(windows)]
+                let (vpad_started, vpad_include_xbox) = (false, false);
                 #[cfg(target_os = "linux")]
                 let overlay = if launch::app_overlay_enabled(app_id) {
                     self.ipc.overlay_port().map(|port| (port, token.clone()))
@@ -3135,15 +3312,23 @@ impl Online {
                 let overlay: Option<(u16, String)> = None;
                 let started = swapped.and_then(|_| {
                     let ov = overlay.as_ref().map(|(p, t)| (*p, t.as_str()));
-                    launch::spawn_with_steamclient(app, dir, args, &self.ipc.env_value(&token), &self.account, account_id, pads.as_deref(), ov)
+                    launch::spawn_with_steamclient(app, dir, args, &self.ipc.env_value(&token), &self.account, account_id, pads.as_deref(), ov, vpad_started)
                 });
-                if started.is_err() && pads.is_some() {
-                    crate::pads::stop();
+                if started.is_err() {
+                    if pads.is_some() {
+                        crate::pads::stop();
+                    }
+                    if vpad_started {
+                        crate::pads::stop_virtual_pads(vpad_include_xbox);
+                    }
                 }
                 match started {
                     Ok(child) => {
                         if pads.is_some() {
                             self.pad_users.insert(app_id);
+                        }
+                        if vpad_started {
+                            self.vpad_users.insert(app_id, vpad_include_xbox);
                         }
                         self.launch_tokens.insert(app_id, token.clone());
                         if input_decision.enabled {
@@ -3155,7 +3340,7 @@ impl Online {
                             tokio::time::sleep(Duration::from_secs(300)).await;
                             launch::swap_loaded(&token);
                         });
-                        self.track(app_id, dir, child, sink, exit_tx)?;
+                        self.track(app_id, dir, child, sink, process_tx)?;
                     }
                     Err(e) => {
                         launch::swap_exited(&token);
@@ -3182,7 +3367,7 @@ impl Online {
                         if let Some((_, tok)) = overlay {
                             self.launch_tokens.insert(app_id, tok);
                         }
-                        self.track(app_id, dir, child, sink, exit_tx)?;
+                        self.track(app_id, dir, child, sink, process_tx)?;
                     }
                     Err(e) => {
                         if let Some((_, tok)) = overlay {
@@ -3197,7 +3382,7 @@ impl Online {
     }
 
     /// A game we started ourselves: we're the one "playing" it.
-    fn track(&mut self, app_id: AppId, dir: &std::path::Path, child: std::process::Child, sink: &Sink, exit_tx: &mpsc::UnboundedSender<(AppId, Option<std::path::PathBuf>)>) -> Result<(), Error> {
+    fn track(&mut self, app_id: AppId, dir: &std::path::Path, child: std::process::Child, sink: &Sink, process_tx: &mpsc::UnboundedSender<GameProcessEvent>) -> Result<(), Error> {
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.running.insert(app_id, child.id());
         self.stop_flags.insert(app_id, stop_flag.clone());
@@ -3210,10 +3395,11 @@ impl Online {
             self.unconnected_play.insert(app_id, (unix_now(), self.link == Link::Offline));
         }
         sink(Event::GameStarted { app_id });
-        let tx = exit_tx.clone();
+        let tx = process_tx.clone();
         let dir_owned = dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let _ = tx.send((launch::wait_in_dir_cancellable(app_id, &dir_owned, child, Some(&stop_flag)), None));
+            let app_id = launch::wait_in_dir_cancellable(app_id, &dir_owned, child, Some(&stop_flag));
+            let _ = tx.send(GameProcessEvent::Exited(app_id, None));
         });
         Ok(())
     }
@@ -3590,6 +3776,91 @@ impl Online {
                 tokio::spawn(async move {
                     let _ = reply.send(crate::game_servers::list(&conn, app_id, &filter, max).await);
                 });
+            }
+            Request::FavoriteServers { history } => {
+                let root = self.steam_root.clone().unwrap_or_else(|| store::config_dir().join("steam"));
+                let account_id = model::account_id(self.me);
+                let lists = local::servers::load_lists(&root, account_id);
+                let src = if history { &lists.history } else { &lists.favorites };
+                let flag = if history { 2 } else { 1 };
+                let servers = src
+                    .iter()
+                    .filter_map(|s| {
+                        let (ip, port) = local::servers::parse_ipv4_port(&s.addr)?;
+                        Some(crate::ipc::protocol::FavoriteServer {
+                            app_id: s.app_id,
+                            ip,
+                            conn_port: port,
+                            query_port: port,
+                            flags: flag,
+                            last_played: u32::try_from(s.last_played).unwrap_or(u32::MAX),
+                        })
+                    })
+                    .collect();
+                let _ = reply.send(Reply::FavoriteServers { servers });
+            }
+            Request::FavoriteServerAdd(srv) => {
+                let root = self.steam_root.clone().unwrap_or_else(|| store::config_dir().join("steam"));
+                let account_id = model::account_id(self.me);
+                let port = if srv.query_port != 0 { srv.query_port } else { srv.conn_port };
+                let addr = local::servers::format_ipv4_port(srv.ip, port);
+                let entry = local::servers::SavedServer {
+                    addr,
+                    name: String::new(),
+                    app_id: srv.app_id,
+                    game_dir: String::new(),
+                    last_played: u64::from(srv.last_played),
+                };
+                if srv.flags & 2 != 0 {
+                    let _ = local::servers::record_history(&root, account_id, entry.clone());
+                }
+                if srv.flags & 1 != 0 || srv.flags == 0 {
+                    let _ = local::servers::add_favorite(&root, account_id, entry);
+                }
+                let _ = reply.send(Reply::Ok);
+            }
+            Request::FavoriteServerRemove { app_id: _, ip, conn_port, query_port, flags } => {
+                let root = self.steam_root.clone().unwrap_or_else(|| store::config_dir().join("steam"));
+                let account_id = model::account_id(self.me);
+                let q_addr = local::servers::format_ipv4_port(ip, query_port);
+                let c_addr = local::servers::format_ipv4_port(ip, conn_port);
+                let mut lists = local::servers::load_lists(&root, account_id);
+                if flags & 1 != 0 || flags == 0 {
+                    lists.favorites.retain(|s| s.addr != q_addr && s.addr != c_addr);
+                }
+                if flags & 2 != 0 {
+                    lists.history.retain(|s| s.addr != q_addr && s.addr != c_addr);
+                }
+                let _ = local::servers::save_lists(&root, account_id, &lists);
+                let _ = reply.send(Reply::Ok);
+            }
+            Request::FriendServers { app_id: filter_app } => {
+                let servers = self
+                    .personas
+                    .values()
+                    .filter(|p| filter_app == 0 || p.game_app_id == Some(filter_app))
+                    .filter_map(|p| {
+                        let srv = p.server.as_deref()?;
+                        let (ip, port) = local::servers::parse_ipv4_port(srv)?;
+                        Some(crate::ipc::protocol::GameServer {
+                            ip,
+                            query_port: port,
+                            game_port: port,
+                            app_id: p.game_app_id.unwrap_or(filter_app),
+                            name: p.name.clone(),
+                            ..Default::default()
+                        })
+                    })
+                    .collect();
+                let _ = reply.send(Reply::Servers { servers });
+            }
+            Request::PlayedWith { steam_id } => {
+                let time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                _sink(Event::CoplayRecorded { steam_id, app_id, time });
+                let _ = reply.send(Reply::Ok);
             }
             Request::PromoItems => {
                 tokio::spawn(async move {
@@ -4119,7 +4390,8 @@ fn invite_link(app_id: AppId, connect: &str) -> String {
 
 /// Fetch the user's Steam Family status, request personas for non-friend
 /// members/inviters, and emit `Event::Family`.
-async fn reload_family(conn: &Connection, sink: &Sink, me: SteamId, language: &str) {
+async fn reload_family(gate: &tokio::sync::Mutex<()>, conn: &Connection, sink: &Sink, me: SteamId, language: &str) {
+    let _guard = gate.lock().await;
     let r = crate::account::family(conn, me, language).await;
     if let Ok(f) = &r {
         let mut ids: Vec<SteamId> = f.invites.iter().map(|i| i.inviter).collect();
@@ -4131,7 +4403,7 @@ async fn reload_family(conn: &Connection, sink: &Sink, me: SteamId, language: &s
             let _ = conn.send(emsg::CLIENT_REQUEST_FRIEND_DATA, &CMsgClientRequestFriendData { persona_state_requested: Some(PERSONA_FLAGS), friends: ids });
         }
     }
-    sink(Event::Family(r));
+    sink(Event::Family { steam_id: me, result: r });
 }
 
 #[cfg(test)]

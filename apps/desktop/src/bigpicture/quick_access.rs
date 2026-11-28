@@ -9,7 +9,7 @@ use super::menu::{
 use super::{BigPicture, ChatTarget, Frame, Page, Tab, paint, settings};
 use crate::builtin::settings::FpsCorner;
 use client::Command;
-use egui::{Align2, Id, Rangef, Rect, Sense, Ui, pos2, vec2};
+use egui::{Align2, Id, Rangef, Rect, Ui, pos2, vec2};
 use extensions::Action;
 use i18n::t;
 use model::{AppId, DownloadStatus, PersonaState};
@@ -132,17 +132,36 @@ impl QuickAccess {
         }
     }
 
+    fn step_section(&mut self, delta: i32, wrap: bool) {
+        let previous = self.section;
+        let current = self.sections[previous.index()].focus.current;
+        let index = previous.index() as i32 + delta;
+        let count = SECTIONS.len() as i32;
+        let next = if wrap { index.rem_euclid(count) } else { index.clamp(0, count - 1) };
+        self.select(SECTIONS[next as usize]);
+        if self.section != previous && current.is_some_and(is_qa_tab) {
+            let focus = &mut self.sections[self.section.index()].focus;
+            focus.current = Some(qa_tab_id(self.section));
+            focus.by_pointer = false;
+        }
+    }
+
     pub fn input(&mut self, presses: &[(Press, bool)], now: f64) {
         if self.closing.is_some() {
             return;
         }
         for (p, _) in presses {
             match p {
+                Press::Move(d @ (Dir::Left | Dir::Right))
+                    if self.sections[self.section.index()].focus.current.is_some_and(is_qa_tab) =>
+                {
+                    self.step_section(if *d == Dir::Left { -1 } else { 1 }, false);
+                }
                 Press::Move(d) => self.pending.dir = Some(*d),
                 Press::A => self.pending.press = true,
                 Press::Scroll(delta) => self.pending.stick += f32::from(*delta),
-                Press::Lb => self.select(SECTIONS[(self.section.index() + SECTIONS.len() - 1) % SECTIONS.len()]),
-                Press::Rb => self.select(SECTIONS[(self.section.index() + 1) % SECTIONS.len()]),
+                Press::Lb => self.step_section(-1, true),
+                Press::Rb => self.step_section(1, true),
                 Press::B | Press::QuickAccess => {
                     self.close(now);
                     return;
@@ -155,6 +174,14 @@ impl QuickAccess {
 
 fn qa_id(key: &str) -> Id {
     Id::unique(("bp-qa", key))
+}
+
+fn qa_tab_id(tab: Section) -> Id {
+    Id::unique(("bp-qa-tab", tab.index()))
+}
+
+fn is_qa_tab(id: Id) -> bool {
+    SECTIONS.iter().any(|&tab| qa_tab_id(tab) == id)
 }
 
 pub fn show(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, screen: Rect) {
@@ -180,9 +207,25 @@ pub fn show(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, screen: Rect) {
     let active = drawer.closing.is_none();
     let pad = (32.0 * s).min(width * 0.1);
     let span = Rangef::new(panel.left() + pad, panel.right() - pad);
-    let tabs = Rect::from_min_size(pos2(span.min, panel.top() + 68.0 * s), vec2(span.span() + 8.0 * s, 66.0 * s));
-    draw_header(&mut drawer, ui, f, panel, tabs, active);
-    let active = drawer.closing.is_none();
+    let tabs = Rect::from_min_size(pos2(span.min, panel.top() + 68.0 * s), vec2(span.span(), 66.0 * s));
+    let section = &mut drawer.sections[drawer.section.index()];
+    let input = std::mem::take(&mut drawer.pending);
+    let current = section.focus.current;
+    let available_tab = current.filter(|id| is_qa_tab(*id)).unwrap_or_else(|| qa_tab_id(drawer.section));
+    let (nav, horizontal) = match input.dir.filter(|_| active) {
+        Some(Dir::Left) => (None, -1),
+        Some(Dir::Right) => (None, 1),
+        dir => (dir, 0),
+    };
+    let step = Step {
+        item: current.filter(|_| section.focus.current_place() == Some(Place::Page)),
+        delta: horizontal,
+    };
+    section.focus.begin_drawer(ui, nav, active && input.press, |id| is_qa_tab(id) && id != available_tab, false);
+    let mut header_ui = clipped_child(ui, panel, panel.intersect(screen));
+    let pad_mode = bp.effective_pad_mode(f.app.prefs.bigpicture_hints);
+    let (header_close, tab_clicked) = draw_header(drawer.section, &mut section.focus, &mut header_ui, f, panel, tabs, active, pad_mode);
+    let active = active && !header_close && tab_clicked.is_none();
 
     let playing = f.app.state.playing;
     let download = if playing.is_none() {
@@ -206,16 +249,7 @@ pub fn show(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, screen: Rect) {
     let viewport = Rect::from_min_max(pos2(panel.left(), body_top), pos2(panel.right(), panel.bottom() - footer));
     let body_clip = viewport.intersect(screen);
     let body_ui = clipped_child(ui, viewport, body_clip);
-    let section = &mut drawer.sections[drawer.section.index()];
-    let input = std::mem::take(&mut drawer.pending);
-    let (nav, horizontal) = match input.dir.filter(|_| active) {
-        Some(Dir::Left) => (None, -1),
-        Some(Dir::Right) => (None, 1),
-        dir => (dir, 0),
-    };
-    let step = Step { item: section.focus.current, delta: horizontal };
-    section.focus.begin(&body_ui, nav, active && input.press);
-    let mut close = false;
+    let mut close = header_close;
     if pinned {
         let bounds = Rect::from_min_max(pos2(panel.left(), banner_top), pos2(panel.right(), body_top));
         let clip = bounds.intersect(screen);
@@ -273,14 +307,25 @@ pub fn show(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, screen: Rect) {
     );
     // The focus painter uses the row's clip, including for the pinned banner.
     section.focus.paint_ring(ui, &theme, s, 12.0 * s, body_clip);
+    if !bp.active {
+        return;
+    }
     if close {
         drawer.close(now);
+        ui.ctx().request_repaint();
+    } else if let Some(tab) = tab_clicked {
+        drawer.select(tab);
+        let focus = &mut drawer.sections[tab.index()].focus;
+        focus.current = Some(qa_tab_id(tab));
+        focus.by_pointer = false;
         ui.ctx().request_repaint();
     }
     bp.quick_access = Some(drawer);
 }
 
-fn draw_header(drawer: &mut QuickAccess, ui: &mut Ui, f: &Frame<'_>, panel: Rect, tabs: Rect, active: bool) {
+fn draw_header(
+    section: Section, focus: &mut Focus, ui: &mut Ui, f: &Frame<'_>, panel: Rect, tabs: Rect, active: bool, pad_mode: bool,
+) -> (bool, Option<Section>) {
     let s = f.s;
     let p = ui.painter().with_clip_rect(panel);
     paint::line(
@@ -295,13 +340,13 @@ fn draw_header(drawer: &mut QuickAccess, ui: &mut Ui, f: &Frame<'_>, panel: Rect
     let close = Rect::from_center_size(pos2(tabs.right() - 22.0 * s, panel.top() + 36.0 * s), vec2(40.0 * s, 40.0 * s));
     p.circle_filled(close.center(), 19.0 * s, egui::Color32::from_white_alpha(12));
     p.text(close.center(), Align2::CENTER_CENTER, icons::X, w::font(21.0 * s), f.t.text_dim);
-    let close_hit = close.intersect(ui.clip_rect());
-    if active
-        && close_hit.is_positive()
-        && ui.interact(close_hit, qa_id("close"), Sense::click()).on_hover_text(t!("Close")).clicked()
-    {
-        drawer.close(f.now);
-        ui.ctx().request_repaint();
+    let clip = if active { ui.clip_rect() } else { Rect::NOTHING };
+    let close_hit = focus.item(ui, qa_id("close"), close, clip, Place::Bar);
+    if let Some(response) = close_hit.response {
+        response.on_hover_text(t!("Close"));
+    }
+    if close_hit.focused {
+        focus.ring_around_clipped(close, 20.0 * s, ui.clip_rect());
     }
 
     let notifications = f.app.state.notifications.as_ref().map_or(0, |n| n.unread);
@@ -313,14 +358,31 @@ fn draw_header(drawer: &mut QuickAccess, ui: &mut Ui, f: &Frame<'_>, panel: Rect
         .filter(|(id, _)| f.app.state.friends.get(id) == Some(&model::Relationship::Friend))
         .map(|(_, n)| n)
         .sum::<usize>();
-    let stride = tabs.width() / SECTIONS.len() as f32;
+    let badge_scale = (s * 0.8).min(tabs.width() / 220.0);
+    let (left, right) = if pad_mode { ("LB", "RB") } else { ("Q", "E") };
+    let left_badge = paint::glyph(&p, &f.t, tabs.left_center(), left, false, badge_scale, 0.0);
+    let right_width = paint::glyph_width(&p, right, false, badge_scale);
+    let right_badge = paint::glyph(&p, &f.t, tabs.right_center() - vec2(right_width, 0.0), right, false, badge_scale, 0.0);
+    let gap = (8.0 * s).min(tabs.width() * 0.025);
+    let start = left_badge.right() + gap;
+    let stride = (right_badge.left() - gap - start).max(0.0) / SECTIONS.len() as f32;
+    let mut clicked = None;
     for tab in SECTIONS {
         let rect = Rect::from_min_size(
-            pos2(tabs.left() + tab.index() as f32 * stride, tabs.top()),
-            vec2((stride - 8.0 * s).max(0.0), tabs.height()),
+            pos2(start + tab.index() as f32 * stride, tabs.top()),
+            vec2((stride - gap * 0.5).max(0.0), tabs.height()),
         );
-        let visible = rect.intersect(ui.clip_rect());
-        let selected = tab == drawer.section;
+        let hit = focus.item(ui, qa_tab_id(tab), rect, clip, Place::Bar);
+        if hit.focused {
+            focus.ring_around_clipped(rect, 12.0 * s, ui.clip_rect());
+        }
+        if let Some(response) = hit.response {
+            response.on_hover_text(tab.label());
+        }
+        if hit.activated && tab != section {
+            clicked = Some(tab);
+        }
+        let selected = tab == section;
         let fill = if selected {
             w::mix(f.t.raised, f.t.accent.gamma_multiply(0.24), 0.35)
         } else {
@@ -360,23 +422,13 @@ fn draw_header(drawer: &mut QuickAccess, ui: &mut Ui, f: &Frame<'_>, panel: Rect
         if unread > 0 {
             count_badge(&p, &f.t, rect.right_top() + vec2(-5.0 * s, 4.0 * s), Align2::RIGHT_TOP, unread, s * 0.78);
         }
-        if active
-            && drawer.closing.is_none()
-            && visible.is_positive()
-            && ui
-                .interact(visible, Id::unique(("bp-qa-tab", tab.index())), Sense::click())
-                .on_hover_text(tab.label())
-                .clicked()
-        {
-            drawer.select(tab);
-            ui.ctx().request_repaint();
-        }
     }
     p.hline(
-        Rangef::new(tabs.left(), tabs.right() - 8.0 * s),
+        tabs.x_range(),
         tabs.bottom() + 12.0 * s,
         egui::Stroke::new(1.0, egui::Color32::from_white_alpha(18)),
     );
+    (close_hit.activated, clicked)
 }
 
 fn live_banner(
@@ -524,6 +576,10 @@ fn system_rows(rows: &mut DrawerRows<'_>, bp: &mut BigPicture, f: &mut Frame<'_>
     rows.caption(t!("Account"));
     if rows.button(qa_id("fullscreen"), icons::MONITOR, t!("Fullscreen"), toggle_value(!bp.is_windowed()), false) {
         bp.toggle_fullscreen(rows.ui.ctx());
+    }
+    if rows.button(qa_id("leave"), icons::DESKTOP, t!("Exit Big Picture"), "", false) {
+        bp.leave(rows.ui.ctx());
+        return true;
     }
     if !f.app.demo {
         let online = f.app.state.online();
@@ -917,4 +973,23 @@ mod tests {
             assert!(!drawer.is_animating(2.0));
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn arrows_switch_sections_only_when_a_tab_has_focus() {
+    let mut drawer = QuickAccess::new(0.0, Section::System);
+    drawer.sections[0].focus.current = Some(qa_id("volume"));
+    drawer.input(&[(Press::Move(Dir::Right), false)], 1.0);
+    assert_eq!(drawer.section, Section::System);
+    assert_eq!(drawer.pending.dir, Some(Dir::Right));
+    drawer.sections[0].focus.current = Some(qa_tab_id(Section::System));
+    drawer.input(&[(Press::Move(Dir::Right), false)], 2.0);
+    assert_eq!(drawer.section, Section::Performance);
+    assert_eq!(drawer.sections[1].focus.current, Some(qa_tab_id(Section::Performance)));
+    drawer.input(&[(Press::Rb, false)], 3.0);
+    assert_eq!(drawer.section, Section::Notifications);
+    assert_eq!(drawer.sections[2].focus.current, Some(qa_tab_id(Section::Notifications)));
+    drawer.input(&[(Press::Move(Dir::Left), false)], 4.0);
+    assert_eq!(drawer.section, Section::Performance);
 }

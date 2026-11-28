@@ -180,11 +180,55 @@ fn icon_for_name(name: &str) -> &str {
         "search" => icons::SEARCH,
         "play" => icons::PLAY,
         "bell" => icons::BELL,
-        "speaker" => icons::SPEAKER_HIGH,
+        "speaker" | "music" => icons::SPEAKER_HIGH,
         "sliders" => icons::SLIDERS,
+        "eye" => icons::EYE,
+        "eye_slash" => icons::EYE_SLASH,
+        "camera" => icons::CAMERA,
+        "globe" => icons::GLOBE,
+        "backpack" => icons::BACKPACK,
+        "sparkle" => icons::SPARKLE,
+        "monitor" | "tv" => icons::MONITOR,
+        "clock" => icons::CLOCK,
+        "note" | "news" => icons::NOTE,
         "menu" | "list" => icons::LIST,
         "close" => icons::X,
         other => other,
+    }
+}
+
+fn render_menu_items(app: &mut SteamApp, ui: &mut Ui, t: &Theme, actions: &mut Vec<Action>, items: &[MenuItemSpec]) {
+    w::menu_spacing(ui);
+    for item in items {
+        match item {
+            MenuItemSpec::Separator => {
+                ui.separator();
+            }
+            MenuItemSpec::Item { label, icon, action } => {
+                let display = if action == "toggle_small_mode" && app.prefs.small_mode {
+                    i18n::t!("Large Mode").to_string()
+                } else {
+                    i18n::tr_dyn(label)
+                };
+                let ic = if action == "toggle_small_mode" && app.prefs.small_mode {
+                    icons::GRID
+                } else {
+                    icon.as_deref().map(icon_for_name).unwrap_or("")
+                };
+                if w::menu_item(ui, t, ic, &display).clicked() {
+                    dispatch_shell_action(app, ui, actions, action);
+                    ui.close();
+                }
+            }
+            MenuItemSpec::Submenu { label, icon, items } => {
+                let ic = icon.as_deref().map(icon_for_name).unwrap_or("");
+                let sub = w::submenu_item(ui, t, ic, &i18n::tr_dyn(label));
+                egui::containers::menu::SubMenu::new().show(ui, &sub, |ui| {
+                    ui.set_min_width(220.0);
+                    render_menu_items(app, ui, t, actions, items);
+                });
+            }
+        }
     }
 }
 
@@ -245,6 +289,8 @@ fn dispatch_shell_action(app: &mut SteamApp, ui: &Ui, actions: &mut Vec<Action>,
             "activate_product" => app.activate = Some(Default::default()),
             "open_friends" => app.friends_window.open = !app.friends_window.open,
             "toggle_friends_drawer" => app.prefs.friends_open = !app.prefs.friends_open,
+            "toggle_small_mode" => actions.push(Action::ToggleSmallMode),
+            "big_picture" => actions.push(Action::EnterBigPicture),
             "back" => app.go_back(),
             "forward" => app.go_forward(),
             "check_updates" => crate::updater::check(ui.ctx().clone(), true),
@@ -476,20 +522,7 @@ fn render_shell_node(rctx: &mut ShellRenderCtx<'_, '_, '_>, ui: &mut Ui, node: &
         Node::Menu { label, icon, items, style } => {
             let resp = render_styled_button(ui, &t, label, icon.as_deref(), style);
             egui::Popup::menu(&resp).width(240.0).show(|ui| {
-                for item in items {
-                    match item {
-                        MenuItemSpec::Separator => {
-                            ui.separator();
-                        }
-                        MenuItemSpec::Item { label, icon, action } => {
-                            let ic = icon.as_deref().map(icon_for_name).unwrap_or("");
-                            if w::menu_item(ui, &t, ic, &i18n::tr_dyn(label)).clicked() {
-                                dispatch_shell_action(rctx.app, ui, rctx.actions, action);
-                                ui.close();
-                            }
-                        }
-                    }
-                }
+                render_menu_items(rctx.app, ui, &t, rctx.actions, items);
             });
         }
 
@@ -713,11 +746,13 @@ fn render_nav_tabs(
         };
         let galley = ui.painter().layout_no_wrap(display, font.clone(), Color32::PLACEHOLDER);
         let icon_w = if icon.is_some() { 20.0 } else { 0.0 };
-        let pad_x = if indicator == IndicatorStyle::Pill { 12.0 } else { 4.0 };
+        // The theme's own left/right padding when it sets one (Metro's 8 px).
+        let default_pad = if indicator == IndicatorStyle::Pill { 12.0 } else { 4.0 };
+        let (pad_x, pad_right) = style.padding.map_or((default_pad, default_pad), |p| (p.left, p.right));
         let tab_w = if full_w {
             ui.available_width()
         } else {
-            galley.size().x + icon_w + pad_x * 2.0
+            galley.size().x + icon_w + pad_x + pad_right
         };
         let tab_h = match style.height {
             Some(SizeVal::Px(h)) => h,
@@ -730,7 +765,13 @@ fn render_nav_tabs(
         let p = ui.painter();
 
         match indicator {
-            IndicatorStyle::None => {}
+            IndicatorStyle::None => {
+                if let Some(hbg) = style.hover_bg.map(|c| c.resolve(&t)) {
+                    if hover > 0.01 {
+                        p.rect_filled(rect, radius, w::mix(Color32::TRANSPARENT, hbg, hover));
+                    }
+                }
+            }
             IndicatorStyle::Pill => {
                 let bg = style.active_bg.map(|c| c.resolve(&t)).unwrap_or_else(|| w::active_fill(&t));
                 let hbg = style.hover_bg.map(|c| c.resolve(&t)).unwrap_or(t.surface_hover);

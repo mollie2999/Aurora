@@ -72,7 +72,40 @@ type = "menu"
 label = ""
 icon = "menu"
 style = { width = 28, height = 28, radius = 6, bg = "transparent", hover_bg = "$surface_hover", color = "$text", font_size = 16 }
-items = [{ label = "Settings", icon = "gear", action = "navigate:settings" }, { label = "Downloads", icon = "download", action = "navigate:downloads" }, { label = "Friends & Chat", icon = "chats", action = "open_friends" }, "separator", { label = "Add a Game…", icon = "plus", action = "add_game" }, { label = "Activate a Product…", icon = "key", action = "activate_product" }, { label = "Check for Updates", icon = "refresh", action = "check_updates" }, "separator", { label = "Minimize", action = "window:minimize" }, { label = "Maximize / Restore", action = "window:maximize" }, "separator", { label = "Switch Account…", action = "logout" }, { label = "Quit Aurora", icon = "power", action = "exit" }]
+items = [
+    { label = "View", icon = "eye", items = [
+        { label = "Library", icon = "books", action = "navigate:library" },
+        { label = "Hidden Games", icon = "eye_slash", action = "navigate:library:hidden" },
+        { label = "Soundtracks", icon = "music", action = "navigate:library:soundtracks" },
+        { label = "Downloads", icon = "download", action = "navigate:downloads" },
+        "separator",
+        { label = "Small Mode", icon = "list", action = "toggle_small_mode" },
+        { label = "Big Picture Mode", icon = "monitor", action = "big_picture" },
+        "separator",
+        { label = "Friends List", icon = "users", action = "open_friends" },
+        { label = "Players", icon = "clock", action = "navigate:community:players" },
+        { label = "Game Servers", icon = "globe", action = "navigate:servers" },
+        { label = "Screenshots", icon = "camera", action = "navigate:screenshots" },
+        { label = "Inventory", icon = "backpack", action = "navigate:inventory" },
+        { label = "Update News", icon = "note", action = "navigate:library:news" },
+        "separator",
+        { label = "Settings", icon = "gear", action = "navigate:settings" },
+    ] },
+    "separator",
+    { label = "Settings", icon = "gear", action = "navigate:settings" },
+    { label = "Downloads", icon = "download", action = "navigate:downloads" },
+    { label = "Friends & Chat", icon = "chats", action = "open_friends" },
+    "separator",
+    { label = "Add a Game…", icon = "plus", action = "add_game" },
+    { label = "Activate a Product…", icon = "key", action = "activate_product" },
+    { label = "Check for Updates", icon = "refresh", action = "check_updates" },
+    "separator",
+    { label = "Minimize", action = "window:minimize" },
+    { label = "Maximize / Restore", action = "window:maximize" },
+    "separator",
+    { label = "Switch Account…", action = "logout" },
+    { label = "Quit Aurora", icon = "power", action = "exit" },
+]
 
 [[shell.children.children]]
 type = "button"

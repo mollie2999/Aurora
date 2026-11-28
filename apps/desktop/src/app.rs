@@ -42,6 +42,8 @@ pub struct Prefs {
     /// Show the "What's new" news shelf on the library home.
     #[serde(default = "yes")]
     pub show_whats_new: bool,
+    #[serde(default)]
+    pub steam_profile_ui: bool,
     /// Account to sign in automatically at startup (cleared on log out).
     pub auto_login: Option<String>,
     /// Interface language code; `None` follows the system.
@@ -68,6 +70,12 @@ pub struct Prefs {
     pub favorite_friends: Vec<u64>,
     /// Mouse wheel and touchpad scroll distance, as a multiple of egui's.
     pub scroll_speed: f32,
+    /// Glide mouse-wheel steps over a few frames (egui's smoothing).
+    pub smooth_scroll: bool,
+    /// Draw the main window at most 60 times a second, even on faster
+    /// monitors (Settings > Accessibility).
+    #[serde(default)]
+    pub cap_fps: bool,
     /// The player has seen the one-time notice for Steam-DRM games (how they
     /// start through a background Steam instance).
     #[serde(default)]
@@ -107,14 +115,28 @@ pub struct Prefs {
     /// Watch active theme files on disk and hot-reload on change.
     #[serde(default)]
     pub hot_reload_themes: bool,
-    /// Start in Big Picture after signing in.
+    /// Compact single-column library Small Mode (`View -> Small Mode`).
+    #[serde(default)]
+    pub small_mode: bool,
+    /// Start in Big Picture after signing in (or from login on Steam Deck).
     pub bigpicture_start: bool,
+    /// True once the user explicitly toggled `bigpicture_start` in Settings.
+    /// Until then, Steam Deck hardware auto-starts in Big Picture even if an
+    /// older release saved `bigpicture_start: false`.
+    #[serde(default)]
+    pub bigpicture_start_explicit: bool,
     /// Big Picture interface scale relative to its screen size.
     pub bigpicture_scale: f32,
     pub bigpicture_library: u8,
     pub bigpicture_swap_ab: bool,
     pub bigpicture_repeat: u8,
     pub bigpicture_stick: u8,
+    /// Which button glyphs Big Picture shows in its hint bar (Auto / Controller / Keyboard).
+    #[serde(default)]
+    pub bigpicture_hints: crate::bigpicture::ButtonHintMode,
+    /// Subtle haptic ticks on Steam Deck touchpads when crossing OSK keys (click feedback is always on).
+    #[serde(default = "yes")]
+    pub osk_touchpad_haptics: bool,
 }
 
 fn yes() -> bool {
@@ -134,6 +156,7 @@ impl Default for Prefs {
             fps_counter: crate::builtin::settings::FpsCorner::Off,
             fps_high_contrast: false,
             show_whats_new: true,
+            steam_profile_ui: false,
             auto_login: None,
             language: None,
             language_asked: false,
@@ -147,6 +170,8 @@ impl Default for Prefs {
             auto_offline: false,
             favorite_friends: Vec::new(),
             scroll_speed: 2.0,
+            smooth_scroll: true,
+            cap_fps: false,
             drm_host_ack: false,
             proton_override: None,
             proton_per_app: Default::default(),
@@ -160,12 +185,16 @@ impl Default for Prefs {
             win_maximized: false,
             active_theme_id: None,
             hot_reload_themes: false,
+            small_mode: false,
             bigpicture_start: false,
+            bigpicture_start_explicit: false,
             bigpicture_scale: 1.0,
             bigpicture_library: 0,
             bigpicture_swap_ab: false,
             bigpicture_repeat: 1,
             bigpicture_stick: 1,
+            bigpicture_hints: crate::bigpicture::ButtonHintMode::Auto,
+            osk_touchpad_haptics: true,
         }
     }
 }
@@ -224,11 +253,19 @@ pub struct SteamApp {
     confirm_exit: bool,
     window_mode: Option<WindowMode>,
     pub(crate) bigpicture: crate::bigpicture::BigPicture,
+    /// Middle-click autoscroll, like a browser.
+    autoscroll: crate::autoscroll::AutoScroll,
+    /// When the last frame started (for the 60 fps cap).
+    last_frame: Option<std::time::Instant>,
     /// A window size waiting to be centered once the monitor size is known.
     center_window: Option<[f32; 2]>,
     /// A window size asked for but not reached yet: (size, resizable, frames
     /// waited).
     pending_size: Option<([f32; 2], bool, u32)>,
+    /// True once the current window mode has been clamped against `monitor_size`.
+    monitor_clamped: bool,
+    /// Last `ViewportCommand::IMEAllowed` state sent to suppress OS virtual keyboards while Aurora's OSK is active.
+    last_ime_allowed: Option<bool>,
     pub tray: crate::tray::Tray,
     taskbar: crate::taskbar::Taskbar,
     flags: crate::builtin::settings::SharedFlags,
@@ -361,11 +398,14 @@ impl SteamApp {
             toast_messages: prefs.toast_messages,
             toast_notifications: prefs.toast_notifications,
             scroll_speed: prefs.scroll_speed,
+            smooth_scroll: prefs.smooth_scroll,
+            cap_fps: prefs.cap_fps,
             drm_host_ack: prefs.drm_host_ack,
             overlay_enabled: prefs.overlay_enabled,
             fps_counter: prefs.fps_counter,
             fps_high_contrast: prefs.fps_high_contrast,
             show_whats_new: prefs.show_whats_new,
+            steam_profile_ui: prefs.steam_profile_ui,
         }));
         client::set_proton_override(prefs.proton_override.clone());
         client::set_app_protons(prefs.proton_per_app.clone());
@@ -399,7 +439,9 @@ impl SteamApp {
 
         let overlay = crate::overlay::Overlay::new(&cc.egui_ctx);
         let mut bigpicture = crate::bigpicture::BigPicture::new(&cc.egui_ctx);
-        if prefs.bigpicture_start && !bigpicture.active {
+        let desktop_flag = crate::links::desktop_requested(std::env::args().skip(1));
+        let auto_deck_bp = bigpicture.system.is_steam_deck() && !prefs.bigpicture_start_explicit && !desktop_flag;
+        if (prefs.bigpicture_start || auto_deck_bp) && !bigpicture.active && !desktop_flag {
             bigpicture.enter(&cc.egui_ctx);
         }
         let (local_tx, local_rx) = mpsc::channel();
@@ -430,8 +472,12 @@ impl SteamApp {
             confirm_exit: false,
             window_mode: None,
             bigpicture,
+            autoscroll: Default::default(),
+            last_frame: None,
             center_window: None,
             pending_size: None,
+            monitor_clamped: false,
+            last_ime_allowed: None,
             tray: crate::tray::Tray::new(cc),
             taskbar: crate::taskbar::Taskbar::new(cc),
             flags,
@@ -510,7 +556,8 @@ impl SteamApp {
                     || (self.friends_window.open && self.friends_window.chat == Some(crate::builtin::group_chat::ChatTarget::Friend(m.friend)));
                 if m.from != self.state.steam_id && !open && self.prefs.toast_messages {
                     let name = self.state.persona(m.from).name;
-                    self.toast(now, name, m.text.clone());
+                    let body = crate::builtin::chat_render::toast_preview(&m.text, &m.media);
+                    self.toast(now, name, body);
                 }
             }
             if let Event::GroupMessage(m) = &e {
@@ -529,7 +576,8 @@ impl SteamApp {
                         if should {
                             let group_name = self.state.group_display_name(g);
                             let sender = self.state.persona(m.from).display_name();
-                            self.toast(now, group_name, format!("{sender}: {}", m.text));
+                            let preview = crate::builtin::chat_render::toast_preview(&m.text, &m.media);
+                            self.toast(now, group_name, format!("{sender}: {preview}"));
                         }
                     }
                 }
@@ -551,8 +599,11 @@ impl SteamApp {
                 }
                 Event::LoggedOut { reason } => {
                     self.anti_cheat_notices.clear();
-                    self.bigpicture.leave(ctx);
+                    if !self.bigpicture.system.is_steam_deck() {
+                        self.bigpicture.leave(ctx);
+                    }
                     self.window_mode = None;
+                    self.monitor_clamped = false;
                     if reason == "Logged out" {
                         self.prefs.auto_login = None;
                     }
@@ -682,6 +733,9 @@ impl SteamApp {
         for a in actions {
             match a {
                 Action::Navigate { page, arg } => {
+                    if self.prefs.small_mode && !self.bigpicture.active {
+                        self.prefs.small_mode = false;
+                    }
                     if !self.bigpicture.navigate(ctx, &page, arg.as_deref()) {
                         self.navigate(page, arg);
                     }
@@ -725,6 +779,8 @@ impl SteamApp {
                     self.client.send(Command::JoinChatGroup { group_id, chat_id, invite_code: code });
                 }
                 Action::ToggleOverlay => self.overlay.toggle(),
+                Action::ToggleSmallMode => self.prefs.small_mode = !self.prefs.small_mode,
+                Action::EnterBigPicture => self.bigpicture.enter(ctx),
                 Action::JoinGame { app_id, connect } => {
                     let now = ctx.input(|i| i.time);
                     if let Err(msg) = client::safe_connect_args(&connect) {
@@ -1010,15 +1066,21 @@ impl SteamApp {
                 self.pending_links.push(request.arg);
             }
         }
+        // Allow Big Picture / Steam Deck launch requests even while on the login screen.
+        let mut remaining = Vec::new();
+        for raw in std::mem::take(&mut self.pending_links) {
+            if let Some((deck_preview, windowed)) = crate::links::big_picture_mode(&raw) {
+                self.bigpicture.enter_requested(ctx, deck_preview, windowed);
+            } else {
+                remaining.push(raw);
+            }
+        }
+        self.pending_links = remaining;
         if self.state.phase != Phase::LoggedIn {
             return;
         }
         for raw in std::mem::take(&mut self.pending_links) {
             let nav = |page: &str, arg: Option<String>| Action::Navigate { page: page.into(), arg };
-            if let Some((deck_preview, windowed)) = crate::links::big_picture_mode(&raw) {
-                self.bigpicture.enter_requested(ctx, deck_preview, windowed);
-                continue;
-            }
             match crate::links::parse(&raw) {
                 Some(Link::Run(id)) => match self.local.games.iter().find(|g| g.app_id == id) {
                     Some(g) => {
@@ -1032,6 +1094,13 @@ impl SteamApp {
                 Some(Link::Uninstall(id)) => actions.push(nav("library", Some(format!("uninstall:{id}")))),
                 Some(Link::Validate(id)) => actions.push(nav("library", Some(format!("verify:{id}")))),
                 Some(Link::Store(id)) => actions.push(nav("store", Some(format!("app:{id}")))),
+                Some(Link::Connect { addr, password }) => {
+                    let target = match password {
+                        Some(pw) => format!("connect:{addr}|{pw}"),
+                        None => format!("connect:{addr}"),
+                    };
+                    actions.push(nav("servers", Some(target)));
+                }
                 Some(Link::Page(p)) => actions.push(nav(p, None)),
                 Some(Link::Show) | None => {}
             }
@@ -1065,6 +1134,10 @@ impl SteamApp {
     /// A download is running, paused or queued.
     pub(crate) fn shared_flags(&self) -> crate::builtin::settings::SharedFlags {
         self.flags.clone()
+    }
+
+    pub fn has_touchscreen(&self) -> bool {
+        self.bigpicture.system.has_touchscreen()
     }
 
     pub fn downloading(&self) -> bool {
@@ -1136,6 +1209,28 @@ fn finish_memory_trim(ctx: &egui::Context, pending: &mut u8) -> bool {
     *pending == 0
 }
 
+/// Smooth scrolling off: egui glides any wheel step of 8 points or more over
+/// a few frames, and applies smaller ones at once. So each mouse-wheel step
+/// becomes small point steps, all on the same frame: the page moves the
+/// whole step immediately. Zoom (Ctrl/Cmd + wheel) and trackpads are left alone.
+fn instant_wheel(raw_input: &mut egui::RawInput, line_points: f32) {
+    use egui::{Event, MouseWheelUnit, TouchPhase};
+    const STEP: f32 = 7.5;
+    let events = std::mem::take(&mut raw_input.events);
+    for event in events {
+        match event {
+            Event::MouseWheel { unit: unit @ (MouseWheelUnit::Line | MouseWheelUnit::Point), delta, phase: TouchPhase::Move, source, modifiers } if !modifiers.command && source != egui::MouseWheelSource::Trackpad => {
+                let points = if unit == MouseWheelUnit::Line { delta * line_points } else { delta };
+                let n = (points.length() / STEP).ceil().max(1.0) as usize;
+                for _ in 0..n.min(400) {
+                    raw_input.events.push(Event::MouseWheel { unit: MouseWheelUnit::Point, delta: points / n as f32, phase: TouchPhase::Move, source, modifiers });
+                }
+            }
+            other => raw_input.events.push(other),
+        }
+    }
+}
+
 impl eframe::App for SteamApp {
     /// Runs before every frame, and also while the window gets no frames
     /// (minimized or behind a fullscreen game on Wayland): the overlay drawn
@@ -1188,15 +1283,25 @@ impl eframe::App for SteamApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.bigpicture.feed_input(raw_input);
         let speed = self.prefs.scroll_speed;
-        if (speed - 1.0).abs() < f32::EPSILON {
-            return;
-        }
+        let scale_scroll = (speed - 1.0).abs() >= f32::EPSILON;
         for event in &mut raw_input.events {
-            if let egui::Event::MouseWheel { delta, modifiers, .. } = event
+            if matches!(event, egui::Event::Touch { .. }) {
+                self.bigpicture.system.mark_touchscreen();
+            } else if scale_scroll
+                && let egui::Event::MouseWheel { delta, modifiers, .. } = event
                 && !modifiers.command
             {
                 *delta *= speed;
             }
+        }
+        // After the speed setting: autoscroll's speed follows the pointer.
+        if self.bigpicture.active {
+            self.autoscroll.stop();
+        } else {
+            self.autoscroll.feed(raw_input);
+        }
+        if !self.prefs.smooth_scroll {
+            instant_wheel(raw_input, _ctx.options(|o| o.input_options.line_scroll_speed));
         }
     }
 
@@ -1207,8 +1312,23 @@ impl eframe::App for SteamApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // "Limit to 60 fps" (Settings > Accessibility): at most 60 frames a
+        // second, even on faster monitors. A frame that comes sooner waits
+        // out the rest of its 1/60 s. Idle windows draw nothing, and slower
+        // timed redraws keep their own pace.
+        if self.prefs.cap_fps {
+            const MIN_FRAME: std::time::Duration = std::time::Duration::from_micros(16_667);
+            if let Some(last) = self.last_frame {
+                let elapsed = last.elapsed();
+                if elapsed < MIN_FRAME {
+                    std::thread::sleep(MIN_FRAME - elapsed);
+                }
+            }
+        }
+        self.last_frame = Some(std::time::Instant::now());
         let ctx = ui.ctx().clone();
         self.sync_theme_state(&ctx);
+        self.autoscroll.paint(&ctx, self.prefs.theme.accent);
         if self.applied_zoom != self.prefs.zoom {
             ctx.set_zoom_factor(self.prefs.zoom);
             self.applied_zoom = self.prefs.zoom;
@@ -1230,11 +1350,14 @@ impl eframe::App for SteamApp {
             self.prefs.toast_messages = f.toast_messages;
             self.prefs.toast_notifications = f.toast_notifications;
             self.prefs.scroll_speed = f.scroll_speed;
+            self.prefs.smooth_scroll = f.smooth_scroll;
+            self.prefs.cap_fps = f.cap_fps;
             self.prefs.drm_host_ack = f.drm_host_ack;
             self.prefs.overlay_enabled = f.overlay_enabled;
             self.prefs.fps_counter = f.fps_counter;
             self.prefs.fps_high_contrast = f.fps_high_contrast;
             self.prefs.show_whats_new = f.show_whats_new;
+            self.prefs.steam_profile_ui = f.steam_profile_ui;
             #[cfg(not(windows))]
             {
                 self.prefs.precompile_shaders = client::shaders::precompile();
@@ -1294,7 +1417,7 @@ impl eframe::App for SteamApp {
         ).unwrap_or(false);
         let launch_dialog = launch_dialog || !self.anti_cheat_notices.is_empty();
         self.bigpicture.launch_dialog = launch_dialog;
-        let big_picture = signed_in_now && self.bigpicture.active;
+        let big_picture = self.bigpicture.active;
         let fullscreen = big_picture && !self.bigpicture.is_windowed();
 
         // Mouse back/forward buttons.
@@ -1309,13 +1432,21 @@ impl eframe::App for SteamApp {
         }
 
         let signed_in = self.state.phase == Phase::LoggedIn;
-        let mode = if signed_in {
+        let deck_window = big_picture && self.bigpicture.is_deck_preview() && self.bigpicture.is_windowed();
+        let mode = if deck_window {
+            WindowMode::DeckPreview
+        } else if big_picture {
             WindowMode::Main
+        } else if signed_in {
+            if self.prefs.small_mode { WindowMode::Small } else { WindowMode::Main }
         } else if crate::login::wants_splash(self) {
             WindowMode::Splash
+        } else if crate::login::wants_tall_window(self) {
+            WindowMode::SignInTall
         } else {
             WindowMode::SignIn
         };
+        let monitor_size = ctx.input(|i| i.viewport().monitor_size);
         if fullscreen {
             if self.window_mode.take().is_some() {
                 // A fixed-size login window leaves size constraints behind on Wayland.
@@ -1325,42 +1456,89 @@ impl eframe::App for SteamApp {
             }
             self.pending_size = None;
             self.center_window = None;
+            self.monitor_clamped = false;
         } else if self.window_mode != Some(mode) {
             self.window_mode = Some(mode);
-            let (size, min, resizable) = match mode {
-                WindowMode::Main => ([1440.0, 900.0], [1060.0, 680.0], true),
+            let (base_size, base_min, resizable) = match mode {
+                WindowMode::Main => ([1440.0, 900.0], [900.0, 580.0], true),
+                // `--steam-deck=window` previews Steam Deck's native 1280×800 geometry.
+                WindowMode::DeckPreview => ([1280.0, 800.0], [900.0, 580.0], true),
+                WindowMode::Small => ([380.0, 620.0], [280.0, 420.0], true),
                 // Small, compact sign-in and splash windows, like Steam's.
                 WindowMode::SignIn => ([560.0, 400.0], [560.0, 400.0], false),
+                // Expanded sign-in window when the built-in touch OSK is open.
+                WindowMode::SignInTall => ([720.0, 690.0], [600.0, 600.0], false),
                 WindowMode::Splash => ([380.0, 250.0], [380.0, 250.0], false),
             };
-            // Locking the size (Resizable(false)) pins it to whatever it is
-            // at that moment, so a fixed-size window is locked only once it
-            // has its size (see `pending_size` below).
-            if resizable {
-                // winit (Wayland) keeps the size it pinned as the max size when
-                // the window becomes resizable again: a max below the main
-                // window's min size is a protocol error that closes the app.
-                ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(16384.0, 16384.0)));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
-            }
+            let desired = if mode == WindowMode::Main { self.prefs.win_size.unwrap_or(base_size) } else { base_size };
+            let (size, min) = match monitor_size {
+                Some(mon) => {
+                    self.monitor_clamped = true;
+                    clamp_window_to_monitor(desired, base_min, [mon.x, mon.y])
+                }
+                None => {
+                    self.monitor_clamped = false;
+                    (desired, base_min)
+                }
+            };
+            // winit (Wayland) pins max_size to the previous window size whenever
+            // Resizable(false) was active: always unpin MaxInnerSize and
+            // Resizable(true) BEFORE sending a new MinInnerSize / InnerSize (even
+            // between two non-resizable modes like SignIn -> SignInTall), or
+            // setting MinInnerSize > old max_size triggers Wayland protocol error 2.
+            ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(16384.0, 16384.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min.into()));
             // Main: restore the last size/position/maximized. Sign-in and
             // splash: always small and centered on the main display.
             if mode == WindowMode::Main && self.prefs.win_maximized {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(self.prefs.win_size.unwrap_or(size).into()));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.into()));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
                 self.center_window = None;
                 self.pending_size = None;
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
-                let size = if mode == WindowMode::Main { self.prefs.win_size.unwrap_or(size) } else { size };
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.into()));
                 self.pending_size = Some((size, resizable, 0));
                 // Restore a saved main-window position, else center once the
                 // monitor size is known (it can be unknown on this frame).
-                match (mode, self.prefs.win_pos) {
-                    (WindowMode::Main, Some(pos)) => ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.into())),
+                match (mode, self.prefs.win_pos, monitor_size) {
+                    (WindowMode::Main, Some(pos), Some(mon)) => {
+                        let clamped = clamp_position_to_monitor(pos, size, [mon.x, mon.y]);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(clamped.into()));
+                    }
+                    (WindowMode::Main, Some(pos), None) => ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.into())),
                     _ => self.center_window = Some(size),
+                }
+            }
+        } else if !self.monitor_clamped
+            && let Some(mon) = monitor_size
+        {
+            // Monitor dimensions arrived after the initial mode setup (common on X11/Wayland):
+            // ensure the floating window fits inside the monitor's safe work area (e.g. 1280×800 + KDE panel).
+            self.monitor_clamped = true;
+            let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+            if !maximized {
+                let current = self
+                    .pending_size
+                    .map(|(s, _, _)| s)
+                    .or_else(|| ctx.input(|i| i.viewport().inner_rect.map(|r| [r.width(), r.height()])))
+                    .unwrap_or([1440.0, 900.0]);
+                let (base_min, resizable) = match mode {
+                    WindowMode::Main | WindowMode::DeckPreview => ([900.0, 580.0], true),
+                    WindowMode::Small => ([280.0, 420.0], true),
+                    WindowMode::SignIn => ([560.0, 400.0], false),
+                    WindowMode::SignInTall => ([600.0, 600.0], false),
+                    WindowMode::Splash => ([380.0, 250.0], false),
+                };
+                let (clamped_size, clamped_min) = clamp_window_to_monitor(current, base_min, [mon.x, mon.y]);
+                if clamped_size != current {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(16384.0, 16384.0)));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(clamped_min.into()));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(clamped_size.into()));
+                    self.pending_size = Some((clamped_size, resizable, 0));
+                    self.center_window = Some(clamped_size);
                 }
             }
         }
@@ -1386,18 +1564,18 @@ impl eframe::App for SteamApp {
             }
         }
         // Center when a size is pending and the monitor size has arrived.
-        if let (Some(size), Some(monitor)) = (self.center_window, ctx.input(|i| i.viewport().monitor_size)) {
-            let pos = ((monitor - egui::Vec2::from(size)) / 2.0).max(egui::Vec2::ZERO);
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.to_pos2()));
+        if let (Some(size), Some(monitor)) = (self.center_window, monitor_size) {
+            let pos = center_in_work_area(size, [monitor.x, monitor.y]);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.into()));
             self.center_window = None;
         }
         // Remember the main window's geometry for next time.
-        if mode == WindowMode::Main && !fullscreen && self.pending_size.is_none() {
+        if mode == WindowMode::Main && !big_picture && self.pending_size.is_none() {
             ctx.input(|i| {
                 let vp = i.viewport();
                 // Right after sign-in the window is still sign-in sized for a
                 // few frames: don't take that for the main window's size.
-                if vp.fullscreen == Some(true) || vp.inner_rect.is_none_or(|r| r.width() < 1000.0 || r.height() < 600.0) {
+                if vp.fullscreen == Some(true) || vp.inner_rect.is_none_or(|r| r.width() < 800.0 || r.height() < 500.0) {
                     return;
                 }
                 self.prefs.win_maximized = vp.maximized.unwrap_or(false);
@@ -1411,7 +1589,7 @@ impl eframe::App for SteamApp {
                 }
             });
         }
-        if big_picture {
+        if big_picture && signed_in {
             crate::bigpicture::show(self, ui, &mut actions);
             crate::friends_window::show(self, &ctx, &mut actions);
             crate::overlay::show(self, &ctx, &mut actions);
@@ -1419,55 +1597,62 @@ impl eframe::App for SteamApp {
                 crate::launch_popup::show(self, &ctx);
             }
             crate::tray::show(self, &ctx);
+        } else if big_picture {
+            crate::bigpicture::show_login(self, ui);
+            crate::tray::show(self, &ctx);
         } else if signed_in {
-            let snapshot = self.resolved_snapshot.take();
-            let bg_tex = self.bg_tex.as_ref().map(|(_, _, h)| h.clone());
-            let logo_tex = self.logo_tex.as_ref().map(|(_, _, h)| h.clone());
-            let now = ctx.input(|i| i.time);
-            let (has_bg_script, has_chrome_script) = {
-                let st = self.themes.lock().unwrap();
-                match st.manager.resolved.as_ref().and_then(|r| r.script.as_ref()) {
-                    Some(s) => (s.has_background(), s.has_chrome()),
-                    None => (false, false),
-                }
-            };
-            let bg_script = has_bg_script.then(|| (self.themes.clone(), self.prefs.theme.clone()));
-            let mut bg_hook = move |painter: &egui::Painter, rect: egui::Rect| {
-                let cmds = {
-                    let Some((themes, theme)) = &bg_script else { return };
-                    let mut st = themes.lock().unwrap();
-                    if let Some(script) = st.manager.resolved.as_mut().and_then(|r| r.script.as_mut()) {
-                        script.paint_background(rect.width(), rect.height(), now, theme)
-                    } else {
-                        Vec::new()
+            if self.prefs.small_mode {
+                crate::shell::show_small_mode(self, ui, &mut actions);
+            } else {
+                let snapshot = self.resolved_snapshot.take();
+                let bg_tex = self.bg_tex.as_ref().map(|(_, _, h)| h.clone());
+                let logo_tex = self.logo_tex.as_ref().map(|(_, _, h)| h.clone());
+                let now = ctx.input(|i| i.time);
+                let (has_bg_script, has_chrome_script) = {
+                    let st = self.themes.lock().unwrap();
+                    match st.manager.resolved.as_ref().and_then(|r| r.script.as_ref()) {
+                        Some(s) => (s.has_background(), s.has_chrome()),
+                        None => (false, false),
                     }
                 };
-                themes::paint_draw_cmds(painter, rect, &cmds);
-            };
-            let chrome_script = has_chrome_script.then(|| (self.themes.clone(), self.prefs.theme.clone()));
-            let mut chrome_hook = move |painter: &egui::Painter, rect: egui::Rect| {
-                let cmds = {
-                    let Some((themes, theme)) = &chrome_script else { return };
-                    let mut st = themes.lock().unwrap();
-                    if let Some(script) = st.manager.resolved.as_mut().and_then(|r| r.script.as_mut()) {
-                        script.paint_chrome(rect.width(), rect.height(), now, theme)
-                    } else {
-                        Vec::new()
-                    }
+                let bg_script = has_bg_script.then(|| (self.themes.clone(), self.prefs.theme.clone()));
+                let mut bg_hook = move |painter: &egui::Painter, rect: egui::Rect| {
+                    let cmds = {
+                        let Some((themes, theme)) = &bg_script else { return };
+                        let mut st = themes.lock().unwrap();
+                        if let Some(script) = st.manager.resolved.as_mut().and_then(|r| r.script.as_mut()) {
+                            script.paint_background(rect.width(), rect.height(), now, theme)
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    themes::paint_draw_cmds(painter, rect, &cmds);
                 };
-                themes::paint_draw_cmds(painter, rect, &cmds);
-            };
-            crate::shell::show_with_theme(
-                self,
-                ui,
-                &mut actions,
-                snapshot.as_ref(),
-                bg_tex.as_ref(),
-                logo_tex.as_ref(),
-                has_bg_script.then_some(&mut bg_hook as &mut dyn FnMut(&egui::Painter, egui::Rect)),
-                has_chrome_script.then_some(&mut chrome_hook as &mut dyn FnMut(&egui::Painter, egui::Rect)),
-            );
-            self.resolved_snapshot = snapshot;
+                let chrome_script = has_chrome_script.then(|| (self.themes.clone(), self.prefs.theme.clone()));
+                let mut chrome_hook = move |painter: &egui::Painter, rect: egui::Rect| {
+                    let cmds = {
+                        let Some((themes, theme)) = &chrome_script else { return };
+                        let mut st = themes.lock().unwrap();
+                        if let Some(script) = st.manager.resolved.as_mut().and_then(|r| r.script.as_mut()) {
+                            script.paint_chrome(rect.width(), rect.height(), now, theme)
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    themes::paint_draw_cmds(painter, rect, &cmds);
+                };
+                crate::shell::show_with_theme(
+                    self,
+                    ui,
+                    &mut actions,
+                    snapshot.as_ref(),
+                    bg_tex.as_ref(),
+                    logo_tex.as_ref(),
+                    has_bg_script.then_some(&mut bg_hook as &mut dyn FnMut(&egui::Painter, egui::Rect)),
+                    has_chrome_script.then_some(&mut chrome_hook as &mut dyn FnMut(&egui::Painter, egui::Rect)),
+                );
+                self.resolved_snapshot = snapshot;
+            }
             crate::shell::activate_dialog(self, &ctx);
             crate::shell::friend_dialogs(self, &ctx);
             crate::friends_window::show(self, &ctx, &mut actions);
@@ -1499,10 +1684,28 @@ impl eframe::App for SteamApp {
         };
         self.registry.tick(env);
         self.apply_actions(&ctx, actions);
-        crate::shell::toasts(self, &ctx);
+        let keyboard_open = big_picture && if signed_in {
+            !launch_dialog && self.bigpicture.osk_open()
+        } else {
+            self.login.bp_osk_open
+        };
+        let desktop_osk_open = !signed_in && !big_picture && crate::login::desktop_osk_visible(self);
+        let want_ime = !(keyboard_open || desktop_osk_open);
+        if self.last_ime_allowed != Some(want_ime) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(want_ime));
+            self.last_ime_allowed = Some(want_ime);
+        }
+        let keyboard_inset = if keyboard_open {
+            self.bigpicture.keyboard_inset(&ctx, ui.max_rect(), self.prefs.bigpicture_scale)
+        } else {
+            0.0
+        };
+        crate::shell::toasts(self, &ctx, keyboard_inset);
+        crate::builtin::chat_render::show_lightbox(&ctx, &self.prefs.theme);
         if !big_picture || self.bigpicture.is_windowed() {
-            if signed_in {
+            if signed_in || self.bigpicture.is_windowed() {
                 crate::chrome::resize_handles(&ctx);
+                crate::chrome::resize_grip(&ctx, &self.prefs.theme);
             }
             crate::chrome::border(&ctx, &self.prefs.theme);
         }
@@ -1510,6 +1713,7 @@ impl eframe::App for SteamApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.sync_client_preferences(true);
+        self.prefs.steam_profile_ui = self.flags.lock().unwrap().steam_profile_ui;
         self.prefs.ext_data = self.registry.save_all().into_iter().collect();
         eframe::set_value(storage, "prefs", &self.prefs);
         // eframe restores its own "window" entry even with persist_window
@@ -1536,7 +1740,48 @@ enum WindowMode {
     /// Small "signing in" splash.
     Splash,
     SignIn,
+    /// Sign-in window expanded vertically to hold the built-in touch OSK.
+    SignInTall,
+    /// Windowed Steam Deck preview (`--steam-deck=window`, 1280×800).
+    DeckPreview,
     Main,
+    Small,
+}
+
+/// Safe usable work-area bounds for a floating window on `monitor`, leaving
+/// breathing room around all edges and room for desktop panels/taskbars (e.g.
+/// KDE Plasma's ~48px panel on Steam Deck's 1280×800 screen).
+fn safe_work_area(monitor: [f32; 2]) -> [f32; 2] {
+    let margin_x = (monitor[0] * 0.05).max(48.0);
+    let margin_y = (monitor[1] * 0.08).max(64.0);
+    [
+        (monitor[0] - margin_x).max(320.0).min(monitor[0]),
+        (monitor[1] - margin_y).max(240.0).min(monitor[1]),
+    ]
+}
+
+/// Clamp a desired window size and minimum size to fit comfortably inside `monitor`.
+fn clamp_window_to_monitor(size: [f32; 2], min: [f32; 2], monitor: [f32; 2]) -> ([f32; 2], [f32; 2]) {
+    let safe = safe_work_area(monitor);
+    let clamped_size = [size[0].min(safe[0]).round(), size[1].min(safe[1]).round()];
+    let clamped_min = [min[0].min(clamped_size[0]).round(), min[1].min(clamped_size[1]).round()];
+    (clamped_size, clamped_min)
+}
+
+/// Center `size` inside the safe work area (leaving extra space at the bottom for a taskbar).
+fn center_in_work_area(size: [f32; 2], monitor: [f32; 2]) -> [f32; 2] {
+    let safe = safe_work_area(monitor);
+    let x = ((monitor[0] - size[0]) * 0.5).max(0.0).round();
+    let y = ((safe[1] - size[1]) * 0.5 + 12.0).clamp(0.0, (monitor[1] - size[1]).max(0.0)).round();
+    [x, y]
+}
+
+/// Clamp a restored outer window position so the window stays visible inside `monitor`.
+fn clamp_position_to_monitor(pos: [f32; 2], size: [f32; 2], monitor: [f32; 2]) -> [f32; 2] {
+    let safe = safe_work_area(monitor);
+    let max_x = (monitor[0] - size[0]).max(0.0);
+    let max_y = (safe[1] - size[1]).max(0.0);
+    [pos[0].clamp(0.0, max_x).round(), pos[1].clamp(0.0, max_y).round()]
 }
 
 fn snapshot_resolved(res: &themes::ResolvedTheme) -> themes::ResolvedTheme {
@@ -1614,7 +1859,26 @@ fn sync_texture(
 
 #[cfg(test)]
 mod tests {
-    use super::Prefs;
+    use super::{Prefs, clamp_position_to_monitor, clamp_window_to_monitor, safe_work_area};
+
+    #[test]
+    fn steam_deck_1280x800_window_clamping_clears_kde_taskbar() {
+        let deck = [1280.0, 800.0];
+        let safe = safe_work_area(deck);
+        assert!(safe[0] <= 1232.0 && safe[0] >= 1200.0, "safe width {safe:?}");
+        assert!(safe[1] <= 752.0 && safe[1] >= 720.0, "safe height {safe:?}");
+
+        let (size, min) = clamp_window_to_monitor([1440.0, 900.0], [900.0, 580.0], deck);
+        assert!(size[0] <= 1232.0 && size[1] <= 752.0, "clamped main size {size:?}");
+        assert!(min[0] <= size[0] && min[1] <= size[1], "min {min:?} must fit size {size:?}");
+
+        let (desktop_size, _) = clamp_window_to_monitor([1440.0, 900.0], [900.0, 580.0], [1920.0, 1080.0]);
+        assert_eq!(desktop_size, [1440.0, 900.0]);
+
+        let pos = clamp_position_to_monitor([500.0, 400.0], size, deck);
+        assert!(pos[0] + size[0] <= deck[0]);
+        assert!(pos[1] + size[1] <= safe[1]);
+    }
 
     #[test]
     fn prefs_controller_defaults_and_roundtrip() {
@@ -1641,6 +1905,17 @@ mod tests {
     }
 
     #[test]
+    fn steam_profile_ui_defaults_to_classic_and_roundtrips() {
+        let legacy: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.steam_profile_ui);
+        assert!(!Prefs::default().steam_profile_ui);
+
+        let prefs = Prefs { steam_profile_ui: true, ..Prefs::default() };
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(serde_json::from_str::<Prefs>(&json).unwrap().steam_profile_ui);
+    }
+
+    #[test]
     fn prefs_show_whats_new_defaults_true_and_roundtrips() {
         let legacy: Prefs = serde_json::from_str("{}").unwrap();
         assert!(legacy.show_whats_new);
@@ -1651,6 +1926,19 @@ mod tests {
         let json = serde_json::to_string(&prefs).unwrap();
         let restored: Prefs = serde_json::from_str(&json).unwrap();
         assert!(!restored.show_whats_new);
+    }
+
+    #[test]
+    fn prefs_small_mode_defaults_false_and_roundtrips() {
+        let legacy: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.small_mode);
+        assert!(!Prefs::default().small_mode);
+
+        let mut prefs = Prefs::default();
+        prefs.small_mode = true;
+        let json = serde_json::to_string(&prefs).unwrap();
+        let restored: Prefs = serde_json::from_str(&json).unwrap();
+        assert!(restored.small_mode);
     }
 }
 

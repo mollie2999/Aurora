@@ -13,7 +13,7 @@ use egui::containers::menu::SubMenu;
 use egui::{Align, Align2, Color32, CornerRadius, Layout, Margin, Rect, Sense, Stroke, Ui, pos2, vec2};
 use extensions::{Ctx, Extension, Manifest, PageSpec};
 use local::manage::{Progress, VerifyReport};
-use model::{AppId, InstalledGame, art};
+use model::{AppId, InstalledGame, SteamId, art};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -160,6 +160,8 @@ struct Saved {
     hide_collections: bool,
     /// Collapsed sidebar group keys (collections and built-in sections).
     collapsed_groups: BTreeSet<String>,
+    /// Themed sidebar sorted by recent activity (Steam's clock button).
+    recent_order: bool,
     /// Collections as Steam last had them, for the account they belong to:
     /// the base of the three-way merge at sign-in.
     collections_base: Option<(u64, client::collections::Collections)>,
@@ -184,6 +186,8 @@ enum MenuAct {
     Hide,
     Shortcut,
     Browse,
+    #[cfg(not(windows))]
+    BrowsePrefix,
     Verify,
     Move,
     Backup,
@@ -276,6 +280,9 @@ pub struct Library {
     favorites: BTreeSet<AppId>,
     hidden: BTreeSet<AppId>,
     show_hidden: bool,
+    hidden_only: bool,
+    soundtracks_only: bool,
+    news_view: bool,
     custom: Vec<CustomGame>,
     /// Index into `custom` when a non-Steam game is open.
     custom_selected: Option<usize>,
@@ -342,6 +349,14 @@ pub struct Library {
     shortcut_after_install: BTreeMap<AppId, std::path::PathBuf>,
     seen_finished: BTreeSet<AppId>,
     storage_dialog: Option<super::storage_ui::StorageDialog>,
+    /// "Change Preferred Copy" open for a family game, with the picked lender.
+    preferred_copy: Option<(AppId, Option<SteamId>)>,
+    pending_preferred_copy: Option<u64>,
+    preferred_copy_request_id: u64,
+    /// A Family load initiated by the game page is still pending.
+    family_loading: bool,
+    /// Sidebar grouped by recent activity instead of the theme's grouping.
+    recent_order: bool,
 }
 
 impl Extension for Library {
@@ -354,10 +369,39 @@ impl Extension for Library {
     }
 
     fn on_navigate(&mut self, _page: &str, arg: Option<&str>) {
+        self.preferred_copy = None;
         self.custom_selected = None;
         self.collections_view = None;
         self.dialog = None;
         self.reader = None;
+        match arg {
+            Some("hidden") => {
+                self.selected = None;
+                self.hidden_only = true;
+                self.soundtracks_only = false;
+                self.news_view = false;
+                return;
+            }
+            Some("soundtracks") => {
+                self.selected = None;
+                self.soundtracks_only = true;
+                self.hidden_only = false;
+                self.news_view = false;
+                return;
+            }
+            Some("news") => {
+                self.selected = None;
+                self.news_view = true;
+                self.hidden_only = false;
+                self.soundtracks_only = false;
+                return;
+            }
+            _ => {
+                self.hidden_only = false;
+                self.soundtracks_only = false;
+                self.news_view = false;
+            }
+        }
         if arg == Some("restore") {
             self.selected = None;
             self.pending = Some("restore".into());
@@ -420,12 +464,35 @@ impl Extension for Library {
                 Err(e) => ctx.toast(i18n::tr_dyn(e)),
             },
             client::Event::LoggedIn { steam_id, .. } => {
+                self.family_loading = false;
+                self.preferred_copy = None;
+                self.pending_preferred_copy = None;
                 self.account = Some(*steam_id);
                 self.collections_loaded = false;
                 self.send_cloud_settings(ctx);
                 ctx.send(Command::LoadSteamCollections);
                 // Account-wide play history, for "Recent games".
                 ctx.send(Command::LoadPlayerGames { steam_id: *steam_id, language: i18n::language().steam_name().into() });
+            }
+            client::Event::LoggedOut { .. } => {
+                self.family_loading = false;
+                self.preferred_copy = None;
+                self.pending_preferred_copy = None;
+            }
+            client::Event::Family { steam_id, .. } if ctx.state.steam_id == *steam_id => {
+                self.family_loading = false;
+            }
+            client::Event::PreferredCopyChanged { request_id, steam_id, result, .. }
+                if ctx.state.steam_id == *steam_id && self.pending_preferred_copy == Some(*request_id) =>
+            {
+                self.pending_preferred_copy = None;
+                match result {
+                    Ok(()) => {
+                        self.preferred_copy = None;
+                        ctx.toast(t!("Preferred copy updated."));
+                    }
+                    Err(error) => ctx.toast(t!("Steam didn't accept that: {error}", error = error)),
+                }
             }
             client::Event::Apps(_) => {
                 self.send_cloud_settings(ctx);
@@ -528,6 +595,9 @@ impl Extension for Library {
                 (Some(CollectionsView::Detail(i)), _, _) => self.collection_detail(i, ui, &t, ctx),
                 (None, Some(i), _) => self.custom_page(i, ui, &t, ctx),
                 (None, None, Some(id)) => self.game_page(id, ui, &t, ctx),
+                (None, None, None) if self.news_view => self.news_feed_page(ui, &t, ctx),
+                (None, None, None) if self.hidden_only => self.hidden_games_page(ui, &t, ctx),
+                (None, None, None) if self.soundtracks_only => self.soundtracks_page(ui, &t, ctx),
                 (None, None, None) => self.home(ui, &t, ctx),
             });
         }
@@ -613,6 +683,7 @@ impl Extension for Library {
             collections: self.collections.clone(),
             hide_collections: self.hide_collections,
             collapsed_groups: self.collapsed_groups.clone(),
+            recent_order: self.recent_order,
             collections_base: self.collections_base.clone(),
             through_steam: self.through_steam,
             pending_shortcuts: self.shortcut_after_install.clone(),
@@ -638,6 +709,7 @@ impl Extension for Library {
         self.collections = saved.collections;
         self.hide_collections = saved.hide_collections;
         self.collapsed_groups = saved.collapsed_groups;
+        self.recent_order = saved.recent_order;
         self.collections_base = saved.collections_base;
         self.through_steam = saved.through_steam;
         client::launch_through_steam(self.through_steam);
@@ -1014,6 +1086,10 @@ impl Library {
                     w::menu_spacing(ui);
                     item(ui, icons::DESKTOP, t!("Add desktop shortcut"), MenuAct::Shortcut);
                     item(ui, icons::FOLDER, t!("Browse local files"), MenuAct::Browse);
+                    #[cfg(not(windows))]
+                    if ctx.local.games.iter().find(|g| g.app_id == id).and_then(|g| local::compat::prefix_dir(&g.install_dir, id)).is_some() {
+                        item(ui, icons::FOLDER, t!("Browse Proton prefix"), MenuAct::BrowsePrefix);
+                    }
                     item(ui, icons::SHIELD, t!("Verify game files"), MenuAct::Verify);
                     item(ui, icons::DRIVES, t!("Move install folder…"), MenuAct::Move);
                     item(ui, icons::PACKAGE, t!("Back up game files…"), MenuAct::Backup);
@@ -1089,6 +1165,12 @@ impl Library {
             MenuAct::Browse => {
                 if let Some(g) = local {
                     local::open_folder(&g.install_dir);
+                }
+            }
+            #[cfg(not(windows))]
+            MenuAct::BrowsePrefix => {
+                if let Some(dir) = local.and_then(|g| local::compat::prefix_dir(&g.install_dir, id)) {
+                    local::open_folder(&dir);
                 }
             }
             MenuAct::Verify => {
@@ -1203,7 +1285,11 @@ impl Library {
                     Filter::Favorites => self.favorites.contains(&e.app_id),
                     Filter::Collection(i) => self.collections.get(i).is_some_and(|c| c.games.contains(&e.app_id)),
                 }
-                && (self.show_hidden || !self.hidden.contains(&e.app_id))
+                && if self.hidden_only {
+                    self.hidden.contains(&e.app_id)
+                } else {
+                    self.show_hidden || !self.hidden.contains(&e.app_id)
+                }
                 && self.adv_match(e, &playtime)
         });
         match self.sort {
@@ -1222,7 +1308,11 @@ impl Library {
         // Like Steam, the library lists games unless other types are picked
         // in the filters: no dedicated servers, SDKs, tools or soundtracks.
         // (Games without app info, e.g. non-Steam ones, always show.)
-        if f.kinds.is_empty() && o.is_some_and(|o| !is_game_kind(&o.kind)) {
+        if self.soundtracks_only {
+            if !o.is_some_and(|o| o.kind.eq_ignore_ascii_case("music")) {
+                return false;
+            }
+        } else if f.kinds.is_empty() && o.is_some_and(|o| !is_game_kind(&o.kind)) {
             return false;
         }
         if f.count() == 0 {
@@ -1240,7 +1330,7 @@ impl Library {
                 2 => minutes > 0,
                 _ => minutes == 0,
             });
-        let kind_ok = f.kinds.is_empty() || o.is_some_and(|o| f.kinds.contains(&o.kind));
+        let kind_ok = self.soundtracks_only || f.kinds.is_empty() || o.is_some_and(|o| f.kinds.contains(&o.kind));
         let genre_ok = f.genres.is_empty() || o.is_some_and(|o| o.genres.iter().any(|g| f.genres.contains(g)));
         let feature_ok = f.features.is_empty() || o.is_some_and(|o| f.features.iter().all(|c| o.categories.contains(c)));
         let deck_ok = f.deck.is_empty() || f.deck.contains(&o.map(|o| o.deck).unwrap_or(0));
@@ -1504,6 +1594,9 @@ impl Library {
         self.selected = None;
         self.custom_selected = None;
         self.collections_view = None;
+        self.hidden_only = false;
+        self.soundtracks_only = false;
+        self.news_view = false;
         if matches!(self.filter, Filter::Collection(_)) {
             self.filter = Filter::All;
         }
@@ -1608,6 +1701,18 @@ impl Library {
             }
         });
         ui.add_space(8.0);
+        if self.hidden_only || self.soundtracks_only {
+            let label = if self.hidden_only { t!("Showing: Hidden Games") } else { t!("Showing: Soundtracks") };
+            ui.horizontal(|ui| {
+                ui.label(w::text_medium(label, 12.0, t.accent));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if w::icon_button(ui, t, icons::X, t!("Back to Library"), false, 0).clicked() {
+                        self.return_home();
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        }
         let width = ui.available_width() - 6.0;
         w::search(ui, t, &mut self.search, t!("Search games"), width);
         ui.add_space(6.0);
@@ -2580,6 +2685,7 @@ impl Library {
                 });
             });
             ui.add_space(10.0);
+            self.family_line(ui, t, ctx, id);
 
             // Link row (like Steam's under the play bar).
             egui::Frame::new().outer_margin(Margin::symmetric(24, 0)).show(ui, |ui| {
@@ -2666,6 +2772,9 @@ impl Library {
                 ui.label(w::text(t!("Network {net}/s · Disk {disk}/s", net = ui::bytes(d.speed), disk = ui::bytes(d.disk_speed)), 12.0, t.text_faint));
             }
         });
+        if t.name.eq_ignore_ascii_case("Metro") {
+            ui.add_space(8.0);
+        }
         if d.verifying() {
             if w::icon_button(ui, t, icons::X, t!("Cancel"), false, 0).clicked() {
                 ctx.send(Command::CancelVerify { app_id: id });
@@ -2694,6 +2803,12 @@ impl Library {
             }
             if item(ui, icons::FOLDER, t!("Browse local files"), t.text) {
                 local::open_folder(&g.install_dir);
+            }
+            #[cfg(not(windows))]
+            if let Some(dir) = local::compat::prefix_dir(&g.install_dir, id) {
+                if item(ui, icons::FOLDER, t!("Browse Proton prefix"), t.text) {
+                    local::open_folder(&dir);
+                }
             }
             if item(ui, icons::SHIELD, t!("Verify game files"), t.text) {
                 self.start_verify(ctx, g);
@@ -3004,6 +3119,366 @@ impl Library {
             }
         }
         self.reports.insert(id, report);
+    }
+
+    fn news_feed_page(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+        let mut local_recent: Vec<(u64, AppId)> = ctx
+            .local
+            .games
+            .iter()
+            .filter_map(|g| g.last_played.map(|lp| (lp, g.app_id)))
+            .collect();
+        local_recent.sort_by_key(|(lp, _)| std::cmp::Reverse(*lp));
+        let mut ids: Vec<AppId> = local_recent.into_iter().map(|(_, id)| id).collect();
+        if let Some(Ok(pg)) = ctx.state.player_games.get(&ctx.state.steam_id) {
+            let mut owned_recent: Vec<_> = pg.iter().collect();
+            owned_recent.sort_by_key(|g| std::cmp::Reverse(g.last_played));
+            for g in owned_recent {
+                if !ids.contains(&g.app_id) {
+                    ids.push(g.app_id);
+                }
+            }
+        }
+        for g in &ctx.local.games {
+            if !ids.contains(&g.app_id) {
+                ids.push(g.app_id);
+            }
+        }
+        ids.truncate(15);
+        let (posts, loading) = self.whats_new_posts(&ids);
+
+        egui::ScrollArea::vertical().id_salt("lib-news-feed").auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(22.0);
+            w::centered(ui, 980.0, 28.0, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(w::caption_text(t, t!("LIBRARY")));
+                        ui.label(w::text_bold(t!("Update News"), 24.0, t.text));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if w::button(ui, t, Some(icons::BACK), t!("Back to Library"), w::Kind::Secondary, w::Size::Md).clicked() {
+                            self.return_home();
+                        }
+                    });
+                });
+                ui.add_space(16.0);
+                if posts.is_empty() && loading {
+                    for _ in 0..4 {
+                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 130.0), Sense::hover());
+                        w::skeleton(ui, t, r, t.corner());
+                        ui.add_space(10.0);
+                    }
+                    return;
+                }
+                if posts.is_empty() {
+                    w::empty(ui, t, icons::NOTE, t!("No recent updates"), t!("Updates and announcements from your games will appear here."));
+                    return;
+                }
+                for (app_id, idx, ev) in posts {
+                    let game_name = ctx
+                        .state
+                        .app_name(app_id)
+                        .map(String::from)
+                        .or_else(|| ctx.local.games.iter().find(|g| g.app_id == app_id).map(|g| g.name.clone()))
+                        .unwrap_or_else(|| app_id.to_string());
+                    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 144.0), Sense::click());
+                    let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                    ui.painter().rect_filled(rect, t.corner(), w::mix(t.surface, t.surface_hover, hover));
+                    ui.painter().rect_stroke(rect, t.corner(), Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+                    let img = Rect::from_min_size(rect.min + vec2(12.0, 12.0), vec2(214.0, 120.0));
+                    let art_url = ev.capsule.as_deref().or(ev.header.as_deref());
+                    match art_url {
+                        Some(u) => w::image_or_skeleton(ui, t, img, u, t.corner_small()),
+                        None => {
+                            let hdr = art::header(app_id);
+                            w::image_or_skeleton(ui, t, img, &hdr, t.corner_small());
+                        }
+                    }
+                    let text_rect = Rect::from_min_max(pos2(img.right() + 16.0, rect.top() + 12.0), rect.max - vec2(14.0, 12.0));
+                    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(text_rect).layout(Layout::top_down(Align::Min)));
+                    c.horizontal(|ui| {
+                        ui.label(w::text_bold(i18n::tr_dyn(ev.kind.label()).to_uppercase(), 11.0, news::kind_color(t, ev.kind)));
+                        ui.label(w::text("·", 11.0, t.text_faint));
+                        ui.label(w::text_medium(&game_name, 12.0, t.accent));
+                        ui.label(w::text("·", 11.0, t.text_faint));
+                        ui.label(w::text(news::date(ev.time), 11.5, t.text_faint));
+                    });
+                    c.add(egui::Label::new(w::text_bold(&ev.title, 16.5, t.text)).truncate());
+                    c.add_space(4.0);
+                    let summary: String = ev.summary.chars().take(220).collect();
+                    c.add(egui::Label::new(w::text(summary, 13.0, t.text_dim)).wrap());
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.reader = Some(Reader { app: app_id, index: idx });
+                    }
+                    ui.add_space(12.0);
+                }
+            });
+        });
+    }
+
+    fn hidden_games_page(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+        let rows: Vec<(AppId, String, Option<String>, Option<InstalledGame>)> = entries(ctx.state, ctx.local)
+            .into_iter()
+            .filter(|e| self.hidden.contains(&e.app_id))
+            .map(|e| {
+                let icon = e.owned.and_then(|o| o.icon.as_deref()).map(|h| art::icon(e.app_id, h));
+                (e.app_id, e.name.to_owned(), icon, e.installed.cloned())
+            })
+            .collect();
+        egui::ScrollArea::vertical().id_salt("lib-hidden").auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(22.0);
+            w::centered(ui, 980.0, 28.0, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(w::caption_text(t, t!("LIBRARY")));
+                        ui.label(w::text_bold(t!("Hidden Games"), 24.0, t.text));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if w::button(ui, t, Some(icons::BACK), t!("Show all games"), w::Kind::Secondary, w::Size::Md).clicked() {
+                            self.return_home();
+                        }
+                    });
+                });
+                ui.add_space(16.0);
+                if rows.is_empty() {
+                    w::empty(ui, t, icons::EYE_SLASH, t!("No hidden games"), t!("Right-click any game in your library and choose “Hide this game” to hide it here."));
+                    return;
+                }
+                for (id, name, icon_url, installed) in rows {
+                    let playing = ctx.state.playing == Some(id);
+                    egui::Frame::new()
+                        .fill(t.surface)
+                        .stroke(Stroke::new(1.0, t.border))
+                        .corner_radius(t.corner_small())
+                        .inner_margin(Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let (ir, _) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
+                                let hdr = art::header(id);
+                                let urls: Vec<&str> = icon_url.as_deref().into_iter().chain([hdr.as_str()]).collect();
+                                if !w::paint_cover_first(ui, ir, &urls, CornerRadius::same(4)) {
+                                    ui.painter().rect_filled(ir, CornerRadius::same(4), t.raised);
+                                }
+                                ui.add_space(8.0);
+                                ui.vertical(|ui| {
+                                    ui.label(w::text_semibold(&name, 14.5, t.text));
+                                    let sub = if playing {
+                                        t!("Running").to_string()
+                                    } else if installed.is_some() {
+                                        t!("Installed").to_string()
+                                    } else {
+                                        t!("Not installed").to_string()
+                                    };
+                                    ui.label(w::text(sub, 12.0, t.text_dim));
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if w::button(ui, t, Some(icons::EYE), t!("Unhide"), w::Kind::Secondary, w::Size::Sm).clicked() {
+                                        self.hidden.remove(&id);
+                                    }
+                                    if w::button(ui, t, None, t!("Open"), w::Kind::Ghost, w::Size::Sm).clicked() {
+                                        self.selected = Some(id);
+                                    }
+                                    if let Some(g) = &installed {
+                                        if !playing && w::button(ui, t, Some(icons::PLAY), t!("Play"), w::Kind::Play, w::Size::Sm).clicked() {
+                                            let args = self.launch_args_for(id);
+                                            self.launch_or_notice(ctx, id, g.install_dir.clone(), args);
+                                        }
+                                    } else if w::button(ui, t, Some(icons::DOWNLOAD), t!("Install"), w::Kind::Primary, w::Size::Sm).clicked() {
+                                        self.install_dialog = Some(InstallDialog::new(id, ctx));
+                                    }
+                                });
+                            });
+                        });
+                    ui.add_space(8.0);
+                }
+            });
+        });
+    }
+
+    fn soundtracks_page(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+        let mut rows: Vec<(AppId, String, Option<String>, Option<InstalledGame>)> = entries(ctx.state, ctx.local)
+            .into_iter()
+            .filter(|e| e.owned.is_some_and(|o| o.kind.eq_ignore_ascii_case("music")))
+            .map(|e| {
+                let icon = e.owned.and_then(|o| o.icon.as_deref()).map(|h| art::icon(e.app_id, h));
+                (e.app_id, e.name.to_owned(), icon, e.installed.cloned())
+            })
+            .collect();
+        rows.sort_by(|a, b| model::cmp_ignore_case(&a.1, &b.1));
+        egui::ScrollArea::vertical().id_salt("lib-soundtracks").auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(22.0);
+            w::centered(ui, 980.0, 28.0, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(w::caption_text(t, t!("LIBRARY")));
+                        ui.label(w::text_bold(t!("Soundtracks"), 24.0, t.text));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if w::button(ui, t, Some(icons::BACK), t!("Show all games"), w::Kind::Secondary, w::Size::Md).clicked() {
+                            self.return_home();
+                        }
+                    });
+                });
+                ui.add_space(16.0);
+                if rows.is_empty() {
+                    w::empty(ui, t, icons::SPEAKER_HIGH, t!("No soundtracks"), t!("Soundtracks you own on Steam appear here."));
+                    return;
+                }
+                for (id, name, icon_url, installed) in rows {
+                    egui::Frame::new()
+                        .fill(t.surface)
+                        .stroke(Stroke::new(1.0, t.border))
+                        .corner_radius(t.corner_small())
+                        .inner_margin(Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let (ir, _) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
+                                let hdr = art::header(id);
+                                let urls: Vec<&str> = icon_url.as_deref().into_iter().chain([hdr.as_str()]).collect();
+                                if !w::paint_cover_first(ui, ir, &urls, CornerRadius::same(4)) {
+                                    ui.painter().rect_filled(ir, CornerRadius::same(4), t.raised);
+                                }
+                                ui.add_space(8.0);
+                                ui.vertical(|ui| {
+                                    ui.label(w::text_semibold(&name, 14.5, t.text));
+                                    ui.label(w::text(if installed.is_some() { t!("Downloaded") } else { t!("Not downloaded") }, 12.0, t.text_dim));
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if w::button(ui, t, None, t!("Open"), w::Kind::Ghost, w::Size::Sm).clicked() {
+                                        self.selected = Some(id);
+                                    }
+                                    if let Some(g) = &installed {
+                                        if w::button(ui, t, Some(icons::FOLDER), t!("Browse files"), w::Kind::Secondary, w::Size::Sm).clicked() {
+                                            local::open_folder(&g.install_dir);
+                                        }
+                                    } else if w::button(ui, t, Some(icons::DOWNLOAD), t!("Download"), w::Kind::Primary, w::Size::Sm).clicked() {
+                                        self.install_dialog = Some(InstallDialog::new(id, ctx));
+                                    }
+                                });
+                            });
+                        });
+                    ui.add_space(8.0);
+                }
+            });
+        });
+    }
+
+    /// Compact single-column game list for `View -> Small Mode`.
+    pub(crate) fn show_small_mode(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+        self.finish_uninstalls(ctx);
+        self.downloading = ctx
+            .state
+            .downloads
+            .values()
+            .filter(|d| !matches!(d.phase, model::DownloadPhase::Done | model::DownloadPhase::Failed))
+            .map(|d| (d.app_id, d.paused))
+            .collect();
+        self.queued = ctx.state.download_queue.iter().copied().collect();
+
+        ui.add_space(4.0);
+        let width = ui.available_width();
+        w::search(ui, t, &mut self.search, t!("Search games"), width);
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+            for (f, label) in [(Filter::All, t!("All")), (Filter::Installed, t!("Installed")), (Filter::Favorites, icons::STAR)] {
+                if w::chip(ui, t, label, self.filter == f).clicked() {
+                    self.filter = f;
+                }
+            }
+            if !self.hidden.is_empty() && w::chip(ui, t, icons::EYE, self.show_hidden).on_hover_text(t!("Show hidden games")).clicked() {
+                self.show_hidden = !self.show_hidden;
+            }
+        });
+        ui.add_space(6.0);
+
+        let rows: Vec<(AppId, String, Option<String>, Option<InstalledGame>, bool)> = self
+            .filtered(ctx)
+            .into_iter()
+            .map(|e| {
+                let icon = e.owned.and_then(|o| o.icon.as_deref()).map(|h| art::icon(e.app_id, h));
+                (e.app_id, e.name.to_owned(), icon, e.installed.cloned(), e.owned.is_some())
+            })
+            .collect();
+
+        egui::ScrollArea::vertical().id_salt("lib-small-mode").auto_shrink([false, false]).show(ui, |ui| {
+            if rows.is_empty() {
+                ui.add_space(16.0);
+                ui.label(w::text(t!("No matching games."), 13.0, t.text_faint));
+            }
+            for (id, name, icon_url, installed, owned) in rows {
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 4.0, 32.0), Sense::click());
+                if !ui.is_rect_visible(rect) {
+                    continue;
+                }
+                let sel = self.selected == Some(id);
+                let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                if sel {
+                    ui.painter().rect_filled(rect, t.corner_small(), t.accent.gamma_multiply(0.18));
+                } else if hover > 0.0 {
+                    ui.painter().rect_filled(rect, t.corner_small(), w::mix(Color32::TRANSPARENT, t.surface, hover));
+                }
+                let icon = Rect::from_min_size(rect.min + vec2(6.0, 5.0), vec2(22.0, 22.0));
+                let header = art::header(id);
+                let urls: Vec<&str> = icon_url.as_deref().into_iter().chain([header.as_str()]).collect();
+                if !w::paint_cover_first(ui, icon, &urls, CornerRadius::same(4)) {
+                    ui.painter().rect_filled(icon, CornerRadius::same(4), t.surface_hover);
+                }
+                let setup = setup_state(ctx, id, installed.is_some());
+                let busy = matches!(setup, Setup::Downloading(_) | Setup::Queued);
+                let color = if busy {
+                    t.accent
+                } else if sel {
+                    t.text
+                } else if installed.is_some() {
+                    w::mix(t.text_dim, t.text, hover)
+                } else {
+                    t.text_faint
+                };
+                let playing = ctx.state.playing == Some(id);
+                let right_pad = if playing || busy { 56.0 } else { 20.0 };
+                let mut job = egui::text::LayoutJob::simple_singleline(name.clone(), w::font_medium(13.0), color);
+                job.wrap = egui::text::TextWrapping::truncate_at_width((rect.width() - 40.0 - right_pad).max(40.0));
+                let galley = ui.painter().layout_job(job);
+                ui.painter().galley(pos2(icon.right() + 8.0, rect.center().y - galley.size().y / 2.0), galley, color);
+                if playing {
+                    ui.painter().text(rect.right_center() - vec2(10.0, 0.0), Align2::RIGHT_CENTER, t!("Running"), w::font(11.0), t.in_game);
+                } else if let Setup::Downloading(d) = &setup {
+                    ui.painter().text(rect.right_center() - vec2(10.0, 0.0), Align2::RIGHT_CENTER, format!("{}%", (d.fraction() * 100.0) as u32), w::font(11.0), t.accent);
+                }
+                self.game_menu(t, ctx, &resp, id, installed.is_some(), playing);
+                if resp.double_clicked() {
+                    if playing {
+                        ctx.send(Command::StopGame { app_id: id });
+                    } else if let Some(g) = &installed {
+                        let args = self.launch_args_for(id);
+                        self.launch_or_notice(ctx, id, g.install_dir.clone(), args);
+                    } else if owned {
+                        self.install_dialog = Some(InstallDialog::new(id, ctx));
+                    }
+                } else if resp.clicked() {
+                    self.selected = Some(id);
+                }
+            }
+        });
+
+        self.add_dialog(ui, t, ctx);
+        self.import_dialog(ui, t, ctx);
+        self.reader(ui, t, ctx);
+        self.install_window(ui, t, ctx);
+        self.properties_window(ui, t, ctx);
+        self.run_pending(ctx);
+        self.naming_dialog(ui, t);
+        if let Some(mut dlg) = self.storage_dialog.take()
+            && dlg.show(ui, t, ctx, "library")
+        {
+            self.storage_dialog = Some(dlg);
+        }
+        if let Some((id, act)) = self.menu_request.take() {
+            self.apply_menu(ctx, id, act);
+        }
     }
 
     /// Recent news for Big Picture and the desktop library.
@@ -3851,9 +4326,265 @@ fn themed_shelf_scroll(ui: &Ui, salt: &str, delta: f32) -> egui::ScrollArea {
     scroll
 }
 
+impl Library {
+    /// Steam's "Shared from your Steam Family member" line under the play bar,
+    /// with "Change preferred copy" when more than one member owns the game.
+    /// Drawn from theme tokens only, so it fits every theme.
+    fn family_line(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, id: AppId) {
+        if !ctx.state.online() {
+            return;
+        }
+        let Some(status) = ctx.state.family.as_ref() else {
+            self.load_family(ctx);
+            return;
+        };
+        let family = match status {
+            Ok(status) => match status.family.as_ref() {
+                Some(family) if family.shared_available => family,
+                None => return,
+                _ => {
+                    self.family_retry(ui, t, ctx);
+                    return;
+                }
+            },
+            Err(_) => {
+                self.family_retry(ui, t, ctx);
+                return;
+            }
+        };
+        let me = ctx.state.steam_id;
+        let copy = family.active_copy(id);
+        let copies = family.copies(id, me).len();
+        if copies == 0 || (copy == Some(me) && copies == 1) {
+            return;
+        }
+        let mut open = false;
+        egui::Frame::new().outer_margin(Margin { left: 24, right: 24, top: 0, bottom: 10 }).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if let Some(copy) = copy {
+                    let p = ctx.state.persona(copy);
+                    let lead = if copy == me { t!("Using your own copy") } else { t!("Shared from your Steam Family member") };
+                    ui.label(w::text(lead, 14.0, t.text_dim));
+                    ui.add_space(4.0);
+                    // Avatar, name and status open the member's profile.
+                    let hover_id = ui.scope_id().with(("family-member", copy));
+                    let hovered = ui.ctx().data(|d| d.get_temp::<bool>(hover_id)).unwrap_or(false);
+                    let member = ui
+                        .scope(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                w::avatar(ui, t, &art::avatar(p.avatar_hash.as_deref()), 28.0, Some(crate::shell::status_color(t, &p)));
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    let name = if p.name.is_empty() { copy.to_string() } else { p.name.clone() };
+                                    let color = crate::shell::status_color(t, &p);
+                                    let name_color = if hovered { w::mix(color, t.text, 0.5) } else { color };
+                                    let mut job = egui::text::LayoutJob::simple_singleline(name, w::font(13.5), name_color);
+                                    if hovered {
+                                        job.sections[0].format.underline = Stroke::new(1.0, name_color);
+                                    }
+                                    ui.label(job);
+                                    ui.label(w::text(crate::shell::status_text(ctx.state, &p), 11.5, color));
+                                });
+                            });
+                        })
+                        .response
+                        .interact(Sense::click());
+                    ui.ctx().data_mut(|d| d.insert_temp(hover_id, member.hovered()));
+                    if member.on_hover_text(t!("View profile")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        ctx.navigate("profile", Some(copy.to_string()));
+                    }
+                } else {
+                    ui.label(w::text(t!("Steam Family"), 14.0, t.text_dim));
+                }
+                if copies > 1 && self.pending_preferred_copy.is_none() {
+                    ui.add_space(24.0);
+                    let r = ui.add(egui::Label::new(w::text(t!("Change preferred copy"), 13.5, t.accent)).sense(Sense::click()));
+                    if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        open = true;
+                    }
+                }
+            });
+        });
+        if open {
+            self.preferred_copy = Some((id, copy));
+        }
+        if self.preferred_copy.is_some_and(|(app_id, _)| app_id == id) {
+            self.preferred_copy_dialog(ui, t, ctx);
+        } else {
+            self.preferred_copy = None;
+        }
+    }
+
+    /// Steam's "Change Preferred Copy": every family copy of the game with its DLC.
+    fn preferred_copy_dialog(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+        let Some((app_id, mut pick)) = self.preferred_copy else { return };
+        let Some(family) = ctx.state.family.as_ref().and_then(|s| s.as_ref().ok()).and_then(|s| s.family.as_ref()) else {
+            self.preferred_copy = None;
+            return;
+        };
+        let me = ctx.state.steam_id;
+        let current = family.preferred_copy(app_id);
+        let owners = family.copies(app_id, me);
+        if owners.len() < 2 {
+            self.preferred_copy = None;
+            return;
+        }
+        pick = pick.filter(|owner| owners.contains(owner));
+        let pending = self.pending_preferred_copy.is_some();
+        // DLC every copy has, which doesn't decide anything.
+        let common = family.shared_dlc.iter().filter(|d| d.parent == app_id && owners.iter().all(|o| d.owners.contains(o))).count();
+        let (family_id, mut done) = (family.id, None::<bool>);
+        let mut profile: Option<SteamId> = None;
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            done = Some(false);
+        }
+        ui::widgets::modal(ui.ctx(), egui::Id::unique(("preferred-copy", app_id))).show(ui.ctx(), |ui| {
+            ui.set_width(600.0);
+            ui.horizontal(|ui| {
+                ui.label(w::text_bold(t!("Change Preferred Copy"), 20.0, t.text));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if w::icon_button(ui, t, icons::X, t!("Close"), false, 0).clicked() {
+                        done = Some(false);
+                    }
+                });
+            });
+            ui.add(egui::Label::new(w::text(t!("Select your preferred copy of this game."), 14.0, t.text_dim)).wrap());
+            ui.add_space(10.0);
+            egui::ScrollArea::vertical().max_height(460.0).auto_shrink([false, true]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for &owner in &owners {
+                    let p = ctx.state.persona(owner);
+                    let dlc = family.dlc_of(app_id, owner);
+                    let selected = pick == Some(owner);
+                    let frame = egui::Frame::new()
+                        .fill(if selected { t.surface_hover } else { t.raised })
+                        .stroke(if selected { Stroke::new(1.0, t.accent) } else { Stroke::NONE })
+                        .corner_radius(t.corner_small())
+                        .inner_margin(Margin::same(10));
+                    let resp = frame
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                w::avatar(ui, t, &art::avatar(p.avatar_hash.as_deref()), 32.0, Some(crate::shell::status_color(t, &p)));
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    let name = if p.name.is_empty() { owner.to_string() } else { p.name.clone() };
+                                    let r = ui.add(egui::Label::new(w::text(name, 14.0, crate::shell::status_color(t, &p))).sense(Sense::click()));
+                                    if r.on_hover_text(t!("View profile")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        profile = Some(owner);
+                                    }
+                                    ui.label(w::text(crate::shell::status_text(ctx.state, &p), 12.0, crate::shell::status_color(t, &p)));
+                                });
+                                if current == Some(owner) {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(w::text(icons::STAR, 13.0, t.accent));
+                                        ui.label(w::text_semibold(t!("PREFERRED COPY"), 11.5, t.accent));
+                                    });
+                                }
+                            });
+                            ui.indent(("dlc", owner), |ui| {
+                                ui.add_space(4.0);
+                                if dlc.is_empty() && family.shared_dlc_complete {
+                                    ui.label(w::text(t!("Base game only"), 14.0, t.text));
+                                }
+                                for d in dlc.iter().take(2) {
+                                    ui.horizontal(|ui| {
+                                        let (r, _) = ui.allocate_exact_size(vec2(64.0, 30.0), Sense::hover());
+                                        if !w::paint_cover_first(ui, r, &[&art::header(d.app_id)], CornerRadius::same(2)) {
+                                            ui.painter().rect_filled(r, CornerRadius::same(2), t.surface);
+                                        }
+                                        ui.label(w::text(&d.name, 12.5, t.text_dim));
+                                    });
+                                }
+                                if dlc.len() > 2 {
+                                    ui.label(w::text(t!("+{n} more", n = dlc.len() - 2), 14.0, t.text_dim));
+                                }
+                            });
+                        })
+                        .response
+                        .interact(Sense::click());
+                    if !pending && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        pick = Some(owner);
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            if family.shared_dlc_complete {
+                ui.label(w::text(t!("+ {n} DLC in common to all copies in the Steam Family", n = common), 13.0, t.text_dim));
+            } else {
+                ui.label(w::text(t!("Some DLC details are unavailable."), 13.0, t.text_dim));
+            }
+            if pending {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(w::text(t!("Updating Steam Family…"), 13.0, t.text_dim));
+                });
+            }
+            ui.add_space(12.0);
+            ui.columns(2, |cols| {
+                cols[0].add_enabled_ui(pick.is_some() && !pending, |ui| {
+                    if w::button(ui, t, None, t!("Confirm"), w::Kind::Primary, w::Size::Md).clicked() {
+                        done = Some(true);
+                    }
+                });
+                if w::button(&mut cols[1], t, None, t!("Cancel"), w::Kind::Secondary, w::Size::Md).clicked() {
+                    done = Some(false);
+                }
+            });
+        });
+        if let Some(id) = profile {
+            self.preferred_copy = None;
+            ctx.navigate("profile", Some(id.to_string()));
+            return;
+        }
+        match done {
+            Some(true) => {
+                if let Some(lender) = pick.filter(|_| pick != current && !pending) {
+                    self.preferred_copy_request_id = self.preferred_copy_request_id.wrapping_add(1);
+                    let request_id = self.preferred_copy_request_id;
+                    self.pending_preferred_copy = Some(request_id);
+                    self.preferred_copy = Some((app_id, pick));
+                    ctx.send(Command::SetPreferredLender { request_id, family_id, app_id, lender });
+                } else if !pending {
+                    self.preferred_copy = None;
+                }
+            }
+            Some(false) => self.preferred_copy = None,
+            None => self.preferred_copy = Some((app_id, pick)),
+        }
+    }
+
+    fn load_family(&mut self, ctx: &Ctx) {
+        if !self.family_loading {
+            self.family_loading = true;
+            ctx.send(Command::LoadFamily { language: i18n::language().steam_name().to_string() });
+        }
+    }
+
+    fn family_retry(&mut self, ui: &mut Ui, t: &Theme, ctx: &Ctx) {
+        egui::Frame::new().outer_margin(Margin::symmetric(24, 0)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(w::text(t!("Steam Family details are unavailable."), 14.0, t.text_dim));
+                if self.family_loading {
+                    ui.spinner();
+                } else if w::button(ui, t, None, t!("Retry"), w::Kind::Secondary, w::Size::Sm).clicked() {
+                    self.load_family(ctx);
+                }
+            });
+        });
+    }
+}
+
 impl crate::theme_renderer::LibraryHost for Library {
     fn is_detail_open(&self) -> bool {
-        self.custom_selected.is_some() || self.selected.is_some() || self.collections_view.is_some()
+        self.custom_selected.is_some()
+            || self.selected.is_some()
+            || self.collections_view.is_some()
+            || self.news_view
+            || self.hidden_only
+            || self.soundtracks_only
     }
 
     fn is_collections_open(&self) -> bool {
@@ -3870,6 +4601,9 @@ impl crate::theme_renderer::LibraryHost for Library {
             (Some(CollectionsView::Detail(i)), _, _) => self.collection_detail(i, ui, t, ctx),
             (None, Some(i), _) => self.custom_page(i, ui, t, ctx),
             (None, None, Some(id)) => self.game_page(id, ui, t, ctx),
+            (None, None, None) if self.news_view => self.news_feed_page(ui, t, ctx),
+            (None, None, None) if self.hidden_only => self.hidden_games_page(ui, t, ctx),
+            (None, None, None) if self.soundtracks_only => self.soundtracks_page(ui, t, ctx),
             (None, None, None) => {}
         }
     }
@@ -3979,7 +4713,7 @@ impl crate::theme_renderer::LibraryHost for Library {
                     });
 
                     let installed_on = self.filter == Filter::Installed;
-                    let recent_on = self.filter == Filter::Playing;
+                    let recent_on = self.recent_order;
                     let circle_toggle = |ui: &mut Ui, icon: &str, tip: &str, active: bool| -> bool {
                         let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
                         let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.08);
@@ -3990,8 +4724,9 @@ impl crate::theme_renderer::LibraryHost for Library {
                     if circle_toggle(ui, icons::PLAY, t!("Ready to play"), installed_on) {
                         self.filter = if installed_on { Filter::All } else { Filter::Installed };
                     }
-                    if circle_toggle(ui, icons::CLOCK, t!("Played"), recent_on) {
-                        self.filter = if recent_on { Filter::All } else { Filter::Playing };
+                    // Like Steam: sorts the list by recent activity; the filter stays.
+                    if circle_toggle(ui, icons::CLOCK, t!("Sort by recent activity"), recent_on) {
+                        self.recent_order = !recent_on;
                     }
                 });
             }
@@ -4035,6 +4770,7 @@ impl crate::theme_renderer::LibraryHost for Library {
         if self.hide_collections && matches!(self.filter, Filter::Collection(_)) {
             self.filter = Filter::All;
         }
+        let group_by = if self.recent_order { themes::LibraryGrouping::LastPlayed } else { group_by };
         let items = self.filtered(ctx);
         let searching = !self.search.trim().is_empty();
         let groups = self.sidebar_groups(&items, ctx, group_by, t!("All games"), !self.hide_collections && group_headers);
@@ -4056,6 +4792,11 @@ impl crate::theme_renderer::LibraryHost for Library {
         let fs = style.font_size.unwrap_or(12.5);
         let row_h = row_height.clamp(20.0, 48.0);
         let ic_sz = icon_size.clamp(14.0, (row_h - 4.0).max(14.0));
+        // Optional row styling; unset fields keep the default tinted look.
+        let row_radius = CornerRadius::same(style.radius.unwrap_or(2));
+        let sel_bg = style.active_bg.map(|c| c.resolve(t)).unwrap_or(t.accent.gamma_multiply(0.22));
+        let sel_fg = style.active_color.map(|c| c.resolve(t));
+        let hover_bg = style.hover_bg.map(|c| c.resolve(t));
 
         egui::ScrollArea::vertical().id_salt("lib-side-themed").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -4122,9 +4863,10 @@ impl crate::theme_renderer::LibraryHost for Library {
                         let sel = self.selected == Some(e.app_id);
                         let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.08);
                         if sel {
-                            ui.painter().rect_filled(rect, CornerRadius::same(2), t.accent.gamma_multiply(0.22));
+                            ui.painter().rect_filled(rect, row_radius, sel_bg);
                         } else if hover > 0.0 {
-                            ui.painter().rect_filled(rect, CornerRadius::same(2), t.surface_hover.gamma_multiply(hover * 0.75));
+                            let fill = hover_bg.map(|c| c.gamma_multiply(hover)).unwrap_or(t.surface_hover.gamma_multiply(hover * 0.75));
+                            ui.painter().rect_filled(rect, row_radius, fill);
                         }
                         let icon = Rect::from_min_size(pos2(rect.left() + 18.0, rect.center().y - ic_sz * 0.5), vec2(ic_sz, ic_sz));
                         let url = e.owned.and_then(|o| o.icon.as_deref()).map(|h| art::icon(e.app_id, h));
@@ -4135,7 +4877,9 @@ impl crate::theme_renderer::LibraryHost for Library {
                         }
                         let setup = setup_state(ctx, e.app_id, e.installed.is_some());
                         let busy = matches!(setup, Setup::Downloading(_) | Setup::Queued);
-                        let color = if busy {
+                        let color = if let Some(fg) = sel_fg.filter(|_| sel) {
+                            fg
+                        } else if busy {
                             t.accent
                         } else if sel || e.installed.is_some() {
                             t.text
@@ -4562,6 +5306,63 @@ impl crate::theme_renderer::LibraryHost for Library {
 #[cfg(test)]
 mod themed_library_tests {
     use super::*;
+
+    #[test]
+    fn game_page_requests_family_again_after_account_switch() {
+        let mut library = Library::default();
+        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let client = client::Client::from_sender(tx);
+        let local = local::LocalState::default();
+        let theme = Theme::default();
+        let mut registry = extensions::Registry::default();
+        let mut actions = Vec::new();
+        let egui = egui::Context::default();
+
+        for steam_id in [20, 30] {
+            let mut state = client::State::default();
+            let login = client::Event::LoggedIn { steam_id, account: steam_id.to_string() };
+            state.apply(&login);
+            state.apply(&client::Event::Link(client::Link::Online));
+            let mut ctx = Ctx::new(&state, &local, &theme, 1.0, &client, &mut registry, &mut actions);
+            library.on_event(&login, &mut ctx);
+            for _ in 0..2 {
+                let mut frame = egui.run_ui(egui::RawInput::default(), |ui| library.family_line(ui, &theme, &mut ctx, 620));
+                frame.textures_delta.clear();
+            }
+            let mut loads = 0;
+            while let Ok(command) = commands.try_recv() {
+                if matches!(command, Command::LoadFamily { .. }) {
+                    loads += 1;
+                }
+            }
+            assert_eq!(loads, 1, "account {steam_id}");
+        }
+    }
+
+    #[test]
+    fn rejected_preferred_copy_keeps_selection_and_reports_the_error() {
+        let mut library = Library {
+            preferred_copy: Some((620, Some(30))),
+            pending_preferred_copy: Some(1),
+            ..Default::default()
+        };
+        let state = client::State { steam_id: 20, ..Default::default() };
+        let local = local::LocalState::default();
+        let theme = Theme::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = client::Client::from_sender(tx);
+        let mut registry = extensions::Registry::default();
+        let mut actions = Vec::new();
+        let mut ctx = Ctx::new(&state, &local, &theme, 1.0, &client, &mut registry, &mut actions);
+        library.on_event(&client::Event::PreferredCopyChanged {
+            request_id: 1, steam_id: 20, family_id: 5, app_id: 620, lender: 30,
+            result: Err("COPY_REJECTED".into()),
+        }, &mut ctx);
+
+        assert_eq!(library.preferred_copy, Some((620, Some(30))));
+        assert_eq!(library.pending_preferred_copy, None);
+        assert!(matches!(actions.as_slice(), [extensions::Action::Toast(message)] if message.contains("COPY_REJECTED")));
+    }
 
     #[test]
     fn steam_collections_button_opens_overview_and_drops_dragged_games() {

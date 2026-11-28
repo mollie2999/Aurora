@@ -22,6 +22,8 @@ mod installscript;
 pub mod market;
 pub mod profile_edit;
 pub mod social;
+pub mod showcases;
+pub mod profile_page;
 pub mod cloud;
 pub mod reviews;
 pub mod discovery;
@@ -37,7 +39,8 @@ mod input_config;
 pub mod account;
 pub mod chat_groups;
 mod notify;
-mod pads;
+pub mod pads;
+pub(crate) mod vpad;
 
 /// One HTTP client for plain requests (one connection pool and TLS setup,
 /// instead of a new client per request).
@@ -62,13 +65,13 @@ pub use input_config::{
     set_app_binding, set_app_bindings,
 };
 pub use pads::{
-    ConnectionKind, ControllerFamily, ControllerSettings, DetectedController, DetectionSnapshot, FamilyToggles,
-    LiveInput, PadCalibration, SteamInputDecision, app_controller, effective_controller_override, poll_ui as poll_controllers,
+    ConnectedPadSummary, ConnectionKind, ControllerFamily, ControllerSettings, DetectedController, DetectionSnapshot,
+    FamilyToggles, HapticSide, TouchpadHaptic, LauncherPadFrame, LauncherPadSample, LiveInput, PadCalibration, SteamInputDecision, TouchpadFinger,
+    app_controller, connected_summary as connected_pad_summary, effective_controller_override, poll_ui as poll_controllers,
     refresh_ui as refresh_controllers, resolve_steam_input, set_app_controller, set_app_controllers,
-    set_settings as set_controller_settings, settings as controller_settings, trigger_test_rumble,
+    set_settings as set_controller_settings, settings as controller_settings, subscribe_launcher_pads,
+    trigger_touchpad_haptic, trigger_test_rumble, virtual_pad_available, virtual_pad_backend, virtual_pad_hint,
 };
-#[cfg(windows)]
-pub use pads::listen_for_controller_guide;
 pub use launch::{LaunchArgs, LaunchMode, STEAM_DRM, acknowledge_anti_cheat, app_overlay_enabled, mode as launch_mode, mode_cached as launch_mode_cached, mode_peek as launch_mode_peek, overlay_enabled, proton_builds, proton_override, app_proton, app_protons, default_proton, native_build, NATIVE, DEFAULT_PROTON, safe_connect_args, set_app_overlay, set_app_proton, set_app_protons, set_anti_cheat_acknowledged, set_overlay_disabled_apps, set_overlay_enabled, set_overlay_hotkeys, set_prefer_official as launch_through_steam, set_proton_override, set_steam_setting, steam_setting, steam_settings_locked, SteamSetting, apply_steam_prefs, gameplay_downloads, set_gameplay_downloads, spawn_non_steam};
 pub use state::State;
 pub use store::SavedAccount;
@@ -142,6 +145,14 @@ pub enum Command {
     BlockFriend { steam_id: SteamId, block: bool },
     /// Ask a game server about itself ("ip:port").
     QueryServer { addr: String },
+    /// Browse Internet master game servers matching a `\key\value` filter.
+    BrowseGameServers { request_id: u64, filter: String, max: u32 },
+    /// Discover game servers on the LAN via UDP A2S_INFO broadcast.
+    DiscoverLanServers { request_id: u64 },
+    /// Query A2S info, player list, and server rules/convars for `"ip:port"`.
+    QueryServerDetails { addr: String },
+    /// Load Steam Community's "Recently Played With" coplay list.
+    LoadRecentPlayers,
     /// Tell a friend you're typing.
     Typing { to: SteamId },
     /// Fetch recent chat history with a friend.
@@ -215,6 +226,16 @@ pub enum Command {
     SaveSteamCollections { save: Vec<(String, collections::Entry)>, delete: Vec<String> },
     /// Comments on a profile (newest first), from `start`.
     LoadComments { steam_id: SteamId, start: u32 },
+    /// A profile's showcases (favorite game, group, artwork…). `language` is Steam's name.
+    LoadShowcases { steam_id: SteamId, language: String },
+    /// Steam's profile page: right column, top friends, recent activity.
+    LoadProfilePage { steam_id: SteamId, language: String },
+    /// A profile's previous names.
+    LoadAliases { steam_id: SteamId },
+    /// The SteamID behind a custom profile URL (steamcommunity.com/id/<vanity>).
+    ResolveProfileUrl { vanity: String },
+    /// Clear your own previous names.
+    ClearAliases,
     /// Leave a comment on a profile.
     PostComment { steam_id: SteamId, text: String },
     /// Delete a comment (on your profile, or one you wrote).
@@ -277,6 +298,8 @@ pub enum Command {
     RemoveFromFamily { family_id: u64, steam_id: SteamId, language: String },
     /// Delete a Steam Family (adult role required).
     DeleteFamily { family_id: u64, language: String },
+    /// Play `lender`'s copy of a family-shared game.
+    SetPreferredLender { request_id: u64, family_id: u64, app_id: AppId, lender: SteamId },
     CancelListing { listing_id: u64 },
     CancelBuyOrder { order_id: u64 },
     /// Fetch the games on someone's profile with their playtime.
@@ -384,6 +407,10 @@ impl std::fmt::Debug for Command {
             Command::SetNickname { steam_id, nickname } => f.debug_struct("SetNickname").field("steam_id", steam_id).field("nickname", nickname).finish(),
             Command::BlockFriend { steam_id, block } => f.debug_struct("BlockFriend").field("steam_id", steam_id).field("block", block).finish(),
             Command::QueryServer { addr } => f.debug_struct("QueryServer").field("addr", addr).finish(),
+            Command::BrowseGameServers { request_id, filter, max } => f.debug_struct("BrowseGameServers").field("request_id", request_id).field("filter", filter).field("max", max).finish(),
+            Command::DiscoverLanServers { request_id } => f.debug_struct("DiscoverLanServers").field("request_id", request_id).finish(),
+            Command::QueryServerDetails { addr } => f.debug_struct("QueryServerDetails").field("addr", addr).finish(),
+            Command::LoadRecentPlayers => f.write_str("LoadRecentPlayers"),
             Command::Typing { to } => f.debug_struct("Typing").field("to", to).finish(),
             Command::LoadHistory { friend } => f.debug_struct("LoadHistory").field("friend", friend).finish(),
             Command::LoadChatGroups => f.write_str("LoadChatGroups"),
@@ -431,6 +458,11 @@ impl std::fmt::Debug for Command {
             Command::LoadSteamCollections => f.write_str("LoadSteamCollections"),
             Command::SaveSteamCollections { save, delete } => f.debug_struct("SaveSteamCollections").field("save", save).field("delete", delete).finish(),
             Command::LoadComments { steam_id, start } => f.debug_struct("LoadComments").field("steam_id", steam_id).field("start", start).finish(),
+            Command::LoadShowcases { steam_id, language } => f.debug_struct("LoadShowcases").field("steam_id", steam_id).field("language", language).finish(),
+            Command::LoadProfilePage { steam_id, language } => f.debug_struct("LoadProfilePage").field("steam_id", steam_id).field("language", language).finish(),
+            Command::LoadAliases { steam_id } => f.debug_struct("LoadAliases").field("steam_id", steam_id).finish(),
+            Command::ResolveProfileUrl { vanity } => f.debug_struct("ResolveProfileUrl").field("vanity", vanity).finish(),
+            Command::ClearAliases => f.write_str("ClearAliases"),
             Command::PostComment { steam_id, text } => f.debug_struct("PostComment").field("steam_id", steam_id).field("text", text).finish(),
             Command::DeleteComment { steam_id, comment_id } => f.debug_struct("DeleteComment").field("steam_id", steam_id).field("comment_id", comment_id).finish(),
             Command::LoadBadges { steam_id } => f.debug_struct("LoadBadges").field("steam_id", steam_id).finish(),
@@ -471,6 +503,9 @@ impl std::fmt::Debug for Command {
                 f.debug_struct("RemoveFromFamily").field("family_id", family_id).field("steam_id", steam_id).field("language", language).finish()
             }
             Command::DeleteFamily { family_id, language } => f.debug_struct("DeleteFamily").field("family_id", family_id).field("language", language).finish(),
+            Command::SetPreferredLender { request_id, family_id, app_id, lender } => {
+                f.debug_struct("SetPreferredLender").field("request_id", request_id).field("family_id", family_id).field("app_id", app_id).field("lender", lender).finish()
+            }
             Command::CancelListing { listing_id } => f.debug_struct("CancelListing").field("listing_id", listing_id).finish(),
             Command::CancelBuyOrder { order_id } => f.debug_struct("CancelBuyOrder").field("order_id", order_id).finish(),
             Command::LoadPlayerGames { steam_id, language } => f.debug_struct("LoadPlayerGames").field("steam_id", steam_id).field("language", language).finish(),
@@ -629,8 +664,21 @@ pub enum Event {
     SteamCollectionsSaved { save: Vec<(String, collections::Entry)>, delete: Vec<String>, result: Result<(), String> },
     /// Comments on a profile, or why they can't be shown (private, turned off).
     Comments { steam_id: SteamId, result: Result<model::Comments, String> },
+    Showcases { steam_id: SteamId, result: Result<Vec<model::Showcase>, String> },
+    ProfilePage { steam_id: SteamId, result: Result<model::ProfilePage, String> },
+    Aliases { steam_id: SteamId, result: Result<Vec<model::Alias>, String> },
+    /// A custom profile URL's SteamID (`vanity` as asked, lowercase).
+    ProfileUrlResolved { vanity: String, result: Result<SteamId, String> },
+    /// Outcome of "Clear Previous Aliases".
+    AliasesCleared(Result<(), String>),
     CommentPosted { steam_id: SteamId, result: Result<(), String> },
     ServerInfo { addr: String, result: Result<crate::a2s::ServerInfo, String> },
+    GameServerList { request_id: u64, result: Result<Vec<model::GameServerEntry>, String> },
+    LanServerList { request_id: u64, servers: Vec<model::GameServerEntry> },
+    ServerPlayers { addr: String, result: Result<Vec<crate::a2s::ServerPlayer>, String> },
+    ServerRules { addr: String, result: Result<Vec<(String, String)>, String> },
+    RecentPlayers(Result<Vec<model::RecentPlayer>, String>),
+    CoplayRecorded { steam_id: SteamId, app_id: AppId, time: u64 },
     Blocked { steam_id: SteamId, result: Result<bool, String> },
     Badges { steam_id: SteamId, result: Result<model::Badges, String> },
     Reviews { steam_id: SteamId, page: u32, result: Result<model::UserReviews, String> },
@@ -663,7 +711,9 @@ pub enum Event {
     /// A page of purchase history; `more` is true when it continues the list.
     Purchases { more: bool, result: Result<model::PurchasePage, String> },
     LicenseList(Result<Vec<model::License>, String>),
-    Family(Result<model::FamilyStatus, String>),
+    Family { steam_id: SteamId, result: Result<model::FamilyStatus, String> },
+    /// Steam's response to a preferred-copy change from the Library.
+    PreferredCopyChanged { request_id: u64, steam_id: SteamId, family_id: u64, app_id: AppId, lender: SteamId, result: Result<(), String> },
     /// Outcome of a Steam Family management action.
     FamilyAction(Result<model::FamilyActionDone, String>),
     /// Community Market fee rules for your wallet currency.

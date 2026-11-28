@@ -5,12 +5,15 @@
 
 pub mod community;
 pub mod community_home;
+pub mod chat_render;
 pub mod group_chat;
 pub(crate) mod downloads;
 pub mod hub;
 pub mod inventory;
 pub mod library;
 mod plugins;
+mod screenshots;
+mod servers;
 mod support;
 pub(crate) mod profile;
 mod reviews;
@@ -35,11 +38,13 @@ pub fn registry(
     r.register(library::Library::new(rt.clone(), ctx.clone(), flags.clone(), library_layout));
     r.register(community_home::CommunityHome::new(rt.clone(), ctx.clone()));
     r.register(community::Community::default());
-    r.register(profile::Profile::default());
+    r.register(profile::Profile::new(flags.clone()));
     r.register(downloads::Downloads::new(flags.clone()));
     r.register(workshop::Workshop::default());
     r.register(hub::Hub::default());
     r.register(inventory::Inventory::default());
+    r.register(screenshots::Screenshots::new(rt.clone(), ctx.clone()));
+    r.register(servers::Servers::default());
     r.register(support::Support::default());
     r.register(plugins::Plugins::new());
     r.register(settings::Settings::new(flags, themes));

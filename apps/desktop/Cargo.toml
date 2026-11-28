@@ -32,8 +32,6 @@ fs4 = "1"
 qrcode.workspace = true
 global-hotkey.workspace = true
 rfd = "0.18"
-# Game controllers for Big Picture (Windows, macOS and Linux).
-gilrs = "0.11"
 open.workspace = true
 directories.workspace = true
 sha2 = "0.10"
@@ -47,7 +45,7 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
 tray-icon.workspace = true
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Gaming_Input", "Foundation_Collections"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]

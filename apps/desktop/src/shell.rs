@@ -78,6 +78,56 @@ pub fn show_with_theme(
     });
 }
 
+/// Compact single-column library view (`View -> Small Mode`).
+pub fn show_small_mode(app: &mut SteamApp, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let t = app.prefs.theme.clone();
+    let wr = crate::chrome::window_rounding(ui.ctx());
+    let top_round = egui::CornerRadius { nw: wr.nw, ne: wr.ne, sw: 0, se: 0 };
+
+    egui::Panel::top("small-topbar")
+        .exact_size(TOP_BAR)
+        .resizable(false)
+        .frame(egui::Frame::new().fill(t.chrome).corner_radius(top_round).inner_margin(Margin { left: 8, right: 6, top: 0, bottom: 0 }))
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            crate::chrome::drag_area(ui, rect.expand2(vec2(8.0, 0.0)), true);
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                app_menu(app, ui, &t, actions);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    crate::chrome::window_buttons(ui, &t, TOP_BAR, true);
+                    if w::icon_button_sized(ui, &t, icons::GRID, t!("Large Mode"), false, 0, CTRL).clicked() {
+                        actions.push(Action::ToggleSmallMode);
+                    }
+                    if w::icon_button_sized(ui, &t, icons::MONITOR, t!("Big Picture mode"), false, 0, CTRL).clicked() {
+                        actions.push(Action::EnterBigPicture);
+                    }
+                    let unread = app.state.total_unread();
+                    if w::icon_button_sized(ui, &t, icons::USERS, t!("Friends"), app.friends_window.open, unread, CTRL).clicked() {
+                        app.friends_window.open = !app.friends_window.open;
+                    }
+                });
+            });
+        });
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::new().fill(t.bg).inner_margin(Margin::symmetric(10, 8)))
+        .show(ui, |ui| {
+            let env = Env {
+                state: &app.state,
+                local: &app.local,
+                theme: &app.prefs.theme,
+                zoom: app.prefs.zoom,
+                client: &app.client,
+                actions: &mut *actions,
+            };
+            app.registry.with_ext::<crate::builtin::library::Library, _>("library", env, |lib, mut cx| {
+                lib.show_small_mode(ui, &t, &mut cx);
+            });
+        });
+}
+
 pub(crate) fn show_active_page(app: &mut SteamApp, ui: &mut Ui, t: &Theme, actions: &mut Vec<Action>) {
     let page = app.prefs.page.clone();
     // Offline: pages that need Steam say so instead.
@@ -771,6 +821,66 @@ fn app_menu(app: &mut SteamApp, ui: &mut Ui, t: &Theme, actions: &mut Vec<Action
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     egui::Popup::menu(&resp).width(320.0).show(|ui| {
         let item = |ui: &mut Ui, icon: &str, label: &str| w::menu_item(ui, t, icon, label).clicked();
+        let view = w::submenu_item(ui, t, icons::EYE, t!("View"));
+        egui::containers::menu::SubMenu::new().show(ui, &view, |ui| {
+            ui.set_min_width(230.0);
+            w::menu_spacing(ui);
+            let sub_item = |ui: &mut Ui, icon: &str, label: &str| {
+                let clicked = w::menu_item(ui, t, icon, label).clicked();
+                if clicked {
+                    ui.close();
+                }
+                clicked
+            };
+            if sub_item(ui, icons::BOOKS, t!("Library")) {
+                actions.push(Action::Navigate { page: "library".into(), arg: None });
+            }
+            if sub_item(ui, icons::EYE_SLASH, t!("Hidden Games")) {
+                actions.push(Action::Navigate { page: "library".into(), arg: Some("hidden".into()) });
+            }
+            if sub_item(ui, icons::SPEAKER_HIGH, t!("Soundtracks")) {
+                actions.push(Action::Navigate { page: "library".into(), arg: Some("soundtracks".into()) });
+            }
+            if sub_item(ui, icons::DOWNLOAD, t!("Downloads")) {
+                actions.push(Action::Navigate { page: "downloads".into(), arg: None });
+            }
+            w::menu_separator(ui, t);
+            let (mode_icon, mode_label) = if app.prefs.small_mode {
+                (icons::GRID, t!("Large Mode"))
+            } else {
+                (icons::LIST, t!("Small Mode"))
+            };
+            if sub_item(ui, mode_icon, mode_label) {
+                actions.push(Action::ToggleSmallMode);
+            }
+            if sub_item(ui, icons::MONITOR, t!("Big Picture Mode")) {
+                actions.push(Action::EnterBigPicture);
+            }
+            w::menu_separator(ui, t);
+            if sub_item(ui, icons::USERS, t!("Friends List")) {
+                app.friends_window.open = true;
+            }
+            if sub_item(ui, icons::CLOCK, t!("Players")) {
+                actions.push(Action::Navigate { page: "community".into(), arg: Some("players".into()) });
+            }
+            if sub_item(ui, icons::GLOBE, t!("Game Servers")) {
+                actions.push(Action::Navigate { page: "servers".into(), arg: None });
+            }
+            if sub_item(ui, icons::CAMERA, t!("Screenshots")) {
+                actions.push(Action::Navigate { page: "screenshots".into(), arg: None });
+            }
+            if sub_item(ui, icons::BACKPACK, t!("Inventory")) {
+                actions.push(Action::Navigate { page: "inventory".into(), arg: None });
+            }
+            if sub_item(ui, icons::NOTE, t!("Update News")) {
+                actions.push(Action::Navigate { page: "library".into(), arg: Some("news".into()) });
+            }
+            w::menu_separator(ui, t);
+            if sub_item(ui, icons::GEAR, t!("Settings")) {
+                actions.push(Action::Navigate { page: "settings".into(), arg: None });
+            }
+        });
+        ui.separator();
         if item(ui, icons::GEAR, t!("Settings")) {
             actions.push(Action::Navigate { page: "settings".into(), arg: None });
         }
@@ -1351,7 +1461,7 @@ fn friend_row(app: &mut SteamApp, ui: &mut Ui, t: &Theme, p: &Persona, actions: 
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
-pub fn toasts(app: &mut SteamApp, ctx: &egui::Context) {
+pub fn toasts(app: &mut SteamApp, ctx: &egui::Context, keyboard_inset: f32) {
     let now = ctx.input(|i| i.time);
     app.toasts.retain(|t| t.until > now);
     if app.toasts.is_empty() {
@@ -1359,7 +1469,7 @@ pub fn toasts(app: &mut SteamApp, ctx: &egui::Context) {
     }
     let t = &app.prefs.theme;
     egui::Area::new(egui::Id::unique("toasts"))
-        .anchor(Align2::RIGHT_BOTTOM, vec2(-20.0, -48.0))
+        .anchor(Align2::RIGHT_BOTTOM, vec2(-20.0, -48.0_f32.max(keyboard_inset + 12.0)))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             for toast in app.toasts.iter().rev().take(4) {

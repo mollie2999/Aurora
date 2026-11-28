@@ -1033,7 +1033,61 @@ pub(super) fn kind_title(kind: FileKind) -> String {
     .to_string()
 }
 
-/// What one person shared, newest first, like the links on their profile.
+/// Steam's controls on someone's files page: one game or all, their own
+/// files or their favorites, and the order.
+fn user_filter_bar(hv: &mut HubView, ui: &mut Ui, t: &Theme, io: &mut Io, user: model::SteamId, kind: FileKind, name: &str, filter: &mut hub::UserFilter) {
+    // The games they've shared this kind of file of (Steam's menu).
+    let lang = io.lang();
+    let have = io.state.hub.user_file_games.contains_key(&(user, kind));
+    hv.ask(io, format!("usergames{user}/{kind:?}"), have, || Request::UserFileGames { steam_id: user, kind, language: lang });
+    let games: Vec<(AppId, String)> = match io.state.hub.user_file_games.get(&(user, kind)) {
+        Some(Ok(g)) => g.clone(),
+        _ => Vec::new(),
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+        let current = match filter.app_id {
+            0 => t!("All games").to_string(),
+            app => games.iter().find(|(a, _)| *a == app).map(|(_, n)| n.clone()).or_else(|| io.state.app_name(app).map(String::from)).unwrap_or_else(|| t!("App {id}", id = app).to_string()),
+        };
+        let r = w::button(ui, t, Some(icons::CONTROLLER), &format!("{current}  {}", icons::CARET_DOWN), w::Kind::Secondary, w::Size::Sm);
+        egui::Popup::menu(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).width(280.0).show(|ui| {
+            let width = ui.available_width();
+            w::search(ui, t, &mut hv.user_game_search, t!("Find a game"), width);
+            ui.add_space(4.0);
+            w::menu_spacing(ui);
+            if w::menu_item(ui, t, icons::CONTROLLER, t!("All games")).clicked() {
+                filter.app_id = 0;
+                ui.close();
+            }
+            let q = hv.user_game_search.trim().to_lowercase();
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for (app, game) in games.iter().filter(|(_, n)| q.is_empty() || n.to_lowercase().contains(&q)) {
+                    if w::menu_item(ui, t, if *app == filter.app_id { icons::CHECK } else { "" }, game).clicked() {
+                        filter.app_id = *app;
+                        ui.close();
+                    }
+                }
+            });
+        });
+        ui.add_space(12.0);
+        ui.label(w::text(t!("Show:"), 13.0, t.text_dim));
+        w::segmented(ui, t, &mut filter.favorites, &[(false, &t!("By {name}", name = name)), (true, &t!("{name}'s favorites", name = name))]);
+        ui.add_space(12.0);
+        for sort in hub::UserSort::ALL {
+            let label = match sort {
+                hub::UserSort::MostPopular => t!("Most popular"),
+                hub::UserSort::Newest => t!("Newest first"),
+                hub::UserSort::Oldest => t!("Oldest first"),
+            };
+            if w::chip(ui, t, label, filter.sort == sort).clicked() {
+                filter.sort = sort;
+            }
+        }
+    });
+}
+
+/// What one person shared or favorited, like their screenshots page.
 pub(super) fn user_files(hv: &mut HubView, ui: &mut Ui, t: &Theme, io: &mut Io, user: model::SteamId, kind: FileKind) {
     let p = io.state.persona(user);
     ui.add_space(16.0);
@@ -1056,11 +1110,19 @@ pub(super) fn user_files(hv: &mut HubView, ui: &mut Ui, t: &Theme, io: &mut Io, 
         }
     });
     ui.add_space(10.0);
+    let before = hv.user_filters.get(&(user, kind)).copied().unwrap_or_default();
+    let mut filter = before;
+    user_filter_bar(hv, ui, t, io, user, kind, &p.name, &mut filter);
+    hv.user_filters.insert((user, kind), filter);
     let page_key = format!("user{user}/{kind:?}");
+    if filter != before {
+        hv.pages.insert(page_key.clone(), 1);
+    }
+    ui.add_space(12.0);
     let page = hv.pages.get(&page_key).copied().unwrap_or(1);
-    let key = hub::user_files_key(user, kind, page);
+    let key = hub::user_files_key(user, kind, filter, page);
     let lang = io.lang();
-    let req = || Request::UserFiles { steam_id: user, kind, page, language: lang.clone() };
+    let req = || Request::UserFiles { steam_id: user, kind, filter, page, language: lang.clone() };
     let have = io.state.hub.files.contains_key(&key);
     hv.ask(io, key.clone(), have, req);
     let data = match io.state.hub.files.get(&key) {

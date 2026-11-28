@@ -40,8 +40,6 @@ pub(crate) fn mode_for_launch(app: &OwnedApp, install_dir: &Path, controller: u8
 
 pub(crate) fn mode_with_host(app: &OwnedApp, install_dir: &Path, controller: u8, host_ready: bool) -> LaunchMode {
     #[cfg(not(windows))]
-    let _ = controller;
-    #[cfg(not(windows))]
     let force_official = prefer_official();
     #[cfg(windows)]
     let force_official = false;
@@ -50,20 +48,31 @@ pub(crate) fn mode_with_host(app: &OwnedApp, install_dir: &Path, controller: u8,
     let use_host = host_ready && !force_official && executable.is_some();
     #[cfg(target_os = "freebsd")]
     let use_host = use_host && !linux::plan(app, install_dir).is_ok_and(|p| p.uses_native_wine());
+    let ac = anti_cheat(app, install_dir);
     if !use_host {
-        if let Some(ac) = anti_cheat(app, install_dir) {
+        if let Some(ac) = ac {
             return LaunchMode::OfficialSteam { anti_cheat: ac };
         }
     }
     let steam_drm = steam_drm_marked(app.app_id) || executable.is_some_and(|exe| has_steam_drm(&exe));
     if use_host {
-        #[cfg(windows)]
-        if steam_drm {
-            // The headless host has no Steam Input frontend. Let Steam
-            // start DRM games that need its controller configuration.
-            let input = crate::pads::effective_controller_override(app.app_id, controller);
-            if crate::pads::needs_steam_input_client(input) && steam_exe().is_some() {
-                return LaunchMode::OfficialSteam { anti_cheat: STEAM_DRM.into() };
+        // Demand-driven hybrid routing (without OfficialSteam):
+        // Keep HeadlessHost as default when no controller translation/custom
+        // layout is needed, or whenever Steam DRM or anti-cheat requires Valve's
+        // engine (those launches use our external OS virtual gamepad instead).
+        // For non-DRM, non-anti-cheat Windows/Proton games that actively need
+        // Steam Input translation or custom bindings, route to Aurora's
+        // steamclient so ISteamInput + layouts + XInput SHM run natively.
+        if !steam_drm && ac.is_none() && needs_aurora_input_route(app.app_id, controller) {
+            #[cfg(windows)]
+            if windows_mode(app, install_dir) == LaunchMode::Aurora {
+                return LaunchMode::Aurora;
+            }
+            #[cfg(not(windows))]
+            if let Ok(p) = linux::plan(app, install_dir)
+                && linux::client_dll(&p, install_dir).is_some()
+            {
+                return LaunchMode::Aurora;
             }
         }
         return LaunchMode::HeadlessHost { steam_drm };
@@ -84,6 +93,16 @@ pub(crate) fn mode_with_host(app: &OwnedApp, install_dir: &Path, controller: u8,
     }
     #[cfg(windows)]
     return windows_mode(app, install_dir);
+}
+
+/// Whether this launch actively needs controller translation / Steam Input
+/// (non-Xbox enabled pad connected, custom layout chosen, or per-game Enable).
+pub(crate) fn needs_aurora_input_route(app_id: AppId, controller: u8) -> bool {
+    let eff = crate::pads::effective_controller_override(app_id, controller);
+    let families = crate::pads::settings().families;
+    let has_custom = crate::input_config::app_binding(app_id) != crate::input_config::BindingChoice::Auto;
+    let summary = crate::pads::connected_summary();
+    summary.needs_translation(eff, &families, has_custom)
 }
 
 /// Windows: our steamclient DLL when it can serve the game.
@@ -451,10 +470,45 @@ pub(crate) fn steam_input_env_vars(
     env
 }
 
+/// Pass Aurora's SDL3 controller mappings (`SDL_GAMECONTROLLERCONFIG`) and,
+/// when an external OS virtual Xbox 360 pad is translating non-Xbox controllers,
+/// suppress raw physical non-Xbox VID:PIDs in SDL games (`SDL_GAMECONTROLLER_IGNORE_DEVICES`)
+/// to prevent double input without any DLL injection.
+fn apply_sdl_controller_env(cmd: &mut Command, ignore_translated_physical: bool) {
+    let summary = crate::pads::connected_summary();
+    if !summary.sdl_mappings.is_empty() {
+        let mut lines: Vec<String> = std::env::var("SDL_GAMECONTROLLERCONFIG")
+            .ok()
+            .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+            .unwrap_or_default();
+        for m in &summary.sdl_mappings {
+            if !lines.iter().any(|existing| existing == m) {
+                lines.push(m.clone());
+            }
+        }
+        cmd.env("SDL_GAMECONTROLLERCONFIG", lines.join("\n"));
+    }
+    if ignore_translated_physical && !summary.non_xbox_vid_pids.is_empty() {
+        let mut entries: Vec<String> = std::env::var("SDL_GAMECONTROLLER_IGNORE_DEVICES")
+            .ok()
+            .map(|s| s.split(',').map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+            .unwrap_or_default();
+        for (vid, pid) in &summary.non_xbox_vid_pids {
+            let item = format!("0x{vid:04X}/0x{pid:04X}");
+            if !entries.iter().any(|e| e.eq_ignore_ascii_case(&item)) {
+                entries.push(item);
+            }
+        }
+        if !entries.is_empty() {
+            cmd.env("SDL_GAMECONTROLLER_IGNORE_DEVICES", entries.join(","));
+        }
+    }
+}
+
 /// Start a game with our steamclient: environment like a Steam launch, plus
 /// the pipe and token for the DLL. The registry swap must be in place.
 /// `pads` names the shared memory with the controllers XInput can't see.
-pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchArgs, ipc_env: &str, account: &str, account_id: u32, pads: Option<&str>, overlay: Option<(u16, &str)>) -> Result<Child, String> {
+pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchArgs, ipc_env: &str, account: &str, account_id: u32, pads: Option<&str>, overlay: Option<(u16, &str)>, ignore_physical_pads: bool) -> Result<Child, String> {
     let connect = safe_connect_args(&args.connect)?;
     let opts = UserOptions::parse(&args.user);
     let mut cmd = command(app, install_dir, &opts, &connect)?;
@@ -483,6 +537,9 @@ pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchA
     #[cfg(windows)]
     let _ = account_id;
     let mut cmd = finish(app, install_dir, &opts, cmd);
+    #[cfg(target_os = "freebsd")]
+    ensure_freebsd_wine_dll_overrides(&mut cmd);
+    apply_sdl_controller_env(&mut cmd, ignore_physical_pads);
     #[cfg(target_os = "linux")]
     apply_vk_overlay_env(&mut cmd, overlay, overlay_on);
     #[cfg(not(target_os = "linux"))]
@@ -490,19 +547,27 @@ pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchA
     cmd.spawn().map_err(|e| format!("could not start {}: {e}", app.name))
 }
 
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn ensure_freebsd_wine_dll_overrides(cmd: &mut Command) {
+    if !cmd.get_envs().any(|(key, value)| key == "WINEPREFIX" && value.is_some()) {
+        return;
+    }
+    // wine-proton can provide built-in Steam bridges. Select our native
+    // Windows DLLs while preserving any user WINEDLLOVERRIDES from the
+    // environment or Launch Options.
+    let mut overrides = existing_cmd_env(cmd, "WINEDLLOVERRIDES").unwrap_or_default();
+    if !overrides.is_empty() && !overrides.ends_with(';') {
+        overrides.push(';');
+    }
+    overrides.push_str("steamclient,steamclient64=n");
+    cmd.env("WINEDLLOVERRIDES", overrides);
+}
+
 #[cfg(not(windows))]
 fn configure_steamclient(cmd: &mut Command, app: &OwnedApp, install_dir: &Path, account_id: u32) -> Result<(), String> {
     #[cfg(target_os = "freebsd")]
     if let Some(prefix) = cmd.get_envs().find(|(key, _)| *key == "WINEPREFIX").and_then(|(_, value)| value) {
         setup_wine_client(Path::new(cmd.get_program()), Path::new(prefix), account_id, [steamclient_dll(true), steamclient_dll(false)])?;
-        // wine-proton can provide built-in Steam bridges. Select our native
-        // Windows DLLs while keeping overrides for unrelated libraries.
-        let mut overrides = std::env::var_os("WINEDLLOVERRIDES").unwrap_or_default();
-        if !overrides.is_empty() {
-            overrides.push(";");
-        }
-        overrides.push("steamclient,steamclient64=n");
-        cmd.env("WINEDLLOVERRIDES", overrides);
         return Ok(());
     }
     let _ = account_id;
@@ -513,7 +578,7 @@ fn configure_steamclient(cmd: &mut Command, app: &OwnedApp, install_dir: &Path, 
     // writes the registry entry naming the DLL, so a prefix without it yet
     // keeps the bridge for this one launch. The DLL draws the Shift+Tab
     // overlay inside D3D11 games and reaches the app over loopback.
-    let root = local::find_steam_root().ok_or("Steam Play needs a Steam install for Proton")?;
+    let root = local::compat::tool_root().ok_or("Steam Play needs a Steam install for Proton")?;
     cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", linux::client_shim(&root)?);
     if prefix_knows_client(app, install_dir) {
         cmd.env("PROTON_DISABLE_LSTEAMCLIENT", "1");
@@ -537,6 +602,7 @@ pub fn spawn_non_steam(exe: &str, args: &str) -> Result<Option<Child>, String> {
     if !exe.exists() {
         return Err(format!("{} doesn't exist", exe.display()));
     }
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
     let opts = UserOptions::parse(args);
     #[cfg(not(windows))]
@@ -546,7 +612,10 @@ pub fn spawn_non_steam(exe: &str, args: &str) -> Result<Option<Child>, String> {
         #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
         let mut cmd = opts.wrap(cmd);
         #[cfg(target_os = "freebsd")]
-        if opts.env.iter().any(|(k, _)| k == "LD_LIBRARY_PATH") && linux::is_linux_elf(&exe) {
+        if opts.env.iter().any(|(k, _)| k == "LD_LIBRARY_PATH")
+            && !cmd.get_envs().any(|(k, _)| k == "STEAM_COMPAT_INSTALL_PATH")
+            && linux::is_linux_elf(&exe)
+        {
             apply_freebsd_runtime_env(&mut cmd, &dir);
         }
         return cmd.spawn().map(Some).map_err(|e| format!("couldn't start {}: {e}", exe.display()));
@@ -580,7 +649,8 @@ fn finish(app: &OwnedApp, install_dir: &Path, opts: &UserOptions, cmd: Command) 
     let mut cmd = opts.wrap(cmd);
     #[cfg(target_os = "freebsd")]
     if opts.env.iter().any(|(k, _)| k == "LD_LIBRARY_PATH")
-        && linux::plan(app, install_dir).is_ok_and(|p| !p.uses_proton())
+        && !cmd.get_envs().any(|(k, _)| k == "STEAM_COMPAT_INSTALL_PATH")
+        && linux::plan(app, install_dir).is_ok_and(|p| !p.uses_proton() && linux::is_linux_elf(&p.exe(install_dir)))
     {
         apply_freebsd_runtime_env(&mut cmd, install_dir);
     }
@@ -1459,9 +1529,10 @@ pub fn run_through_host(
     token: &str,
     steam_id: u64,
     overlay: Option<(u16, &str)>,
+    ignore_physical_pads: bool,
     started: impl FnOnce(),
 ) -> Result<(), String> {
-    run_through_host_cancellable(app, install_dir, args, account, token, steam_id, overlay, None, started)
+    run_through_host_cancellable(app, install_dir, args, account, token, steam_id, overlay, ignore_physical_pads, None, started)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1473,6 +1544,7 @@ pub(crate) fn run_through_host_cancellable(
     token: &str,
     steam_id: u64,
     overlay: Option<(u16, &str)>,
+    ignore_physical_pads: bool,
     stop: Option<&std::sync::atomic::AtomicBool>,
     started: impl FnOnce(),
 ) -> Result<(), String> {
@@ -1578,7 +1650,7 @@ pub(crate) fn run_through_host_cancellable(
         Some(mask) => tracing::info!("controllers: headless launch, native XInput slot mask {mask:#06b} (bit 0 = player 1)"),
         None => tracing::warn!("controllers: headless launch, XInputGetState unavailable"),
     }
-    let game = spawn_for_host(app, install_dir, &args.user, &connect, account, overlay);
+    let game = spawn_for_host(app, install_dir, &args.user, &connect, account, overlay, ignore_physical_pads);
     let child = match game {
         Ok(c) => c,
         Err(e) => {
@@ -1623,6 +1695,7 @@ fn spawn_for_host(
     connect: &[String],
     account: &str,
     overlay: Option<(u16, &str)>,
+    ignore_physical_pads: bool,
 ) -> Result<Child, String> {
     let opts = UserOptions::parse(user_args);
     let mut cmd = command(app, install_dir, &opts, connect)?;
@@ -1633,6 +1706,7 @@ fn spawn_for_host(
         .env("SteamAppUser", account)
         .env("SteamUser", account);
     let mut cmd = finish(app, install_dir, &opts, cmd);
+    apply_sdl_controller_env(&mut cmd, ignore_physical_pads);
     #[cfg(target_os = "linux")]
     {
         apply_vk_overlay_env(&mut cmd, overlay, app_overlay_enabled(app.app_id));
@@ -1905,11 +1979,50 @@ fn apply_freebsd_runtime_env_with(cmd: &mut Command, runtime_dirs: &[PathBuf]) {
     }
 }
 
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn freebsd_lsu_chroot_command(
+    lsu_runner: &Path,
+    runtime_dir: &Path,
+    exe: &Path,
+    args: &[String],
+    cwd: &Path,
+    install_dir: &Path,
+) -> Command {
+    let mut cmd = Command::new(lsu_runner);
+    cmd.arg(runtime_dir)
+        .arg(exe)
+        .args(args)
+        .env("PWD", cwd)
+        .env("STEAM_COMPAT_INSTALL_PATH", install_dir);
+    cmd
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_native_linux_command(exe: &Path, args: &[String], cwd: &Path, install_dir: &Path) -> Command {
+    if local::compat::lsu_chroot_ready()
+        && let Some(runner) = local::compat::find_lsu_run_in_chroot()
+        && let Some(runtime_dir) = local::compat::find_steam_linux_runtime_container(Some(install_dir))
+    {
+        tracing::info!(
+            runner = %runner.display(),
+            runtime = %runtime_dir.display(),
+            "launching Linux game inside FreeBSD LSU chroot"
+        );
+        return freebsd_lsu_chroot_command(&runner, &runtime_dir, exe, args, cwd, install_dir);
+    }
+    let mut c = Command::new(exe);
+    c.args(args);
+    if linux::is_linux_elf(exe) {
+        apply_freebsd_runtime_env(&mut c, install_dir);
+    }
+    c
+}
+
 #[cfg(target_os = "freebsd")]
 fn apply_freebsd_runtime_env(cmd: &mut Command, install_dir: &Path) {
     let dirs = local::compat::linux_runtime_library_paths(Some(install_dir));
     if !dirs.is_empty() {
-        tracing::debug!(count = dirs.len(), "augmenting LD_LIBRARY_PATH with Steam Linux Runtime paths for FreeBSD Linuxulator");
+        tracing::debug!(count = dirs.len(), "augmenting LD_LIBRARY_PATH with Scout/Linuxulator paths on FreeBSD");
     }
     apply_freebsd_runtime_env_with(cmd, &dirs);
 }
@@ -2558,7 +2671,7 @@ pub(crate) fn prefix_setup(app: &OwnedApp, install_dir: &Path) -> Option<Command
         return Some(cmd);
     }
     // Our DLLs, copied into the prefix as on a real launch.
-    let root = local::find_steam_root()?;
+    let root = local::compat::tool_root()?;
     cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", linux::client_shim(&root).ok()?);
     Some(cmd)
 }
@@ -2784,13 +2897,21 @@ mod linux {
             // A game unpacked from an archive or an AppImage often isn't executable yet.
             make_executable(exe);
             tracing::info!("launching non-Steam game {}", exe.display());
-            let mut c = Command::new(exe);
-            c.args(args);
             #[cfg(target_os = "freebsd")]
             if is_linux_elf(exe) {
-                super::apply_freebsd_runtime_env(&mut c, exe.parent().unwrap_or(exe));
+                let dir = exe.parent().unwrap_or(exe);
+                super::freebsd_native_linux_command(exe, args, dir, dir)
+            } else {
+                let mut c = Command::new(exe);
+                c.args(args);
+                c
             }
-            c
+            #[cfg(not(target_os = "freebsd"))]
+            {
+                let mut c = Command::new(exe);
+                c.args(args);
+                c
+            }
         };
         cmd.process_group(0);
         Ok(cmd)
@@ -2827,6 +2948,7 @@ mod linux {
             display: "Wine Proton".into(),
             dir: "/usr/local/wine-proton/bin".into(),
             wine_bin: Some("/usr/local/wine-proton/bin/wine".into()),
+            script_name: None,
             runtime_app: Some(123),
         };
         let mut cmd = compat_command(&tool, Path::new("/missing"), Path::new("/games/compatdata/42"));
@@ -2972,16 +3094,22 @@ mod linux {
                     // Installed before Aurora kept the files' executable flag
                     // ("Permission denied"): fix it, like Steam would have set it.
                     make_executable(&exe);
-                    let mut c = Command::new(&exe);
-                    c.args(split_args(&o.arguments));
+                    let game_args = split_args(&o.arguments);
                     #[cfg(target_os = "freebsd")]
-                    super::apply_freebsd_runtime_env(&mut c, install_dir);
-                    c
+                    {
+                        super::freebsd_native_linux_command(&exe, &game_args, &cwd, install_dir)
+                    }
+                    #[cfg(not(target_os = "freebsd"))]
+                    {
+                        let mut c = Command::new(&exe);
+                        c.args(game_args);
+                        c
+                    }
                 }
                 Some(tool) => self.proton(tool, app, install_dir, &exe),
             };
             tracing::info!("launching {} ({}) {}", app.name, exe.display(), self.describe());
-            cmd.current_dir(cwd).env("SteamAppId", &id).env("SteamGameId", &id).env("SteamOverlayGameId", &id);
+            cmd.current_dir(&cwd).env("SteamAppId", &id).env("SteamGameId", &id).env("SteamOverlayGameId", &id);
             // Like Steam: the driver reads and writes the game's shader cache.
             crate::shaders::apply_env(&mut cmd, install_dir, app.app_id);
             // Its own process group, so stopping the game stops everything it started.
@@ -3602,14 +3730,14 @@ mod tests {
             launch: vec![model::LaunchOption { executable: "game.exe".into(), os_list: "windows".into(), arguments: String::new(), working_dir: String::new(), description: String::new() }],
             ..Default::default()
         };
-        let steam = LaunchMode::OfficialSteam { anti_cheat: STEAM_DRM.into() };
-        assert_eq!(mode(&app, &dir), if connected { steam.clone() } else { LaunchMode::HeadlessHost { steam_drm: true } });
-        assert_eq!(mode_for_launch(&app, &dir, 1), steam);
+        assert_eq!(mode(&app, &dir), LaunchMode::HeadlessHost { steam_drm: true });
+        assert_eq!(mode_for_launch(&app, &dir, 1), LaunchMode::HeadlessHost { steam_drm: true });
         assert_eq!(mode_for_launch(&app, &dir, 2), LaunchMode::HeadlessHost { steam_drm: true });
         crate::pads::set_app_controller(app.app_id, 1);
-        assert_eq!(mode(&app, &dir), steam);
+        assert_eq!(mode(&app, &dir), LaunchMode::HeadlessHost { steam_drm: true });
         assert_eq!(mode_for_launch(&app, &dir, 2), LaunchMode::HeadlessHost { steam_drm: true });
         crate::pads::set_app_controller(app.app_id, 0);
+        let _ = connected;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3964,9 +4092,9 @@ mod tests {
         ] {
             let args = LaunchArgs { user: "-novid".into(), connect: payload.clone(), controller: 0 };
             assert!(spawn(&test_app, &dir, &args, None).is_err(), "spawn must fail closed for {payload}");
-            assert!(spawn_with_steamclient(&test_app, &dir, &args, "127.0.0.1:1:tok", "acct", 1, None, None).is_err());
+            assert!(spawn_with_steamclient(&test_app, &dir, &args, "127.0.0.1:1:tok", "acct", 1, None, None, false).is_err());
             assert!(run_through_steam(480, &args, 1, false, || {}).unwrap_err().contains("refusing launch"));
-            assert!(run_through_host(&test_app, &dir, &args, "acct", "tok", 1, None, || {}).unwrap_err().contains("refusing launch"));
+            assert!(run_through_host(&test_app, &dir, &args, "acct", "tok", 1, None, false, || {}).unwrap_err().contains("refusing launch"));
             assert!(!pwned.exists(), "evil wrapper executed!");
             assert!(!out.exists(), "game started despite unsafe connect!");
         }
@@ -4168,6 +4296,58 @@ mod tests {
         assert!(!super::linux::is_linux_elf(&freebsd_abi));
         assert!(!super::linux::is_linux_elf(&script));
         assert!(!super::linux::is_linux_elf(&dir.path().join("missing")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn freebsd_lsu_chroot_command_sets_runtime_pwd_and_install_path() {
+        let cmd = freebsd_lsu_chroot_command(
+            Path::new("/usr/local/steam-utils/bin/lsu-run-in-chroot"),
+            Path::new("/home/user/.local/share/steaminrust/Steam/steamapps/common/SteamLinuxRuntime_sniper"),
+            Path::new("/games/Hue/Hue.x86_64"),
+            &["--fullscreen".into(), "-windowed".into()],
+            Path::new("/games/Hue"),
+            Path::new("/games/Hue"),
+        );
+        assert_eq!(cmd.get_program(), "/usr/local/steam-utils/bin/lsu-run-in-chroot");
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            [
+                "/home/user/.local/share/steaminrust/Steam/steamapps/common/SteamLinuxRuntime_sniper",
+                "/games/Hue/Hue.x86_64",
+                "--fullscreen",
+                "-windowed",
+            ]
+        );
+        assert_eq!(
+            cmd.get_envs().find(|(k, _)| *k == "PWD").and_then(|(_, v)| v),
+            Some(std::ffi::OsStr::new("/games/Hue"))
+        );
+        assert_eq!(
+            cmd.get_envs().find(|(k, _)| *k == "STEAM_COMPAT_INSTALL_PATH").and_then(|(_, v)| v),
+            Some(std::ffi::OsStr::new("/games/Hue"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn freebsd_wine_dll_overrides_preserves_user_overrides() {
+        let mut cmd = Command::new("/usr/local/wine-proton/bin/wine");
+        cmd.env("WINEPREFIX", "/games/compatdata/322170/pfx")
+            .env("WINEDLLOVERRIDES", "dinput8=n,b");
+        ensure_freebsd_wine_dll_overrides(&mut cmd);
+        assert_eq!(
+            cmd.get_envs().find(|(k, _)| *k == "WINEDLLOVERRIDES").and_then(|(_, v)| v),
+            Some(std::ffi::OsStr::new("dinput8=n,b;steamclient,steamclient64=n"))
+        );
+
+        let mut no_prefix = Command::new("/bin/true");
+        no_prefix.env("WINEDLLOVERRIDES", "dinput8=n,b");
+        ensure_freebsd_wine_dll_overrides(&mut no_prefix);
+        assert_eq!(
+            no_prefix.get_envs().find(|(k, _)| *k == "WINEDLLOVERRIDES").and_then(|(_, v)| v),
+            Some(std::ffi::OsStr::new("dinput8=n,b"))
+        );
     }
 }
 

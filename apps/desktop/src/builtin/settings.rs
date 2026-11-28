@@ -90,6 +90,10 @@ pub struct AppFlags {
     pub toast_notifications: bool,
     /// Multiple of egui's scroll distance per wheel notch / touchpad move.
     pub scroll_speed: f32,
+    /// Glide each mouse-wheel notch over a few frames (off: jump at once).
+    pub smooth_scroll: bool,
+    /// Draw the main window at most 60 times a second.
+    pub cap_fps: bool,
     /// The one-time Steam-DRM launch notice has been shown and accepted.
     pub drm_host_ack: bool,
     /// Enable the in-game overlay.
@@ -100,6 +104,7 @@ pub struct AppFlags {
     pub fps_high_contrast: bool,
     /// Show the "What's new" news shelf on the library home.
     pub show_whats_new: bool,
+    pub steam_profile_ui: bool,
 }
 
 pub type SharedFlags = std::sync::Arc<std::sync::Mutex<AppFlags>>;
@@ -212,7 +217,7 @@ impl Extension for Settings {
                     Section::Family => self.acct.family(ui, &t, ctx),
                     Section::Security => security(ui, &t, ctx, &mut self.acct),
                     Section::Notifications => notifications(ui, &t, &self.flags),
-                    Section::Library => library(ui, &t, ctx),
+                    Section::Library => library(ui, &t, ctx, &self.flags),
                     Section::Downloads => downloads(ui, &t, ctx, &self.flags),
                     Section::Cloud => cloud(ui, &t, &self.flags),
                     Section::Accessibility => accessibility(ui, &t, ctx, &self.flags),
@@ -420,8 +425,17 @@ fn notifications(ui: &mut Ui, t: &Theme, flags: &SharedFlags) {
     *flags.lock().unwrap() = f;
 }
 
-fn library(ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
+fn library(ui: &mut Ui, t: &Theme, ctx: &mut Ctx, flags: &SharedFlags) {
     w::page_title(ui, t, t!("Library"), None);
+    let mut steam_profile_ui = flags.lock().unwrap().steam_profile_ui;
+    switch(
+        ui,
+        t,
+        t!("Steam-style profile page"),
+        t!("Use the new Steam-style profile layout instead of Aurora's classic profile view."),
+        &mut steam_profile_ui,
+    );
+    flags.lock().unwrap().steam_profile_ui = steam_profile_ui;
     ctx.settings_for("library", ui);
     if info_row(ui, t, t!("Add a non-Steam game"), "", Some(t!("Open library"))) {
         ctx.navigate("library", None);
@@ -566,7 +580,18 @@ fn accessibility(ui: &mut Ui, t: &Theme, ctx: &mut Ctx, flags: &SharedFlags) {
     row(ui, t!("Scroll speed"), t!("How far the mouse wheel and touchpad scroll."), &mut |ui| {
         ui.add(egui::Slider::new(&mut f.scroll_speed, 0.5..=5.0).step_by(0.25).custom_formatter(|v, _| format!("{v:.2}×")));
     });
-    flags.lock().unwrap().scroll_speed = f.scroll_speed;
+    ui.add_space(8.0);
+    row(ui, t!("Smooth scrolling"), t!("Glide each mouse wheel step over a few frames. Off: the page jumps the whole step at once."), &mut |ui| {
+        ui.add(toggle(&mut f.smooth_scroll));
+    });
+    ui.add_space(8.0);
+    row(ui, t!("Limit to 60 fps"), t!("Draw the window at most 60 times a second, even on faster monitors. Uses less CPU and GPU while scrolling or animating."), &mut |ui| {
+        ui.add(toggle(&mut f.cap_fps));
+    });
+    let mut stored = flags.lock().unwrap();
+    stored.scroll_speed = f.scroll_speed;
+    stored.smooth_scroll = f.smooth_scroll;
+    stored.cap_fps = f.cap_fps;
 }
 
 /// The interface size slider. Zooming rescales the slider itself, so a

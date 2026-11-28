@@ -9,14 +9,17 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompatTool {
     /// Internal name, as in config.vdf's CompatToolMapping (`proton_11`,
-    /// `GE-Proton10-34`, `proton-cachyos-native`).
+    /// `GE-Proton10-34`, `proton-cachyos-native`, `LSU_Sniper_chroot`).
     pub name: String,
     /// Name to show (`Proton 11.0`).
     pub display: String,
-    /// Direct Wine executable on FreeBSD. Proton tools use their script instead.
+    /// Direct Wine executable on FreeBSD. Proton/LSU tools use their script instead.
     pub wine_bin: Option<PathBuf>,
-    /// Folder holding the `proton` script.
+    /// Folder holding the compatibility tool script.
     pub dir: PathBuf,
+    /// Entrypoint script relative to `dir` (from `toolmanifest.vdf`
+    /// `commandline`, e.g. `run.sh` for LSU tools). `None` defaults to `proton`.
+    pub script_name: Option<String>,
     /// Steam Linux Runtime app the tool asks to run inside (toolmanifest.vdf
     /// `require_tool_appid`), if any.
     pub runtime_app: Option<AppId>,
@@ -24,7 +27,7 @@ pub struct CompatTool {
 
 impl CompatTool {
     pub fn script(&self) -> PathBuf {
-        self.dir.join("proton")
+        self.dir.join(self.script_name.as_deref().unwrap_or("proton"))
     }
 }
 
@@ -51,6 +54,7 @@ fn discover_wine(port_root: &Path, path: &[PathBuf]) -> Vec<CompatTool> {
             tools.push(CompatTool {
                 dir: bin.parent().unwrap().to_owned(),
                 wine_bin: Some(bin),
+                script_name: None,
                 display: display.into(),
                 name: name.into(),
                 runtime_app: None,
@@ -69,8 +73,71 @@ fn runtime_of(dir: &Path) -> Option<AppId> {
     m.obj("manifest")?.u64("require_tool_appid").map(|v| v as AppId)
 }
 
+/// Resolve a tool's entrypoint script relative to `dir` from `toolmanifest.vdf`
+/// `"commandline"` (e.g. `"/run.sh %verb%"` -> `"run.sh"`), falling back to
+/// `"proton"`. Rejects paths that escape `dir`.
+fn tool_script(dir: &Path) -> Option<String> {
+    if let Some(cmd) = read_vdf(&dir.join("toolmanifest.vdf"))
+        .and_then(|m| m.obj("manifest").and_then(|o| o.str("commandline")).map(String::from))
+    {
+        if let Some(first) = cmd.split_whitespace().next() {
+            let rel = first.strip_prefix('/').unwrap_or(first);
+            if !rel.is_empty() && !rel.contains('\\') {
+                let p = Path::new(rel);
+                if p.components().all(|c| matches!(c, std::path::Component::Normal(_))) && dir.join(p).is_file() {
+                    return Some(rel.to_string());
+                }
+            }
+        }
+    }
+    dir.join("proton").is_file().then(|| "proton".to_string())
+}
+
+fn discover_custom_tools(dirs: &[PathBuf], out: &mut Vec<CompatTool>) {
+    for base in dirs {
+        let Ok(entries) = std::fs::read_dir(base) else { continue };
+        for e in entries.flatten() {
+            let folder = e.path();
+            if !folder.file_name().and_then(|n| n.to_str()).is_some_and(crate::is_valid_folder_name) {
+                continue;
+            }
+            let Some(m) = read_vdf(&folder.join("compatibilitytool.vdf")) else { continue };
+            let Some(tools) = m.obj("compatibilitytools").and_then(|c| c.obj("compat_tools")) else { continue };
+            for (name, v) in tools.iter() {
+                let Some(t) = v.as_obj() else { continue };
+                // Skip Linux-to-Linux runtime tools (e.g. LSU_Sniper_chroot / LSU_Scout_chroot)
+                // so they are never picked to run Windows `.exe` games.
+                if let Some(from) = t.str("from_oslist")
+                    && !from.split(',').any(|os| os.trim().eq_ignore_ascii_case("windows"))
+                {
+                    continue;
+                }
+                let dir = match t.str("install_path") {
+                    None | Some(".") => folder.clone(),
+                    Some(sub) if crate::is_valid_folder_name(sub) => folder.join(sub),
+                    Some(_) => continue,
+                };
+                if out.iter().any(|x: &CompatTool| x.name == name) {
+                    continue;
+                }
+                let Some(script) = tool_script(&dir) else { continue };
+                let script_name = (script != "proton").then_some(script);
+                out.push(CompatTool {
+                    wine_bin: None,
+                    name: name.to_string(),
+                    display: t.str("display_name").unwrap_or(name).to_string(),
+                    script_name,
+                    runtime_app: runtime_of(&dir),
+                    dir,
+                });
+            }
+        }
+    }
+}
+
 /// Every installed tool: Valve's Proton apps in the Steam libraries, then
-/// custom tools in `compatibilitytools.d` (the user's and the system's).
+/// custom tools in `compatibilitytools.d` (the user's and the system's),
+/// plus `linux-steam-utils` tools on FreeBSD.
 pub fn compat_tools(root: &Path) -> Vec<CompatTool> {
     #[cfg(target_os = "freebsd")]
     let mut out = discover_wine(Path::new("/usr/local"), &std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>());
@@ -91,36 +158,18 @@ pub fn compat_tools(root: &Path) -> Vec<CompatTool> {
             let Some(installdir) = state.str("installdir").filter(|s| crate::is_valid_folder_name(s)) else { continue };
             let dir = apps.join("common").join(installdir);
             if dir.join("proton").is_file() {
-                out.push(CompatTool { wine_bin: None, name: internal, display: name.to_string(), runtime_app: runtime_of(&dir), dir });
+                out.push(CompatTool { wine_bin: None, script_name: None, name: internal, display: name.to_string(), runtime_app: runtime_of(&dir), dir });
             }
         }
     }
     let mut dirs = vec![root.join("compatibilitytools.d")];
     dirs.push(PathBuf::from("/usr/share/steam/compatibilitytools.d"));
     dirs.push(PathBuf::from("/usr/local/share/steam/compatibilitytools.d"));
-    for base in dirs {
-        let Ok(entries) = std::fs::read_dir(&base) else { continue };
-        for e in entries.flatten() {
-            let folder = e.path();
-            if !folder.file_name().and_then(|n| n.to_str()).is_some_and(crate::is_valid_folder_name) {
-                continue;
-            }
-            let Some(m) = read_vdf(&folder.join("compatibilitytool.vdf")) else { continue };
-            let Some(tools) = m.obj("compatibilitytools").and_then(|c| c.obj("compat_tools")) else { continue };
-            for (name, v) in tools.iter() {
-                let Some(t) = v.as_obj() else { continue };
-                let dir = match t.str("install_path") {
-                    None | Some(".") => folder.clone(),
-                    Some(sub) if crate::is_valid_folder_name(sub) => folder.join(sub),
-                    Some(_) => continue,
-                };
-                if !dir.join("proton").is_file() || out.iter().any(|x: &CompatTool| x.name == name) {
-                    continue;
-                }
-                out.push(CompatTool { wine_bin: None, name: name.to_string(), display: t.str("display_name").unwrap_or(name).to_string(), runtime_app: runtime_of(&dir), dir });
-            }
-        }
+    #[cfg(target_os = "freebsd")]
+    for lsu in lsu_roots() {
+        dirs.push(lsu.join("tools"));
     }
+    discover_custom_tools(&dirs, &mut out);
     out
 }
 
@@ -214,6 +263,21 @@ pub fn compat_data(install_dir: &Path, app: AppId) -> Option<PathBuf> {
     Some(steamapps.join("compatdata").join(app.to_string()))
 }
 
+/// The game's Wine/Proton prefix folder (`<library>/steamapps/compatdata/<app>/pfx`),
+/// falling back to `compatdata/<app>` if `pfx` doesn't exist yet, when either
+/// exists on disk.
+pub fn prefix_dir(install_dir: &Path, app: AppId) -> Option<PathBuf> {
+    let data = compat_data(install_dir, app)?;
+    let pfx = data.join("pfx");
+    if pfx.is_dir() {
+        Some(pfx)
+    } else if data.is_dir() {
+        Some(data)
+    } else {
+        None
+    }
+}
+
 /// The Windows user folder inside a game's Proton prefix, where its saves
 /// go (`…/pfx/drive_c/users/steamuser`), if the prefix exists.
 pub fn prefix_user_dir(install_dir: &Path, app: AppId) -> Option<PathBuf> {
@@ -246,18 +310,6 @@ const SCOUT_LIB_SUBDIRS: &[&str] = &[
     "i386/usr/lib/i386-linux-gnu",
     "i386/lib",
     "i386/usr/lib",
-];
-
-#[cfg(any(target_os = "freebsd", all(test, unix)))]
-const CONTAINER_LIB_SUBDIRS: &[&str] = &[
-    "lib/x86_64-linux-gnu",
-    "usr/lib/x86_64-linux-gnu",
-    "lib/i386-linux-gnu",
-    "usr/lib/i386-linux-gnu",
-    "lib",
-    "usr/lib",
-    "lib64",
-    "usr/lib64",
 ];
 
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
@@ -336,43 +388,13 @@ fn scout_dirs_for_root(root: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
-fn has_container_lib_dir(files_dir: &Path) -> bool {
-    files_dir.is_dir() && CONTAINER_LIB_SUBDIRS.iter().any(|sub| files_dir.join(sub).is_dir())
-}
-
-#[cfg(any(target_os = "freebsd", all(test, unix)))]
-fn container_files_dir(runtime_base: &Path, platform_prefix: &str) -> Option<PathBuf> {
-    // Steam's generated `run` script names the active platform directory directly.
-    if let Ok(run_script) = std::fs::read_to_string(runtime_base.join("run")) {
-        for line in run_script.lines() {
-            if let Some(dir_name) = line.trim().strip_prefix("dir=") {
-                let dir_name = dir_name.trim_matches(['"', '\'']);
-                if crate::is_valid_folder_name(dir_name) {
-                    let files = runtime_base.join(dir_name).join("files");
-                    if has_container_lib_dir(&files) {
-                        return Some(files);
-                    }
-                }
-            }
-        }
-    }
-    let mut platform_dirs: Vec<String> = std::fs::read_dir(runtime_base)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            (name.starts_with(platform_prefix) && entry.path().is_dir()).then_some(name)
-        })
-        .collect();
-    platform_dirs.sort_by(|a, b| b.cmp(a));
-    for name in platform_dirs {
-        let files = runtime_base.join(name).join("files");
-        if has_container_lib_dir(&files) {
-            return Some(files);
-        }
-    }
-    let direct = runtime_base.join("files");
-    has_container_lib_dir(&direct).then_some(direct)
+fn has_lsu_platform_metadata(runtime_base: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(runtime_base) else { return false };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.contains("_platform_") && entry.path().join("metadata").is_file()
+    })
 }
 
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
@@ -392,14 +414,96 @@ fn container_runtime_dirs_for_root(root: &Path, default_name: &str, app_id: AppI
     dirs
 }
 
-/// Collect Steam Linux Runtime (Scout / Soldier / Sniper / SteamRT 4) and
-/// FreeBSD Linuxulator / `linux-steam-utils` library directories from explicit
-/// roots.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+fn lsu_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(dir) = std::env::var_os("LSU_DIR").map(PathBuf::from) {
+        if dir.is_absolute() {
+            roots.push(dir);
+        }
+    }
+    let default = PathBuf::from("/usr/local/steam-utils");
+    if !roots.iter().any(|r| r == &default) {
+        roots.push(default);
+    }
+    roots
+}
+
+/// Locate `linux-steam-utils`'s `lsu-run-in-chroot` wrapper across explicit
+/// LSU roots and `PATH` directories.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+pub fn find_lsu_run_in_chroot_in(lsu_roots: &[PathBuf], path_dirs: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    lsu_roots
+        .iter()
+        .map(|root| root.join("bin/lsu-run-in-chroot"))
+        .chain(path_dirs.iter().filter(|dir| dir.is_absolute()).map(|dir| dir.join("lsu-run-in-chroot")))
+        .find(|bin| bin.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
+/// Locate `lsu-run-in-chroot` on this FreeBSD system.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+pub fn find_lsu_run_in_chroot() -> Option<PathBuf> {
+    let path_dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    find_lsu_run_in_chroot_in(&lsu_roots(), &path_dirs)
+}
+
+/// Find an installed Steam Linux Runtime container directory suitable for
+/// `lsu-run-in-chroot` (Sniper preferred, then Soldier, then SteamRT 4).
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+pub fn find_steam_linux_runtime_container_in(steam_roots: &[PathBuf]) -> Option<PathBuf> {
+    for &(default_name, app_id) in &[
+        ("SteamLinuxRuntime_sniper", 1628350),
+        ("SteamLinuxRuntime_soldier", 1391110),
+        ("SteamLinuxRuntime_4", 4183110),
+    ] {
+        for root in steam_roots {
+            for rt_base in container_runtime_dirs_for_root(root, default_name, app_id) {
+                if has_lsu_platform_metadata(&rt_base) {
+                    return Some(rt_base);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find an installed Steam Linux Runtime container across all known Steam and
+/// Aurora library roots on this machine.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+pub fn find_steam_linux_runtime_container(install_dir: Option<&Path>) -> Option<PathBuf> {
+    let roots = all_steam_roots(install_dir);
+    find_steam_linux_runtime_container_in(&roots)
+}
+
+/// Check FreeBSD kernel prerequisites required by `lsu-run-in-chroot` /
+/// `lsu-mount-runtime`: `security.bsd.unprivileged_chroot=1`,
+/// `vfs.usermount=1`, and `nullfs` kernel module loaded.
+#[cfg(target_os = "freebsd")]
+pub fn lsu_chroot_ready() -> bool {
+    let sysctl_one = |name: &str| {
+        std::process::Command::new("/sbin/sysctl")
+            .args(["-nq", name])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+    };
+    let nullfs = std::process::Command::new("/sbin/kldstat")
+        .args(["-q", "-m", "nullfs"])
+        .status()
+        .is_ok_and(|s| s.success());
+    sysctl_one("security.bsd.unprivileged_chroot") && sysctl_one("vfs.usermount") && nullfs
+}
+
+/// Collect Scout Steam Linux Runtime and FreeBSD Linuxulator /
+/// `linux-steam-utils` library directories for direct Linux ELF execution
+/// outside an LSU chroot.
 ///
-/// Order prioritizes FreeBSD shims, Scout pinned libs, and `/compat/linux`
-/// base system libraries before Steam runtime directories (so Linuxulator's
-/// `libc.so.6`, `libGL.so.1`, and `libstdc++.so.6` are never shadowed by
-/// container copies), followed by Scout -> Soldier -> Sniper -> SteamRT 4.
+/// Container runtimes (Soldier / Sniper / SteamRT 4) are intentionally NOT
+/// added to flat `LD_LIBRARY_PATH`: their rootfs libraries (glibc/libstdc++/
+/// libGL) belong inside an LSU chroot (`lsu-run-in-chroot`), and mixing them
+/// on the host causes ABI/symbol collisions with `/compat/linux`.
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
 pub fn collect_linux_runtime_library_paths(
     steam_roots: &[PathBuf],
@@ -428,27 +532,11 @@ pub fn collect_linux_runtime_library_paths(
         push_existing_subdirs(&mut out, &mut seen, scout, SCOUT_LIB_SUBDIRS, true);
     }
 
-    for &(default_name, app_id, platform_prefix) in &[
-        ("SteamLinuxRuntime_soldier", 1391110, "soldier_platform_"),
-        ("SteamLinuxRuntime_sniper", 1628350, "sniper_platform_"),
-        ("SteamLinuxRuntime_4", 4183110, "steamrt4_platform_"),
-    ] {
-        for root in steam_roots {
-            for rt_base in container_runtime_dirs_for_root(root, default_name, app_id) {
-                if let Some(files) = container_files_dir(&rt_base, platform_prefix) {
-                    push_existing_subdirs(&mut out, &mut seen, &files, CONTAINER_LIB_SUBDIRS, true);
-                }
-            }
-        }
-    }
-
     out
 }
 
-/// Discover Steam Linux Runtime and FreeBSD Linuxulator / LSU library paths
-/// across all known Steam and Aurora library roots on this machine.
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
-pub fn linux_runtime_library_paths(install_dir: Option<&Path>) -> Vec<PathBuf> {
+fn all_steam_roots(install_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen_roots = std::collections::HashSet::new();
     let mut push_root = |cand: PathBuf| {
@@ -500,10 +588,17 @@ pub fn linux_runtime_library_paths(install_dir: Option<&Path>) -> Vec<PathBuf> {
     for lib in crate::extra_libraries() {
         push_root(lib);
     }
+    roots
+}
 
-    let lsu_roots = [PathBuf::from("/usr/local/steam-utils")];
+/// Discover Scout Steam Linux Runtime and FreeBSD Linuxulator / LSU library
+/// paths across all known Steam and Aurora library roots on this machine.
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+pub fn linux_runtime_library_paths(install_dir: Option<&Path>) -> Vec<PathBuf> {
+    let roots = all_steam_roots(install_dir);
+    let lsu = lsu_roots();
     let linux_compat_roots = [PathBuf::from("/compat/linux")];
-    collect_linux_runtime_library_paths(&roots, &lsu_roots, &linux_compat_roots)
+    collect_linux_runtime_library_paths(&roots, &lsu, &linux_compat_roots)
 }
 
 #[cfg(test)]
@@ -600,6 +695,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn prefix_dir_prefers_pfx_and_falls_back_to_compatdata() {
+        let root = std::env::temp_dir().join(format!("sir-compat-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let install_dir = root.join("steamapps").join("common").join("SomeGame");
+        std::fs::create_dir_all(&install_dir).unwrap();
+
+        assert_eq!(prefix_dir(&install_dir, 420), None);
+
+        let compat = root.join("steamapps").join("compatdata").join("420");
+        std::fs::create_dir_all(&compat).unwrap();
+        assert_eq!(prefix_dir(&install_dir, 420), Some(compat.clone()));
+
+        // A non-directory `pfx` file must fall back to `compatdata/<app>`.
+        let pfx = compat.join("pfx");
+        std::fs::write(&pfx, b"").unwrap();
+        assert_eq!(prefix_dir(&install_dir, 420), Some(compat.clone()));
+        std::fs::remove_file(&pfx).unwrap();
+
+        std::fs::create_dir_all(&pfx).unwrap();
+        assert_eq!(prefix_dir(&install_dir, 420), Some(pfx));
+
+        // Unsafe traversal components in `install_dir` are rejected.
+        assert_eq!(prefix_dir(&root.join("steamapps").join("common").join(".."), 420), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Reads this machine's Steam install when there is one (no assertions
     /// that depend on what's installed).
     #[test]
@@ -682,13 +805,94 @@ mod tests {
             extra_scout.join("amd64/lib"),
             extra_scout.join("i386/lib/i386-linux-gnu"),
             extra_scout.join("i386/lib"),
-            soldier.join("soldier_platform_2.0.1000/files/lib/x86_64-linux-gnu"),
-            soldier.join("soldier_platform_2.0.1000/files/lib/i386-linux-gnu"),
-            soldier.join("soldier_platform_2.0.1000/files/lib"),
-            sniper.join("sniper_platform_3.0.1/files/lib/x86_64-linux-gnu"),
-            sniper.join("sniper_platform_3.0.1/files/lib"),
         ];
         assert_eq!(paths, expected);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_lsu_tools_and_container_runtimes() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = std::env::temp_dir().join(format!("aurora-lsu-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+
+        // Fake LSU tools directory with toolmanifest.vdf pointing at /run.sh:
+        // Windows-to-Linux tools (e.g. LSU_FreeBSD_Wine) must be discovered,
+        // while Linux-to-Linux runtime tools (LSU_Sniper_chroot) must not be
+        // mixed into Windows compat tools.
+        let lsu_root = temp.join("steam-utils");
+        let wine_tool = lsu_root.join("tools/LSU_FreeBSD_Wine");
+        std::fs::create_dir_all(&wine_tool).unwrap();
+        std::fs::write(wine_tool.join("run.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            wine_tool.join("compatibilitytool.vdf"),
+            "\"compatibilitytools\"\n{\n\t\"compat_tools\"\n\t{\n\t\t\"LSU_FreeBSD_Wine\"\n\t\t{\n\t\t\t\"install_path\"\t\".\"\n\t\t\t\"display_name\"\t\"LSU FreeBSD Wine\"\n\t\t\t\"from_oslist\"\t\"windows\"\n\t\t\t\"to_oslist\"\t\"linux\"\n\t\t}\n\t}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wine_tool.join("toolmanifest.vdf"),
+            "\"manifest\"\n{\n\t\"version\"\t\"2\"\n\t\"commandline\"\t\"/run.sh %verb%\"\n}\n",
+        )
+        .unwrap();
+
+        let sniper_tool = lsu_root.join("tools/LSU_Sniper_chroot");
+        std::fs::create_dir_all(&sniper_tool).unwrap();
+        std::fs::write(sniper_tool.join("run.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            sniper_tool.join("compatibilitytool.vdf"),
+            "\"compatibilitytools\"\n{\n\t\"compat_tools\"\n\t{\n\t\t\"LSU_Sniper_chroot\"\n\t\t{\n\t\t\t\"install_path\"\t\".\"\n\t\t\t\"display_name\"\t\"LSU Sniper (chroot)\"\n\t\t\t\"from_oslist\"\t\"linux\"\n\t\t\t\"to_oslist\"\t\"linux\"\n\t\t}\n\t}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sniper_tool.join("toolmanifest.vdf"),
+            "\"manifest\"\n{\n\t\"version\"\t\"2\"\n\t\"commandline\"\t\"/run.sh %verb%\"\n}\n",
+        )
+        .unwrap();
+
+        // Unsafe toolmanifest.vdf commandline escaping the directory must be rejected.
+        let bad_tool = lsu_root.join("tools/BadTool");
+        std::fs::create_dir_all(&bad_tool).unwrap();
+        std::fs::write(lsu_root.join("tools/escape.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            bad_tool.join("compatibilitytool.vdf"),
+            "\"compatibilitytools\"\n{\n\t\"compat_tools\"\n\t{\n\t\t\"BadTool\"\n\t\t{\n\t\t\t\"install_path\"\t\".\"\n\t\t\t\"from_oslist\"\t\"windows\"\n\t\t}\n\t}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bad_tool.join("toolmanifest.vdf"),
+            "\"manifest\"\n{\n\t\"commandline\"\t\"../escape.sh %verb%\"\n}\n",
+        )
+        .unwrap();
+
+        let mut tools = Vec::new();
+        discover_custom_tools(&[lsu_root.join("tools")], &mut tools);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "LSU_FreeBSD_Wine");
+        assert_eq!(tools[0].display, "LSU FreeBSD Wine");
+        assert_eq!(tools[0].script(), wine_tool.join("run.sh"));
+
+        // lsu-run-in-chroot discovery
+        let runner = lsu_root.join("bin/lsu-run-in-chroot");
+        std::fs::create_dir_all(runner.parent().unwrap()).unwrap();
+        std::fs::write(&runner, b"#!/usr/bin/env ruby\n").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(find_lsu_run_in_chroot_in(&[lsu_root.clone()], &[]), Some(runner));
+
+        // Steam Linux Runtime container discovery: Sniper preferred over Soldier,
+        // and dirs without *_platform_*/metadata are ignored.
+        let steam = temp.join("steam");
+        let soldier = steam.join("steamapps/common/SteamLinuxRuntime_soldier");
+        std::fs::create_dir_all(soldier.join("soldier_platform_2.0.1")).unwrap();
+        std::fs::write(soldier.join("soldier_platform_2.0.1/metadata"), b"").unwrap();
+
+        let sniper_incomplete = steam.join("steamapps/common/SteamLinuxRuntime_sniper");
+        std::fs::create_dir_all(sniper_incomplete.join("sniper_platform_3.0.1")).unwrap();
+        assert_eq!(find_steam_linux_runtime_container_in(&[steam.clone()]), Some(soldier));
+
+        std::fs::write(sniper_incomplete.join("sniper_platform_3.0.1/metadata"), b"").unwrap();
+        assert_eq!(find_steam_linux_runtime_container_in(&[steam]), Some(sniper_incomplete));
+
         let _ = std::fs::remove_dir_all(&temp);
     }
 }

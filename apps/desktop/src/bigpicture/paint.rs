@@ -251,16 +251,33 @@ pub fn level_bar(p: &Painter, t: &Theme, rect: Rect, fraction: f32, active: bool
     p.circle_filled(pos2(knob_x, rect.center().y), rect.height() * 0.72, Color32::WHITE);
 }
 
+pub fn glyph_width(p: &Painter, label: &str, round: bool, s: f32) -> f32 {
+    let h = 34.0 * s;
+    if round {
+        h
+    } else {
+        (text_width(p, label, w::font_bold(18.0 * s)) + 18.0 * s).max(h)
+    }
+}
+
 /// A button glyph for the hints: a round "A", a pill "LB", or a key cap.
 pub fn glyph(p: &Painter, t: &Theme, left_center: Pos2, label: &str, round: bool, s: f32, flash: f32) -> Rect {
-    let font = w::font_bold(17.0 * s);
-    let tw = text_width(p, label, font.clone());
     let h = 34.0 * s;
-    let wdt = if round { h } else { (tw + 22.0 * s).max(h) };
-    let rect = Rect::from_min_size(pos2(left_center.x, left_center.y - h / 2.0), vec2(wdt, h));
-    let fill = w::mix(Color32::from_white_alpha(30), t.accent, flash);
-    p.rect_filled(rect, radius(if round { h / 2.0 } else { 8.0 * s }), fill);
-    p.rect_stroke(rect, radius(if round { h / 2.0 } else { 8.0 * s }), egui::Stroke::new(1.5 * s, Color32::from_white_alpha(70)), egui::StrokeKind::Inside);
-    p.text(rect.center(), Align2::CENTER_CENTER, label, font, t.text);
+    let rect = Rect::from_min_size(
+        pos2(left_center.x, left_center.y - h / 2.0),
+        vec2(glyph_width(p, label, round, s), h),
+    );
+    let fill = w::mix(Color32::from_gray(32), t.accent, flash);
+    let fg = w::mix(Color32::WHITE, t.on_accent, flash);
+    let stroke = egui::Stroke::new(s.max(1.0), Color32::from_white_alpha(145));
+    if round {
+        p.circle_filled(rect.center(), h / 2.0, fill);
+        p.circle_stroke(rect.center(), (h / 2.0 - stroke.width * 0.5).max(0.0), stroke);
+    } else {
+        let radius = radius(8.0 * s);
+        p.rect_filled(rect, radius, fill);
+        p.rect_stroke(rect, radius, stroke, egui::StrokeKind::Inside);
+    }
+    p.text(rect.center(), Align2::CENTER_CENTER, label, w::font_bold(18.0 * s), fg);
     rect
 }

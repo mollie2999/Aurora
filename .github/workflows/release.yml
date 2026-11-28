@@ -80,8 +80,28 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev libgtk-3-dev libxdo-dev \
+            cmake ninja-build pkg-config libssl-dev libgtk-3-dev libxdo-dev \
             libayatana-appindicator3-dev libxkbcommon-dev libwayland-dev libudev-dev
+
+      - name: Build bundled libSDL3.so.0 (gamepad/HIDAPI/haptic/sensor)
+        run: |
+          v=3.4.18
+          tarball="$RUNNER_TEMP/SDL3-$v.tar.gz"
+          curl -fsSL -o "$tarball" "https://github.com/libsdl-org/SDL/releases/download/release-$v/SDL3-$v.tar.gz"
+          echo "9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3  $tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/sdl3-src" "$RUNNER_TEMP/sdl3-build"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/sdl3-src" --strip-components=1
+          cmake -S "$RUNNER_TEMP/sdl3-src" -B "$RUNNER_TEMP/sdl3-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSDL_UNIX_CONSOLE_BUILD=ON \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+            -DSDL_AUDIO=OFF -DSDL_VIDEO=OFF -DSDL_RENDER=OFF -DSDL_GPU=OFF \
+            -DSDL_CAMERA=OFF -DSDL_DIALOG=OFF -DSDL_TRAY=OFF \
+            -DSDL_JOYSTICK=ON -DSDL_HAPTIC=ON -DSDL_HIDAPI=ON -DSDL_HIDAPI_LIBUSB=OFF -DSDL_SENSOR=ON
+          cmake --build "$RUNNER_TEMP/sdl3-build" --target SDL3-shared
+          cp -L "$RUNNER_TEMP/sdl3-build/libSDL3.so.0" "$RUNNER_TEMP/libSDL3.so.0"
+          cp "$RUNNER_TEMP/sdl3-src/LICENSE.txt" "$RUNNER_TEMP/SDL3-LICENSE.txt"
+          ls -lh "$RUNNER_TEMP/libSDL3.so.0"
 
       - name: Rust (stable)
         run: rustup toolchain install stable --profile minimal
@@ -102,7 +122,7 @@ jobs:
       - name: Check the glibc the binaries need
         run: |
           max=2.35
-          for f in target/release/aurora target/release/steamhost target/release/libVkLayer_aurora_overlay.so target/release/libaurora_htmlsurface.so; do
+          for f in target/release/aurora target/release/steamhost target/release/libVkLayer_aurora_overlay.so target/release/libaurora_htmlsurface.so "$RUNNER_TEMP/libSDL3.so.0"; do
             need=$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n1)
             echo "$f needs glibc $need"
             if [ "$(printf '%s\n%s\n' "$need" "$max" | sort -V | tail -n1)" != "$max" ]; then
@@ -114,7 +134,10 @@ jobs:
         run: |
           name=Aurora-Linux-x86_64
           mkdir -p dist/$name
-          cp target/release/aurora target/release/steamhost target/release/libVkLayer_aurora_overlay.so target/release/libaurora_htmlsurface.so README.md LICENSE assets/icon-256.png dist/$name/
+          cp target/release/aurora target/release/steamhost target/release/libVkLayer_aurora_overlay.so \
+             target/release/libaurora_htmlsurface.so \
+             "$RUNNER_TEMP/libSDL3.so.0" "$RUNNER_TEMP/SDL3-LICENSE.txt" \
+             README.md LICENSE assets/icon-256.png dist/$name/
           tar -C dist -czf dist/$name.tar.gz $name
           (cd dist && sha256sum $name.tar.gz > $name.tar.gz.sha256)
 
@@ -314,6 +337,8 @@ jobs:
           install -d $root/DEBIAN $root/opt/aurora $root/usr/bin $root/usr/share/applications \
             $root/usr/share/icons/hicolor/256x256/apps $root/usr/share/doc/aurora
           install -m755 $src/aurora $src/steamhost $src/libVkLayer_aurora_overlay.so $src/libaurora_htmlsurface.so $root/opt/aurora/
+          if [ -f $src/libSDL3.so.0 ]; then install -m755 $src/libSDL3.so.0 $root/opt/aurora/; fi
+          if [ -f $src/SDL3-LICENSE.txt ]; then install -m644 $src/SDL3-LICENSE.txt $root/usr/share/doc/aurora/SDL3-LICENSE.txt; fi
           for dll in steamclient64.dll steamclient32.dll; do
             if [ -f $src/$dll ]; then install -m644 $src/$dll $root/opt/aurora/; fi
           done

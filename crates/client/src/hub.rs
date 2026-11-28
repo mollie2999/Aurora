@@ -31,9 +31,13 @@ pub enum Request {
     Item { file_id: u64, language: String },
     /// A page of a game's Workshop items, guides, screenshots, artwork or videos.
     Files(FileQuery),
-    /// A page of what someone shared (their screenshots, Workshop items…),
-    /// newest first. Answered as [`Response::Files`] with [`user_files_key`].
-    UserFiles { steam_id: SteamId, kind: FileKind, page: u32, language: String },
+    /// A page of what someone shared (their screenshots, Workshop items…)
+    /// or favorited, for one game or all, in the order asked for.
+    /// Answered as [`Response::Files`] with [`user_files_key`].
+    UserFiles { steam_id: SteamId, kind: FileKind, filter: UserFilter, page: u32, language: String },
+    /// The games someone has shared files of (Steam's "All games" menu on
+    /// their screenshots page), read from that page.
+    UserFileGames { steam_id: SteamId, kind: FileKind, language: String },
     /// A guide's sections, read from its page.
     Guide { file_id: u64, language: String },
     /// Comments under a Workshop item or guide.
@@ -66,6 +70,7 @@ pub enum Request {
 pub enum Response {
     Item { file_id: u64, result: Result<Item, String> },
     Files { key: String, result: Result<FilePage, String> },
+    UserFileGames { steam_id: SteamId, kind: FileKind, result: Result<Vec<(AppId, String)>, String> },
     Guide { file_id: u64, result: Result<Guide, String> },
     FileComments { file_id: u64, result: Result<model::Comments, String> },
     Topics { key: String, result: Result<TopicPage, String> },
@@ -101,6 +106,38 @@ impl FileKind {
             FileKind::Videos => 3,
             FileKind::Screenshots => 4,
             FileKind::Guides => 11,
+        }
+    }
+}
+
+/// How someone's files are filtered and ordered, like the controls on
+/// their screenshots page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct UserFilter {
+    /// One game's files; 0 = all games.
+    pub app_id: AppId,
+    /// Their favorites instead of what they shared.
+    pub favorites: bool,
+    pub sort: UserSort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum UserSort {
+    MostPopular,
+    #[default]
+    Newest,
+    Oldest,
+}
+
+impl UserSort {
+    pub const ALL: [UserSort; 3] = [UserSort::MostPopular, UserSort::Newest, UserSort::Oldest];
+
+    /// GetUserFiles' sort name.
+    fn method(self) -> &'static str {
+        match self {
+            UserSort::MostPopular => "score",
+            UserSort::Newest => "created",
+            UserSort::Oldest => "createdasc",
         }
     }
 }
@@ -294,8 +331,39 @@ pub struct News {
     pub external: bool,
 }
 
-pub fn user_files_key(steam_id: SteamId, kind: FileKind, page: u32) -> String {
-    format!("user{steam_id}/{kind:?}#{page}")
+pub fn user_files_key(steam_id: SteamId, kind: FileKind, filter: UserFilter, page: u32) -> String {
+    format!("user{steam_id}/{kind:?}/{}/{}/{:?}#{page}", filter.app_id, filter.favorites, filter.sort)
+}
+
+/// Someone's page of this kind of file on steamcommunity.com.
+fn user_files_url(steam_id: SteamId, kind: FileKind, language: &str) -> String {
+    let (path, section) = match kind {
+        FileKind::Screenshots => ("screenshots", ""),
+        FileKind::Art => ("images", ""),
+        FileKind::Videos => ("videos", ""),
+        FileKind::Guides => ("myworkshopfiles", "&section=guides"),
+        FileKind::Items | FileKind::Collections => ("myworkshopfiles", ""),
+    };
+    let lang = if language.is_empty() { "english" } else { language };
+    format!("{COMMUNITY}/profiles/{steam_id}/{path}/?l={lang}{section}")
+}
+
+/// The game menu on someone's files page: each
+/// `SelectSharedFilesContentFilter({ 'appid': '730' });">Counter-Strike 2</div>`,
+/// without "All games".
+fn parse_user_file_games(html: &str) -> Vec<(AppId, String)> {
+    const MARK: &str = "SelectSharedFilesContentFilter({ 'appid': '";
+    let mut out: Vec<(AppId, String)> = Vec::new();
+    let mut rest = html;
+    while let Some(i) = rest.find(MARK) {
+        rest = &rest[i + MARK.len()..];
+        let Some(app) = rest.split('\'').next().and_then(|a| a.parse::<AppId>().ok()) else { continue };
+        let name = rest.split_once("\">").map(|x| x.1).and_then(|s| s.split("</div>").next()).map(|s| decode(s.trim())).unwrap_or_default();
+        if app != 0 && !name.is_empty() && !out.iter().any(|(a, _)| *a == app) {
+            out.push((app, name));
+        }
+    }
+    out
 }
 
 pub fn topics_key(app_id: AppId, forum: &str, page: u32) -> String {
@@ -311,6 +379,8 @@ pub fn thread_key(url: &str, page: u32) -> String {
 pub struct Cache {
     pub items: crate::read_cache::ReadCache<u64, Result<Item, String>, 64>,
     pub files: crate::read_cache::ReadCache<String, Result<FilePage, String>, 64>,
+    /// The games someone has shared each kind of file of.
+    pub user_file_games: crate::read_cache::ReadCache<(SteamId, FileKind), Result<Vec<(AppId, String)>, String>, 32>,
     pub guides: crate::read_cache::ReadCache<u64, Result<Guide, String>, 32>,
     pub comments: crate::read_cache::ReadCache<u64, Result<model::Comments, String>, 64>,
     pub topics: crate::read_cache::ReadCache<String, Result<TopicPage, String>, 64>,
@@ -333,6 +403,9 @@ impl Cache {
             }
             Response::Files { key, result } => {
                 self.files.insert(key.clone(), result.clone());
+            }
+            Response::UserFileGames { steam_id, kind, result } => {
+                self.user_file_games.insert((*steam_id, *kind), result.clone());
             }
             Response::Guide { file_id, result } => {
                 self.guides.insert(*file_id, result.clone());
@@ -482,15 +555,19 @@ pub(crate) async fn handle(conn: Connection, me: SteamId, web: Result<Arc<Web>, 
             }
             out(Response::Files { key, result });
         }
-        Request::UserFiles { steam_id, kind, page, language } => {
-            let key = user_files_key(steam_id, kind, page);
+        Request::UserFileGames { steam_id, kind, language } => {
+            let result = crate::market::page(&web_or_anon, &user_files_url(steam_id, kind, &language)).await.map(|b| parse_user_file_games(&b));
+            out(Response::UserFileGames { steam_id, kind, result });
+        }
+        Request::UserFiles { steam_id, kind, filter, page, language } => {
+            let key = user_files_key(steam_id, kind, filter, page);
             let req = CPublishedFileGetUserFilesRequest {
                 steamid: Some(steam_id),
-                appid: Some(0),
+                appid: Some(filter.app_id),
                 page: Some(page.max(1)),
                 numperpage: Some(USER_PAGE),
-                r#type: Some("myfiles".into()),
-                sortmethod: Some("created".into()),
+                r#type: Some(if filter.favorites { "myfavorites" } else { "myfiles" }.into()),
+                sortmethod: Some(filter.sort.method().into()),
                 filetype: Some(kind.matching()),
                 language: Some(language_id(&language)),
                 excluded_content_descriptors: MATURE.to_vec(),
@@ -1102,6 +1179,27 @@ pub fn parse_thread(body: &str) -> Result<Thread, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_game_menu_of_someones_files() {
+        // As on steamcommunity.com/profiles/<id>/screenshots/.
+        let html = r#"<div role="button" class="option ellipsis" id="sharedfiles_filterselect_app_option_0" onclick="javascript:SelectSharedFilesContentFilter({ 'appid': '0' });">All games</div>
+<div id="sharedfiles_filterselect_app_filterable">
+<div role="button" class="option ellipsis" id="sharedfiles_filterselect_app_option_2" onclick="javascript:SelectSharedFilesContentFilter({ 'appid': '730' });">Counter-Strike 2</div>
+<div role="button" class="option ellipsis" id="sharedfiles_filterselect_app_option_3" onclick="javascript:SelectSharedFilesContentFilter({ 'appid': '3489700' });">Stellar Blade™</div>
+<div role="button" class="option ellipsis" id="sharedfiles_filterselect_app_option_4" onclick="javascript:SelectSharedFilesContentFilter({ 'appid': '1' });">Tom &amp; Jerry</div>
+</div>"#;
+        assert_eq!(
+            parse_user_file_games(html),
+            [(730, "Counter-Strike 2".to_string()), (3489700, "Stellar Blade™".to_string()), (1, "Tom & Jerry".to_string())]
+        );
+        assert!(parse_user_file_games("<html></html>").is_empty());
+        assert_eq!(user_files_url(5, FileKind::Guides, "french"), "https://steamcommunity.com/profiles/5/myworkshopfiles/?l=french&section=guides");
+        // Each filter is its own page in the cache.
+        let a = user_files_key(5, FileKind::Screenshots, UserFilter::default(), 1);
+        let b = user_files_key(5, FileKind::Screenshots, UserFilter { sort: UserSort::Oldest, ..Default::default() }, 1);
+        assert_ne!(a, b);
+    }
 
     const TOPICS: &str = r#"
 <div class="rightbox forum_list"><div class="content">

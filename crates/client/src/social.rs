@@ -13,10 +13,13 @@ fn http(web: Option<&Web>) -> reqwest::Client {
 
 /// A page of comments, newest first. `Err` carries Steam's reason, e.g.
 /// "This profile is private." or comments being turned off.
+/// [`model::COMMENTS_PER_PAGE`] for form fields that take `&str`.
+const COMMENTS_PER_PAGE_STR: &str = "6";
+
 pub async fn comments(web: Option<&Web>, steam_id: SteamId, start: u32) -> Result<model::Comments, String> {
     let v: Value = http(web)
         .get(format!("{COMMUNITY}/comment/Profile/render/{steam_id}/-1/"))
-        .query(&[("start", start.to_string()), ("count", "20".to_string())])
+        .query(&[("start", start.to_string()), ("count", model::COMMENTS_PER_PAGE.to_string())])
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -59,14 +62,98 @@ pub fn parse_comments(html: &str) -> Vec<model::Comment> {
             });
             let time = between(block, "data-timestamp=\"", "\"").and_then(|t| t.parse().ok()).unwrap_or(0);
             let text_start = block.find("class=\"commentthread_comment_text\"")?;
-            let text = between(&block[text_start..], ">", "</div>").unwrap_or_default().trim().to_string();
-            Some(model::Comment { id, author: account + BASE_ID, name: unescape(&name), avatar, time, html: text })
+            let text = div_contents(&block[text_start..]).unwrap_or_default().trim().to_string();
+            // Author names carry your nickname for them: "name (nick)".
+            let name = strip_tags(&name).split_whitespace().collect::<Vec<_>>().join(" ");
+            Some(model::Comment { id, author: account + BASE_ID, name, avatar, time, html: text })
         })
         .collect()
 }
 
+/// The inside of the `<div …>` that `s` starts in, up to its own `</div>`
+/// (comments can hold headings and code blocks, which are divs too).
+fn div_contents(s: &str) -> Option<&str> {
+    let start = s.find('>')? + 1;
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < s.len() {
+        let rest = &s[i..];
+        let next_open = rest.find("<div");
+        let next_close = rest.find("</div>")?;
+        match next_open {
+            Some(o) if o < next_close => {
+                depth += 1;
+                i += o + 4;
+            }
+            _ => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..i + next_close]);
+                }
+                i += next_close + 6;
+            }
+        }
+    }
+    None
+}
+
 fn unescape(s: &str) -> String {
     s.replace("&amp;", "&").replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">")
+}
+
+/// Names a profile used before (Steam's "This user has also played as"), newest first.
+pub async fn aliases(web: Option<&Web>, steam_id: SteamId) -> Result<Vec<model::Alias>, String> {
+    let v: Value = http(web).get(format!("{COMMUNITY}/profiles/{steam_id}/ajaxaliases/")).send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    Ok(parse_aliases(&v))
+}
+
+/// The SteamID behind steamcommunity.com/id/<vanity>, from the profile's XML.
+pub async fn resolve_vanity(web: Option<&Web>, vanity: &str) -> Result<SteamId, String> {
+    if vanity.is_empty() || !vanity.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+        return Err("Not a profile address".into());
+    }
+    let body = http(web).get(format!("{COMMUNITY}/id/{vanity}/")).query(&[("xml", "1")]).send().await.map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string())?;
+    parse_steam_id64(&body).ok_or_else(|| "No Steam profile at that address".into())
+}
+
+fn parse_steam_id64(xml: &str) -> Option<SteamId> {
+    let start = xml.find("<steamID64>")? + "<steamID64>".len();
+    let end = xml[start..].find("</steamID64>")? + start;
+    xml[start..end].trim().parse().ok().filter(|id: &SteamId| *id > 0)
+}
+
+fn parse_aliases(v: &Value) -> Vec<model::Alias> {
+    v.as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| {
+                    let name = a.get("newname")?.as_str()?.to_string();
+                    let changed = a.get("timechanged").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+                    Some(model::Alias { name, changed })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Clear your own name history ("Clear Previous Aliases"). Needs the web session.
+pub async fn clear_aliases(web: &Web, steam_id: SteamId) -> Result<(), String> {
+    let resp = web
+        .http
+        .post(format!("{COMMUNITY}/profiles/{steam_id}/ajaxclearaliashistory/"))
+        .header("Referer", format!("{COMMUNITY}/profiles/{steam_id}/"))
+        .form(&[("sessionid", web.session_id.as_str())])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Steam said {}", resp.status()));
+    }
+    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    match v.get("success").and_then(|s| s.as_i64().or_else(|| s.as_bool().map(i64::from))) {
+        Some(1) | None => Ok(()),
+        Some(code) => Err(format!("Steam couldn't clear the name history (error {code})")),
+    }
 }
 
 /// Leave a comment. Needs the signed-in web session.
@@ -75,7 +162,7 @@ pub async fn post_comment(web: &Web, steam_id: SteamId, text: &str) -> Result<mo
         .http
         .post(format!("{COMMUNITY}/comment/Profile/post/{steam_id}/-1/"))
         .header("Referer", format!("{COMMUNITY}/profiles/{steam_id}/"))
-        .form(&[("comment", text), ("count", "20"), ("sessionid", web.session_id.as_str()), ("feature2", "-1")])
+        .form(&[("comment", text), ("count", COMMENTS_PER_PAGE_STR), ("sessionid", web.session_id.as_str()), ("feature2", "-1")])
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -97,6 +184,75 @@ pub async fn block_user(web: &Web, steam_id: SteamId, block: bool) -> Result<boo
         .await
         .map_err(|e| e.to_string())?;
     if resp.status().is_success() { Ok(block) } else { Err(format!("Steam said {}", resp.status())) }
+}
+
+/// Recent co-play players from Steam Community (`/profiles/{id}/friends/coplay`).
+pub async fn recent_players(web: Option<&Web>, steam_id: SteamId) -> Result<Vec<model::RecentPlayer>, String> {
+    let resp = http(web)
+        .get(format!("{COMMUNITY}/profiles/{steam_id}/friends/coplay"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Steam said {}", resp.status()));
+    }
+    let html = resp.text().await.map_err(|e| e.to_string())?;
+    Ok(parse_recent_players(&html))
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    unescape(out.trim())
+}
+
+pub fn parse_recent_players(html: &str) -> Vec<model::RecentPlayer> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for block in html.split("data-steamid=\"").skip(1) {
+        let Some(id_str) = block.split('"').next() else { continue };
+        let Ok(steam_id) = id_str.trim().parse::<u64>() else { continue };
+        if !seen.insert(steam_id) {
+            continue;
+        }
+        let end = block.find("class=\"friend_block_v2").unwrap_or(block.len().min(2048));
+        let chunk = &block[..end];
+        let avatar = between(chunk, "class=\"playerAvatar", ">")
+            .and_then(|_| between(chunk, "<img", ">"))
+            .and_then(|img| between(img, "src=\"", "\""))
+            .filter(|u| u.starts_with("http"))
+            .unwrap_or_default()
+            .to_string();
+        let name = between(chunk, "friend_block_content\">", "<br")
+            .or_else(|| between(chunk, "friend_block_content\">", "</div>"))
+            .map(strip_tags)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| steam_id.to_string());
+        let played_at = between(chunk, "friend_small_text\">", "</span>")
+            .or_else(|| between(chunk, "friend_small_text\">", "</div>"))
+            .map(strip_tags)
+            .unwrap_or_default();
+        let app_id = between(chunk, "/app/", "/")
+            .or_else(|| between(chunk, "app/", "\""))
+            .and_then(|d| d.trim().parse::<u32>().ok());
+        out.push(model::RecentPlayer {
+            steam_id,
+            name,
+            avatar,
+            app_id,
+            game_name: String::new(),
+            played_at,
+        });
+    }
+    out
 }
 
 /// `Community.DeleteCommentFromThread#1`, the comment service Steam's own
@@ -149,7 +305,7 @@ pub async fn delete_comment(web: &Web, steam_id: SteamId, comment_id: u64) -> Re
         .http
         .post(format!("{COMMUNITY}/comment/Profile/delete/{steam_id}/-1/"))
         .header("Referer", format!("{COMMUNITY}/profiles/{steam_id}/"))
-        .form(&[("gidcomment", comment_id.to_string()), ("start", "0".into()), ("count", "20".into()), ("sessionid", web.session_id.clone()), ("feature2", "-1".into())])
+        .form(&[("gidcomment", comment_id.to_string()), ("start", "0".into()), ("count", model::COMMENTS_PER_PAGE.to_string()), ("sessionid", web.session_id.clone()), ("feature2", "-1".into())])
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -405,6 +561,13 @@ pub fn collections<'a>(entries: impl Iterator<Item = (&'a str, bool, &'a str)>) 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn reads_vanity_profile_xml() {
+        let xml = "<?xml version=\"1.0\"?><profile><steamID64>76561198000000001</steamID64><steamID><![CDATA[x]]></steamID></profile>";
+        assert_eq!(super::parse_steam_id64(xml), Some(76561198000000001));
+        assert_eq!(super::parse_steam_id64("<response><error>The specified profile could not be found.</error></response>"), None);
+    }
+
+    #[test]
     fn reads_steam_collections() {
         let entries = [
             ("user-collections.favorite", false, r#"{"id":"favorite","name":"Favorites","added":[570,620,730],"removed":[730]}"#),
@@ -487,6 +650,15 @@ mod tests {
         assert_eq!(list[0].avatar.as_deref(), Some("https://avatars.example/a.jpg"));
         assert_eq!(list[0].html, "hello &amp; welcome");
 
+        let aliases = super::parse_aliases(&serde_json::json!([{"newname": "altushka", "timechanged": "14 Nov @ 10:38am"}, {"newname": "leyley"}]));
+        assert_eq!(aliases, [model::Alias { name: "altushka".into(), changed: "14 Nov @ 10:38am".into() }, model::Alias { name: "leyley".into(), changed: String::new() }]);
+
+        // Your nickname for the author, and markup with its own divs.
+        let c = r#"<div class="commentthread_comment responsive_body_text" id="comment_9"><a class="hoverunderline commentthread_author_link" href="x" data-miniprofile="2"><bdi>saya <span class="nickname_block">(<span class="nickname_name">minha bb</span>)</span></bdi></a><div class="commentthread_comment_text" id="comment_content_9"><div class="bb_h1">Hi</div>after</div></div>"#;
+        let list = super::parse_comments(c);
+        assert_eq!(list[0].name, "saya (minha bb)");
+        assert_eq!(list[0].html, r#"<div class="bb_h1">Hi</div>after"#);
+
         let b = r#"<span class="friendPlayerLevelNum">18</span><span class="profile_xp_block_xp">XP 2,715</span><div class="profile_xp_block_remaining">85 XP to reach Level 19</div><div class="profile_xp_block_remaining_bar_progress" style="width: 58%"></div>
         <div class="badge_row is_link"><a class="badge_row_overlay" href="https://x/badges/13"></a><div class="badge_info_image"><img src="trans.gif" data-delayed-image="https://x/13.png" class="badge_icon"></div><div class="badge_info_description"><div class="badge_info_title">Power Player</div><div> 340 XP </div><div class="badge_info_unlocked"> Unlocked Oct 14 @ 10:06am </div></div><div style="clear: both;"></div></div>"#;
         let badges = super::parse_badges(b);
@@ -497,5 +669,16 @@ mod tests {
         assert_eq!(badges.items[0].title, "Power Player");
         assert_eq!(badges.items[0].detail, "340 XP");
         assert_eq!(badges.items[0].icon.as_deref(), Some("https://x/13.png"));
+    }
+
+    #[test]
+    fn reads_recent_players() {
+        let html = r#"<div class="friend_block_v2" data-steamid="76561197960287930"><div class="playerAvatar offline"><img src="https://avatars.example/p1.jpg"></div><div class="friend_block_content">SquadMate<br><span class="friend_small_text">Team Fortress 2 - Yesterday</span></div></div>"#;
+        let list = super::parse_recent_players(html);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].steam_id, 76561197960287930);
+        assert_eq!(list[0].name, "SquadMate");
+        assert_eq!(list[0].avatar, "https://avatars.example/p1.jpg");
+        assert_eq!(list[0].played_at, "Team Fortress 2 - Yesterday");
     }
 }

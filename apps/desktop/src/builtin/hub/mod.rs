@@ -333,6 +333,10 @@ pub struct HubView {
     ach_filter: u8,
     ach_sort: u8,
     show_all_notes: bool,
+    /// Game, show and sort picked on someone's files page.
+    user_filters: HashMap<(SteamId, FileKind), hub::UserFilter>,
+    /// The search in that page's game menu.
+    user_game_search: String,
 }
 
 impl HubView {

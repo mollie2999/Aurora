@@ -288,13 +288,14 @@ pub fn message_from_history(group_id: GroupChatId, chat_id: ChatRoomId, m: &c_ch
             })
             .collect(),
         mentioned_me: false,
+        media: parsed.media,
     }
 }
 
 pub fn message_from_notification(me: SteamId, n: &CChatRoomIncomingChatMessageNotification) -> GroupMessage {
     let raw = if n.message().is_empty() { n.message_no_bbcode() } else { n.message() };
     let parsed = model::chat::parse_message(raw);
-    let text = if parsed.text.is_empty() && parsed.invite.is_none() && parsed.group_invite.is_none() {
+    let text = if parsed.text.is_empty() && parsed.invite.is_none() && parsed.group_invite.is_none() && parsed.media.is_empty() {
         n.message_no_bbcode().to_string()
     } else {
         parsed.text
@@ -325,6 +326,7 @@ pub fn message_from_notification(me: SteamId, n: &CChatRoomIncomingChatMessageNo
         server_msg,
         reactions: Vec::new(),
         mentioned_me,
+        media: parsed.media,
     }
 }
 
@@ -509,6 +511,7 @@ pub fn send_message(conn: Connection, me: SteamId, group_id: GroupChatId, chat_i
                     server_msg: None,
                     reactions: Vec::new(),
                     mentioned_me: false,
+                    media: parsed.media,
                 }));
             }
             Err(e) => sink(Event::Error(format!("Message not sent: {e}"))),

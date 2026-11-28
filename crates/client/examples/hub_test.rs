@@ -36,7 +36,7 @@ fn main() {
                 c.send(hub(Request::Files(q(FileKind::Items, 3, 10))));
                 c.send(hub(Request::Topics { app_id: app, forum: String::new(), page: 1, language: "english".into() }));
                 c.send(hub(Request::News { app_id: app, count: 3 }));
-                c.send(hub(Request::UserFiles { steam_id: me, kind: FileKind::Screenshots, page: 1, language: "english".into() }));
+                c.send(hub(Request::UserFiles { steam_id: me, kind: FileKind::Screenshots, filter: Default::default(), page: 1, language: "english".into() }));
                 c.send(Command::LoadPlayerGames { steam_id: me, language: "english".into() });
             }
             // Achievements: your most played game, for you and a friend.

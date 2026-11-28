@@ -48,6 +48,74 @@ pub fn open_http(url: &str) -> bool {
     open::that_detached(parsed.as_str()).is_ok()
 }
 
+/// The page in Aurora a Steam web link stands for, if Aurora has one:
+/// profiles (`/profiles/<id>` and custom `/id/<name>` URLs), store pages,
+/// and the community pages the hub shows (workshop, guides, discussions…).
+pub fn in_app(url: &str) -> Option<(String, Option<String>)> {
+    let url = url.trim();
+    let scheme_len = if url.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
+        8
+    } else if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) {
+        7
+    } else {
+        return None;
+    };
+    let rest = &url[scheme_len..];
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let parts: Vec<&str> = path.split(['?', '#']).next().unwrap_or_default().split('/').filter(|p| !p.is_empty()).collect();
+    match (host, parts.as_slice()) {
+        ("steamcommunity.com", [kind, who, more @ ..]) if kind.eq_ignore_ascii_case("profiles") || kind.eq_ignore_ascii_case("id") => {
+            // Profile lists Aurora shows itself; anything else opens the profile.
+            let section = match more.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                Some("games") => "/games",
+                Some("badges") => "/badges",
+                Some("recommended" | "reviews") => "/reviews",
+                Some("groups") => "/groups",
+                Some("groupscommon") => "/groupscommon",
+                _ => "",
+            };
+            let who = if kind.eq_ignore_ascii_case("id") { format!("id:{who}") } else { who.parse::<u64>().ok()?.to_string() };
+            return Some(("profile".into(), Some(format!("{who}{section}"))));
+        }
+        ("store.steampowered.com", [app, id, ..]) if app.eq_ignore_ascii_case("app") => {
+            return Some(("store".into(), Some(format!("app:{}", id.parse::<u64>().ok()?))));
+        }
+        _ => {}
+    }
+    let view = crate::builtin::hub::route(url)?;
+    Some(view.to_page())
+}
+
+/// Where a link clicked in Steam text goes: a page in Aurora when it has one
+/// (see [`in_app`]), otherwise the browser.
+pub fn web_action(url: &str) -> Option<extensions::Action> {
+    if let Some((page, arg)) = in_app(url) {
+        return Some(extensions::Action::Navigate { page, arg });
+    }
+    open_http(url);
+    None
+}
+
+/// Right-clicking empty space on a page offers "Copy page URL" (its address
+/// on Steam), like a browser. Call it before drawing the page: its widgets
+/// are added after, so they keep their own clicks and menus.
+pub fn page_url_menu(ui: &mut egui::Ui, url: &str) {
+    let resp = ui.interact(ui.max_rect(), ui.id().with("aurora-page-url-menu"), egui::Sense::click());
+    resp.context_menu(|ui| {
+        if ui.button(format!("{}  {}", ui::icons::COPY, i18n::t!("Copy page URL"))).clicked() {
+            ui.ctx().copy_text(url.to_string());
+            ui.close();
+        }
+    });
+}
+
+/// `base` with these query parameters, encoded.
+pub fn with_query(base: &str, params: &[(&str, &str)]) -> String {
+    reqwest::Url::parse_with_params(base, params).map(String::from).unwrap_or_else(|_| base.to_string())
+}
+
 /// Validate a YouTube video ID (`[A-Za-z0-9_-]+`).
 pub fn valid_youtube_id(id: &str) -> Option<&str> {
     let id = id.trim();
@@ -68,8 +136,49 @@ pub enum Link {
     Uninstall(u32),
     Validate(u32),
     Store(u32),
+    Connect { addr: String, password: Option<String> },
     Page(&'static str),
     Show,
+}
+
+fn valid_connect_addr(raw: &str) -> Option<String> {
+    let addr = raw.trim();
+    if addr.is_empty()
+        || addr.len() > 253
+        || addr.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, ';' | '"' | '\'' | '\\' | '/'))
+    {
+        return None;
+    }
+    let (host, port) = addr.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    let port_num: u16 = port.parse().ok()?;
+    if port_num == 0 {
+        return None;
+    }
+    if host.starts_with('[') && host.ends_with(']') {
+        let inner = &host[1..host.len() - 1];
+        inner.parse::<std::net::Ipv6Addr>().ok()?;
+    } else if host.parse::<std::net::Ipv4Addr>().is_err() {
+        if !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+            || host.starts_with('.')
+            || host.ends_with('.')
+        {
+            return None;
+        }
+    }
+    Some(addr.to_string())
+}
+
+fn valid_connect_password(raw: Option<&str>) -> Option<String> {
+    let p = raw?.trim();
+    if p.is_empty() || p.len() > 128 || p.chars().any(|c| c.is_control() || matches!(c, ';' | '"' | '\n' | '\r')) {
+        return None;
+    }
+    Some(p.to_string())
 }
 
 pub fn parse(url: &str) -> Option<Link> {
@@ -84,11 +193,17 @@ pub fn parse(url: &str) -> Option<Link> {
         "uninstall" => Link::Uninstall(id()?),
         "validate" => Link::Validate(id()?),
         "store" | "advertise" => Link::Store(id()?),
+        "connect" => Link::Connect {
+            addr: valid_connect_addr(parts.next()?)?,
+            password: valid_connect_password(parts.next()),
+        },
         "nav" | "open" => match parts.next().unwrap_or_default() {
             "downloads" => Link::Page("downloads"),
             "friends" => Link::Page("community"),
             "settings" => Link::Page("settings"),
             "games" | "library" => Link::Page("library"),
+            "servers" => Link::Page("servers"),
+            "screenshots" => Link::Page("screenshots"),
             _ => Link::Show,
         },
         "friends" => Link::Page("community"),
@@ -221,6 +336,12 @@ pub(crate) fn big_picture_mode(request: &str) -> Option<(bool, bool)> {
         DECK_PREVIEW_WINDOW => Some((true, true)),
         _ => None,
     }
+}
+
+/// True when `--desktop` was passed on the command line to opt out of automatic
+/// Steam Deck Big Picture startup.
+pub(crate) fn desktop_requested(args: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+    args.into_iter().any(|a| a.as_ref() == "--desktop")
 }
 
 
@@ -609,12 +730,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn steam_web_links_open_in_aurora() {
+        let page = |u: &str| in_app(u).map(|(p, a)| (p, a.unwrap_or_default()));
+        let p = |page: &str, arg: &str| Some((page.to_string(), arg.to_string()));
+        assert_eq!(page("https://steamcommunity.com/profiles/76561198000000001"), p("profile", "76561198000000001"));
+        // Custom profile URLs keep their name's case for Steam to resolve.
+        assert_eq!(page("https://steamcommunity.com/id/MissColourz/"), p("profile", "id:MissColourz"));
+        assert_eq!(page("https://steamcommunity.com/id/yayazzli/groupscommon/"), p("profile", "id:yayazzli/groupscommon"));
+        assert_eq!(page("https://www.steamcommunity.com/id/x/games/?tab=all"), p("profile", "id:x/games"));
+        assert_eq!(page("https://store.steampowered.com/app/570/Dota_2/"), p("store", "app:570"));
+        assert_eq!(page("https://steamcommunity.com/sharedfiles/filedetails/?id=123"), p("workshop_item", "123"));
+        assert_eq!(page("https://example.com/id/x"), None);
+        assert_eq!(page("https://steamcommunity.com/profiles/notanumber"), None);
+    }
+
+    #[test]
     fn parses_links() {
         assert_eq!(parse("steam://rungameid/570"), Some(Link::Run(570)));
         assert_eq!(parse("\"steam://launch/730/\""), Some(Link::Run(730)));
         assert_eq!(parse("steam://install/440"), Some(Link::Install(440)));
         assert_eq!(parse("steam://store/620"), Some(Link::Store(620)));
         assert_eq!(parse("steam://open/downloads"), Some(Link::Page("downloads")));
+        assert_eq!(
+            parse("steam://connect/198.51.100.1:27015"),
+            Some(Link::Connect { addr: "198.51.100.1:27015".into(), password: None })
+        );
+        assert_eq!(
+            parse("steam://connect/play.example.com:27015/secret"),
+            Some(Link::Connect { addr: "play.example.com:27015".into(), password: Some("secret".into()) })
+        );
+        assert_eq!(parse("steam://connect/1.2.3.4:27015;quit"), None);
+        assert_eq!(parse("steam://connect/notaport"), None);
         assert_eq!(parse("https://example.com"), None);
         assert!(shortcut_runs("[InternetShortcut]\r\nURL=steam://rungameid/570\r\n", 570));
         assert!(!shortcut_runs("[InternetShortcut]\r\nURL=steam://rungameid/5700\r\n", 570));

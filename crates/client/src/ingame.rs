@@ -445,6 +445,32 @@ fn collect_screenshots_in(dir: &std::path::Path, seen: &mut std::collections::BT
     }
 }
 
+/// List all local screenshots recorded across every game on this machine (newest first).
+pub fn list_all_screenshots() -> Vec<(AppId, LocalScreenshot)> {
+    let base = crate::store::config_dir().join("screenshots");
+    let Ok(rd) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        let Some(app_id) = entry.file_name().to_str().and_then(|s| s.parse::<AppId>().ok()) else {
+            continue;
+        };
+        let mut per_app = Vec::new();
+        collect_screenshots_in(&entry.path(), &mut seen, &mut per_app);
+        for s in per_app {
+            out.push((app_id, s));
+        }
+    }
+    out.sort_by(|a, b| b.1.modified.cmp(&a.1.modified).then_with(|| b.1.name.cmp(&a.1.name)));
+    out
+}
+
 /// Delete a screenshot and its thumbnail from disk.
 pub fn delete_screenshot(path: &std::path::Path) -> Result<(), String> {
     if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {

@@ -39,7 +39,9 @@ pub fn minimize(ctx: &egui::Context) {
 
 /// Outer corner radius for floating (non-maximized, non-fullscreen) windows.
 pub fn window_rounding(ctx: &egui::Context) -> egui::CornerRadius {
-    if ctx.input(|i| i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)) {
+    if ctx.input(|i| i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false))
+        || ctx.global_style().visuals.window_corner_radius == egui::CornerRadius::ZERO
+    {
         egui::CornerRadius::ZERO
     } else {
         egui::CornerRadius::same(12)

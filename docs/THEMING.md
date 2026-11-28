@@ -2,11 +2,12 @@
 
 Aurora includes a **Declarative Theme Engine** inspired by Millennium and CSS box-model layouts. A theme is a self-contained folder (or `.zip` package) that can restyle colors and typography, completely rearrange the window chrome and library layout via `layout.toml`, expose user-configurable `[options.*]`, bundle custom fonts/backgrounds/logos, and draw custom ambient effects with sandboxed `theme.rhai` scripts.
 
-Two complete packages are bundled with Aurora and automatically installed on launch (for both fresh installs and updates):
+Built-in theme packages are bundled with Aurora and automatically installed on launch (for both fresh installs and updates):
 
 - [Aurora Desktop (Steam replica)](examples/steam-replica/README.md): Steam-style chrome and library shelves, with Modern, Classic Blue and VGUI Olive palettes.
 - [Adwaita](examples/adwaita/README.md): compact AdwSteamGtk-inspired chrome around Aurora's default library, with optional native GTK4/libadwaita styling on Linux.
 - [Metro](examples/metro/README.md): port of the MetroSteam skin, with a single flat black title bar, square corners and solid-accent selection, plus Variation and Accent Color options.
+- [Aurora Square](examples/square/README.md): Aurora's default interface with sharp `0px` square corners and selectable built-in palettes, suited for compositors that apply native window rounding (e.g. KDE Plasma / KWin).
 
 Open **Settings → Appearance** to activate either theme right away. If you uninstall a bundled theme and later want it back, click **Restore Built-in Themes** in **Settings → Appearance**.
 

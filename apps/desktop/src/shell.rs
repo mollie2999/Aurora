@@ -1461,7 +1461,7 @@ fn friend_row(app: &mut SteamApp, ui: &mut Ui, t: &Theme, p: &Persona, actions: 
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
-pub fn toasts(app: &mut SteamApp, ctx: &egui::Context) {
+pub fn toasts(app: &mut SteamApp, ctx: &egui::Context, keyboard_inset: f32) {
     let now = ctx.input(|i| i.time);
     app.toasts.retain(|t| t.until > now);
     if app.toasts.is_empty() {
@@ -1469,7 +1469,7 @@ pub fn toasts(app: &mut SteamApp, ctx: &egui::Context) {
     }
     let t = &app.prefs.theme;
     egui::Area::new(egui::Id::unique("toasts"))
-        .anchor(Align2::RIGHT_BOTTOM, vec2(-20.0, -48.0))
+        .anchor(Align2::RIGHT_BOTTOM, vec2(-20.0, -48.0_f32.max(keyboard_inset + 12.0)))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             for toast in app.toasts.iter().rev().take(4) {

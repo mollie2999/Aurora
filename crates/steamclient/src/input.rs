@@ -571,12 +571,26 @@ fn intern(list: &mut Vec<String>, name: &str) -> u64 {
     }
 }
 
+fn pad_handle(index: usize, pad: SteamInputPad) -> u64 {
+    if pad.device_id == 0 { index as u64 + 1 } else { (1u64 << 32) | u64::from(pad.device_id) }
+}
+
+fn slot_for(pads: &[Option<SteamInputPad>; 4], handle: u64) -> Option<usize> {
+    pads.iter().enumerate().find_map(|(i, p)| p.filter(|p| pad_handle(i, *p) == handle).map(|_| i))
+}
+
+fn current_slot(handle: u64) -> Option<usize> {
+    let mut s = st();
+    poll(&mut s);
+    slot_for(&s.pads, handle)
+}
+
 const ALL: u64 = u64::MAX;
 
 /// The pad, the active set's name, active layers, and calibration context for a controller.
 fn context(s: &mut Input, handle: u64) -> Option<(Pad, bool, PadCalibration, String, Vec<String>)> {
     poll(s);
-    let mut entry = s.pads.get(handle.checked_sub(1).filter(|i| *i < 4)? as usize).copied().flatten()?;
+    let mut entry = s.pads.get(slot_for(&s.pads, handle)?).copied().flatten()?;
     let c = cal(s);
     if !entry.calibrated && c.nintendo_layout {
         entry.pad.buttons = pads_shm::swap_nintendo_buttons(entry.pad.buttons);
@@ -608,6 +622,8 @@ extern "C" fn set_manifest_path(_t: This, path: *const c_char) -> bool {
         crate::log!("input: loaded fallback bindings from manifest {p}: {} group(s), {} set(s)/layer(s)", b.groups.len(), b.presets.len());
         s.manifest_path = Some(p);
         s.manifest_bindings = Some(b);
+        s.polled = None;
+        LOAD_CV.notify_all();
         true
     } else {
         s.manifest_path = Some(p);
@@ -626,8 +642,8 @@ extern "C" fn connected(_t: This, out: *mut u64) -> i32 {
     // background IPC fetch is still in flight.
     if !has_bindings(&s) && matches!(s.load_state, LoadState::Loading(_)) && !s.waited_once {
         s.waited_once = true;
-        let deadline = Instant::now() + Duration::from_millis(150);
-        while matches!(s.load_state, LoadState::Loading(_)) {
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while !has_bindings(&s) && matches!(s.load_state, LoadState::Loading(_)) {
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else { break };
             let (guard, timeout) = LOAD_CV.wait_timeout(s, rem).unwrap_or_else(|e| e.into_inner());
             s = guard;
@@ -642,9 +658,9 @@ extern "C" fn connected(_t: This, out: *mut u64) -> i32 {
     poll(&mut s);
     let mut n = 0;
     for (i, p) in s.pads.iter().enumerate() {
-        if p.is_some() {
+        if let Some(p) = p {
             if !out.is_null() {
-                unsafe { out.add(n).write_unaligned(i as u64 + 1) };
+                unsafe { out.add(n).write_unaligned(pad_handle(i, *p)) };
             }
             n += 1;
         }
@@ -804,7 +820,7 @@ extern "C" fn origin_name(_t: This, o: i32) -> *const c_char {
 }
 
 extern "C" fn vibrate(_t: This, handle: u64, left: u16, right: u16) {
-    let slots: Vec<usize> = if handle == ALL { (0..4).collect() } else { handle.checked_sub(1).filter(|i| *i < 4).map(|i| i as usize).into_iter().collect() };
+    let slots: Vec<usize> = if handle == ALL { (0..4).collect() } else { current_slot(handle).into_iter().collect() };
     for i in slots {
         crate::pads::rumble(i, left, right);
     }
@@ -816,8 +832,8 @@ extern "C" fn motion_data(_t: This, ret: *mut u8, handle: u64) -> *mut u8 {
         let mut b = Bytes::new(40);
         // Identity orientation quaternion (0, 0, 0, 1).
         b.u32(12, 1.0f32.to_bits());
-        if let Some(slot) = handle.checked_sub(1).filter(|i| *i < 4)
-            && let Some((accel, gyro)) = crate::pads::motion(slot as usize)
+        if let Some(slot) = current_slot(handle)
+            && let Some((accel, gyro)) = crate::pads::motion(slot)
         {
             const G: f32 = 9.80665;
             b.u32(16, (accel[0] / G).to_bits());
@@ -832,23 +848,55 @@ extern "C" fn motion_data(_t: This, ret: *mut u8, handle: u64) -> *mut u8 {
     ret
 }
 
-/// ESteamInputType: 3 = Xbox One controller.
+fn family_input_type(family: u8) -> i32 {
+    match family {
+        pads_shm::SLOT_FAMILY_XBOX => 3,
+        pads_shm::SLOT_FAMILY_PLAYSTATION => 5,
+        pads_shm::SLOT_FAMILY_SWITCH_PRO => 10,
+        pads_shm::SLOT_FAMILY_GENERIC => 4,
+        _ => 0,
+    }
+}
+
 extern "C" fn input_type(_t: This, handle: u64) -> i32 {
     if !crate::pads::steam_input_enabled() {
         return 0;
     }
     let mut s = st();
     poll(&mut s);
-    let Some(i) = handle.checked_sub(1).filter(|i| *i < 4) else { return 0 };
-    s.pads[i as usize].map_or(0, |pad| pad.input_type())
+    slot_for(&s.pads, handle).and_then(|i| s.pads[i]).map_or(0, |p| family_input_type(p.family))
 }
 
 extern "C" fn for_index(_t: This, i: i32) -> u64 {
-    if (0..4).contains(&i) { i as u64 + 1 } else { 0 }
+    let mut s = st();
+    poll(&mut s);
+    s.pads.get(i as usize).copied().flatten().map_or(0, |p| pad_handle(i as usize, p))
 }
 
 extern "C" fn index_of(_t: This, handle: u64) -> i32 {
-    if (1..=4).contains(&handle) { handle as i32 - 1 } else { -1 }
+    current_slot(handle).map_or(-1, |i| i as i32)
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn handle_follows_device_when_seats_move() {
+        let p = SteamInputPad { device_id: 1, ..Default::default() };
+        let fallback = SteamInputPad::default();
+        let handle = pad_handle(2, p);
+        assert_eq!(pad_handle(0, fallback), 1);
+        assert_eq!(slot_for(&[Some(fallback), None, Some(p), None], handle), Some(2));
+        assert_eq!(slot_for(&[Some(p), None, None, None], handle), Some(0));
+        assert_eq!(slot_for(&[Some(fallback), None, None, None], handle), None);
+    }
+
+    #[test]
+    fn steamworks_family_values() {
+        use pads_shm::*;
+        assert_eq!([SLOT_FAMILY_UNKNOWN, SLOT_FAMILY_XBOX, SLOT_FAMILY_PLAYSTATION, SLOT_FAMILY_SWITCH_PRO, SLOT_FAMILY_GENERIC].map(family_input_type), [0, 3, 5, 10, 4]);
+    }
 }
 
 /// EXboxOrigin → EInputActionOrigin (A, B, X, Y, LB, RB, Menu, View, LT pull/click, RT…).

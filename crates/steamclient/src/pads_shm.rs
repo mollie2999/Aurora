@@ -32,7 +32,7 @@ pub const SLOT_FAMILY_SWITCH_PRO: u8 = 3;
 pub const SLOT_FAMILY_GENERIC: u8 = 4;
 
 pub const SHM_PREFIX: &str = "Local\\sir-pads-";
-pub const MAGIC: u32 = 0x3144_4150; // "PAD1"
+pub const MAGIC: u32 = 0x3244_4150; // "PAD2"
 pub const SLOTS: usize = 4;
 /// A heartbeat older than this means the app stopped reading pads.
 pub const STALE_MS: u64 = 3000;
@@ -100,6 +100,7 @@ pub struct Slot {
     seq: AtomicU32,
     connected: AtomicU32,
     packet: AtomicU32,
+    device_id: AtomicU32,
     /// XInput button bits (plus [`GUIDE`]).
     buttons: AtomicU32,
     /// Left trigger | right trigger << 8.
@@ -114,12 +115,15 @@ pub struct Slot {
     /// Gyroscope (rad/s) as f32 bit patterns.
     gyro: [AtomicU32; 3],
     /// Low-frequency motor | high-frequency motor << 16, set by the game.
-    pub rumble: AtomicU32,
+    // Upper word is the connection generation, so cached commands cannot cross hotplug.
+    rumble: AtomicU64,
 }
 
 /// One pad's state, in XINPUT_GAMEPAD terms, plus optional SDL3 motion sensors.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct State {
+    /// Stable host device identity, or zero for a slot-based identity.
+    pub device_id: u32,
     pub packet: u32,
     pub buttons: u16,
     pub lt: u8,
@@ -342,6 +346,12 @@ impl Slot {
         self.seq.store(seq.wrapping_add(1) | 1, Ordering::Relaxed);
         fence(Ordering::Release);
         let s0 = s.unwrap_or_default();
+        let was_connected = self.connected.load(Ordering::Relaxed) != 0;
+        if was_connected != s.is_some() || self.device_id.load(Ordering::Relaxed) != s0.device_id {
+            let generation = self.rumble_generation().wrapping_add(1);
+            self.rumble.store(u64::from(generation) << 32, Ordering::Release);
+        }
+        self.device_id.store(s0.device_id, Ordering::Relaxed);
         self.connected.store(s.is_some() as u32, Ordering::Relaxed);
         self.packet.store(s0.packet, Ordering::Relaxed);
         self.buttons.store(s0.buttons as u32, Ordering::Relaxed);
@@ -369,6 +379,7 @@ impl Slot {
             let (t, l, r) = (self.triggers.load(Ordering::Relaxed), self.left.load(Ordering::Relaxed), self.right.load(Ordering::Relaxed));
             let flags = self.motion_flags.load(Ordering::Relaxed);
             let s = State {
+                device_id: self.device_id.load(Ordering::Relaxed),
                 packet: self.packet.load(Ordering::Relaxed),
                 buttons: self.buttons.load(Ordering::Relaxed) as u16,
                 lt: t as u8,
@@ -400,8 +411,19 @@ impl Slot {
         None
     }
 
+    pub fn rumble_generation(&self) -> u32 {
+        (self.rumble.load(Ordering::Acquire) >> 32) as u32
+    }
+
+    pub fn set_rumble_for(&self, generation: u32, low: u16, high: u16) {
+        let motors = u64::from(low) | (u64::from(high) << 16);
+        let _ = self.rumble.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            ((current >> 32) as u32 == generation).then_some((u64::from(generation) << 32) | motors)
+        });
+    }
+
     pub fn set_rumble(&self, low: u16, high: u16) {
-        self.rumble.store(low as u32 | (high as u32) << 16, Ordering::Relaxed);
+        self.set_rumble_for(self.rumble_generation(), low, high);
     }
 
     pub fn rumble(&self) -> (u16, u16) {
@@ -589,10 +611,20 @@ mod tests {
     fn slot_round_trip() {
         let slot: Slot = unsafe { std::mem::zeroed() };
         assert_eq!(slot.read(), None);
-        let s = State { packet: 7, buttons: 0x1000 | GUIDE, lt: 255, rt: 1, lx: -32768, ly: 32767, rx: -1, ry: 0, ..Default::default() };
+        let s = State { device_id: 73, packet: 7, buttons: 0x1000 | GUIDE, lt: 255, rt: 1, lx: -32768, ly: 32767, rx: -1, ry: 0, ..Default::default() };
         slot.write(Some(s));
         assert_eq!(slot.read(), Some(s));
+        let original = slot.rumble_generation();
+        slot.set_rumble(40, 80);
+        slot.write(Some(s));
+        assert_eq!(slot.rumble(), (40, 80));
+        slot.write(Some(State { device_id: 2, ..s }));
+        assert_eq!(slot.rumble(), (0, 0));
+        slot.set_rumble_for(original, 50, 90);
+        assert_eq!(slot.rumble(), (0, 0));
+        slot.set_rumble(10, 20);
         slot.write(None);
+        assert_eq!(slot.rumble(), (0, 0));
         assert_eq!(slot.read(), None);
         slot.set_rumble(0xFFFF, 0x1234);
         assert_eq!(slot.rumble(), (0xFFFF, 0x1234));
@@ -669,8 +701,9 @@ mod tests {
         // Random Shm::create() round-trips through open_shm.
         let rand_shm = Shm::create().expect("random Shm::create");
         assert!(valid_mapping_name(rand_shm.name()));
-        let opened = open_shm(rand_shm.name()).expect("open_shm accepts valid Local\\sir-pads- name");
-        assert_eq!(opened.magic.load(Ordering::Acquire), MAGIC);
+        let opened = open_shm_with_error(rand_shm.name()).expect("open_shm accepts valid Local\\sir-pads- name");
+        assert!(opened.writable);
+        assert_eq!(opened.shared.magic.load(Ordering::Acquire), MAGIC);
 
         assert!(open_shm("Global\\sir-pads-1234").is_none());
         assert!(open_shm("Local\\other-1234").is_none());

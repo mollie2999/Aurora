@@ -368,6 +368,12 @@ pub(crate) fn big_picture_mode(request: &str) -> Option<(bool, bool)> {
     }
 }
 
+/// True when `--desktop` was passed on the command line to opt out of automatic
+/// Steam Deck Big Picture startup.
+pub(crate) fn desktop_requested(args: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+    args.into_iter().any(|a| a.as_ref() == "--desktop")
+}
+
 
 pub(crate) fn is_allowed_payload(payload: &str) -> bool {
     let p = payload.trim();

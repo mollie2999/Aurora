@@ -46,6 +46,12 @@ install -d \
     "$appdir/usr/share/doc/aurora"
 
 install -m755 "$src/aurora" "$src/steamhost" "$src/libVkLayer_aurora_overlay.so" "$src/libaurora_htmlsurface.so" "$appdir/opt/aurora/"
+if [[ -f "$src/libSDL3.so.0" ]]; then
+    install -m755 "$src/libSDL3.so.0" "$appdir/opt/aurora/libSDL3.so.0"
+fi
+if [[ -f "$src/SDL3-LICENSE.txt" ]]; then
+    install -m644 "$src/SDL3-LICENSE.txt" "$appdir/usr/share/licenses/aurora/SDL3-LICENSE.txt"
+fi
 for dll in steamclient64.dll steamclient32.dll; do
     if [[ -f "$src/$dll" ]]; then
         install -m644 "$src/$dll" "$appdir/opt/aurora/$dll"

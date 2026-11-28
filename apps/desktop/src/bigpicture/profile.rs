@@ -152,8 +152,22 @@ pub(crate) struct ProfileState {
 }
 
 impl ProfileState {
-    pub(crate) fn edit_typing(&self) -> bool {
-        self.edit.active_field.is_some()
+    pub(crate) fn active_text_open(&self, page: &Page) -> bool {
+        match page {
+            Page::Profile(_) => self.comment_open,
+            Page::ProfileGames(_) => self.games_search_open,
+            Page::ProfileEdit => self.edit.active_field.is_some(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn active_target_id(&self, page: &Page) -> Option<Id> {
+        match page {
+            Page::Profile(id) if self.comment_open => Some(Id::unique(("bp-osk-prof-c", *id))),
+            Page::ProfileGames(id) if self.games_search_open => Some(Id::unique(("bp-osk-prof-g", *id))),
+            Page::ProfileEdit => self.edit.active_field.map(|f| Id::unique(("bp-osk-prof-e", f as usize))),
+            _ => None,
+        }
     }
 
     pub(crate) fn active_text_mut(&mut self, page: &Page) -> Option<&mut String> {
@@ -169,6 +183,28 @@ impl ProfileState {
             },
             _ => None,
         }
+    }
+
+    pub(crate) fn cycle_edit_field(&mut self, dir: i8) -> bool {
+        if dir == 0 || self.edit.draft.is_none() {
+            return false;
+        }
+        const GENERAL_FIELDS: [EditField; 4] = [
+            EditField::PersonaName,
+            EditField::RealName,
+            EditField::CustomUrl,
+            EditField::Summary,
+        ];
+        let Some(cur) = self.edit.active_field else {
+            return false;
+        };
+        let Some(idx) = GENERAL_FIELDS.iter().position(|f| *f == cur) else {
+            return false;
+        };
+        let len = GENERAL_FIELDS.len();
+        let next = if dir > 0 { (idx + 1) % len } else { (idx + len - 1) % len };
+        self.edit.active_field = Some(GENERAL_FIELDS[next]);
+        true
     }
 
     pub(crate) fn close_osk(&mut self, page: &Page) -> bool {
@@ -310,31 +346,6 @@ impl ProfileState {
         if self.lists_requested.insert((id, 3, 0)) {
             client.send(Command::LoadGroups { steam_id: id });
         }
-    }
-}
-
-fn draw_osk_into(bp: &mut BigPicture, ui: &mut Ui, f: &Frame, left: f32, width: f32, y: &mut f32, text: &mut String, go: &str) -> bool {
-    if f.x {
-        text.pop();
-    }
-    if f.y {
-        text.push(' ');
-    }
-    match osk::draw(bp, ui, f, left, width, y, go) {
-        Some(osk::Key::Char(c)) => {
-            text.push(c);
-            false
-        }
-        Some(osk::Key::Del) => {
-            text.pop();
-            false
-        }
-        Some(osk::Key::Clear) => {
-            text.clear();
-            false
-        }
-        Some(osk::Key::Go) => true,
-        None => false,
     }
 }
 
@@ -1143,28 +1154,45 @@ fn profile_comments(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, left: f32, 
         Some(Ok(c)) => c,
     };
 
-    // Comment composer toggle + OSK
+    // Comment composer toggle (overlay OSK opens on A/click or X when focused)
     let hint = if mine { t!("Write a comment on your profile…") } else { t!("Add a comment…") };
-    let shown_draft = if bp.profile.comment_draft.is_empty() { hint } else { bp.profile.comment_draft.as_str() };
     let post_w = paint::pill_width(ui, true, t!("Post comment"), s);
     let composer_w = (width - post_w - 16.0 * s).max(200.0 * s);
     let composer_r = Rect::from_min_size(pos2(left, y), vec2(composer_w, 64.0 * s));
+    if bp.profile.comment_open {
+        bp.osk.field_rect = Some(composer_r);
+    }
     let comp_hit = bp.focus.item(ui, Id::unique(("bp-prof-c-input", id)), composer_r, ui.clip_rect(), Place::Page);
     if composer_r.intersects(ui.clip_rect()) {
         let p = ui.painter();
         p.rect_filled(composer_r, paint::radius(12.0 * s), w::mix(f.t.chrome.gamma_multiply(0.86), f.t.raised, comp_hit.glow));
         p.rect_stroke(composer_r, paint::radius(12.0 * s), Stroke::new(1.5 * s, if bp.profile.comment_open { f.t.accent } else { Color32::from_white_alpha(28) }), egui::StrokeKind::Inside);
-        let caret = if bp.profile.comment_open && ((f.now * 2.0) as i64 % 2 == 0) { "|" } else { "" };
-        let display = if bp.profile.comment_draft.is_empty() { format!("{hint}{caret}") } else { format!("{shown_draft}{caret}") };
-        let col = if bp.profile.comment_draft.is_empty() { f.t.text_faint } else { f.t.text };
-        paint::line(p, pos2(composer_r.left() + 18.0 * s, composer_r.center().y), Align2::LEFT_CENTER, &display, w::font(18.5 * s), col, composer_r.width() - 96.0 * s);
+        let inner = Rect::from_min_max(
+            pos2(composer_r.left() + 18.0 * s, composer_r.top() + 8.0 * s),
+            pos2(composer_r.right() - 88.0 * s, composer_r.bottom() - 8.0 * s),
+        );
+        osk::paint_single_line_field(
+            p,
+            inner,
+            &bp.profile.comment_draft,
+            hint,
+            w::font(18.5 * s),
+            &f.t,
+            f.now,
+            bp.profile.comment_open || comp_hit.focused,
+            if bp.profile.comment_open { bp.osk.caret } else { bp.profile.comment_draft.chars().count() },
+            bp.profile.comment_open && bp.osk.selected_all,
+        );
         p.text(pos2(composer_r.right() - 16.0 * s, composer_r.center().y), Align2::RIGHT_CENTER, format!("{}/1000", bp.profile.comment_draft.chars().count()), w::font(14.5 * s), f.t.text_faint);
     }
     if comp_hit.focused {
         bp.focus.ring_around(composer_r, 12.0 * s);
     }
-    if comp_hit.activated {
+    if comp_hit.activated || (comp_hit.focused && f.x && !bp.profile.comment_open) {
         bp.profile.comment_open = !bp.profile.comment_open;
+        if bp.profile.comment_open {
+            bp.osk.reset_focus();
+        }
     }
 
     let trimmed = bp.profile.comment_draft.trim().to_string();
@@ -1184,21 +1212,7 @@ fn profile_comments(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, left: f32, 
     if post_hit.activated && can_post {
         f.app.client.send(Command::PostComment { steam_id: id, text: trimmed });
     }
-    y = composer_r.bottom().max(post_r.bottom()) + 16.0 * s;
-
-    if bp.profile.comment_open {
-        let mut draft = std::mem::take(&mut bp.profile.comment_draft);
-        let submitted = draw_osk_into(bp, ui, f, left, width, &mut y, &mut draft, t!("Post comment"));
-        bp.profile.comment_draft = draft;
-        if submitted {
-            let trimmed = bp.profile.comment_draft.trim().to_string();
-            if !trimmed.is_empty() && trimmed.chars().count() <= 1000 {
-                f.app.client.send(Command::PostComment { steam_id: id, text: trimmed });
-            }
-            bp.profile.comment_open = false;
-        }
-        y += 18.0 * s;
-    }
+    y = composer_r.bottom().max(post_r.bottom()) + 18.0 * s;
 
     if data.items.is_empty() {
         paint::line(ui.painter(), pos2(left, y + 6.0 * s), Align2::LEFT_TOP, t!("No comments yet."), w::font(18.0 * s), f.t.text_faint, width);
@@ -1353,8 +1367,11 @@ pub(super) fn games_page(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f
         if bp.profile.games_search_open || !bp.profile.games_search.is_empty() { Kind::Primary } else { Kind::Secondary },
         None,
     );
-    if shit.activated {
+    if shit.activated || (shit.focused && f.x && !bp.profile.games_search_open) {
         bp.profile.games_search_open = !bp.profile.games_search_open;
+        if bp.profile.games_search_open {
+            bp.osk.reset_focus();
+        }
     }
     let sort_label = format!("{}  {}", t!("Sort"), bp.profile.games_sort.label());
     let (sor, sohit) = button(bp, ui, f, Id::unique(("bp-prof-games-sort", id)), pos2(sr.right() + 14.0 * s, y), 0.0, Some(icons::SLIDERS), &sort_label, Kind::Secondary, None);
@@ -1378,13 +1395,15 @@ pub(super) fn games_page(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame, top: f
     y = bar_bottom + 18.0 * s;
 
     if bp.profile.games_search_open {
-        let mut q = std::mem::take(&mut bp.profile.games_search);
-        let done = draw_osk_into(bp, ui, f, left, width, &mut y, &mut q, t!("Search"));
-        bp.profile.games_search = q;
-        if done {
-            bp.profile.games_search_open = false;
-        }
-        y += 18.0 * s;
+        let field = Rect::from_min_size(pos2(left, y), vec2(width.min(720.0 * s), 58.0 * s));
+        bp.osk.field_rect = Some(field);
+        let p = ui.painter();
+        p.rect_filled(field, paint::radius(29.0 * s), Color32::from_black_alpha(120));
+        p.rect_stroke(field, paint::radius(29.0 * s), Stroke::new(2.0 * s, f.t.accent.gamma_multiply(0.8)), egui::StrokeKind::Inside);
+        p.text(pos2(field.left() + 24.0 * s, field.center().y), Align2::LEFT_CENTER, icons::SEARCH, w::font(22.0 * s), f.t.text_dim);
+        let inner = Rect::from_min_max(pos2(field.left() + 60.0 * s, field.top() + 8.0 * s), pos2(field.right() - 24.0 * s, field.bottom() - 8.0 * s));
+        osk::paint_single_line_field(p, inner, &bp.profile.games_search, t!("Search games"), w::font_semibold(21.0 * s), &f.t, f.now, true, bp.osk.caret, bp.osk.selected_all);
+        y += 74.0 * s;
     }
 
     let q = bp.profile.games_search.trim().to_lowercase();
@@ -2000,6 +2019,10 @@ pub(super) fn edit_page(bp: &mut BigPicture, ui: &mut Ui, f: &mut Frame) -> f32 
         let rtop = r.top() - body_top;
         bp.profile.edit.body_scroll.reveal(rtop, rtop + r.height(), body_view.height(), 36.0 * s);
     }
+    if !ui.is_enabled() && let Some(field) = bp.osk.take_field_reveal() {
+        let top = field.top() - body_top;
+        bp.profile.edit.body_scroll.reveal(top, top + field.height(), body_view.height(), 16.0 * s);
+    }
     bp.profile.edit.body_scroll.clamp(body_h, body_view.height());
     bp.profile.edit.body_scroll.step(ui);
     if let Some((r, Place::Page)) = bp.focus.focused() {
@@ -2036,6 +2059,9 @@ fn edit_text_row(
     let s = f.s;
     let active = bp.profile.edit.active_field == Some(field);
     let r = Rect::from_min_size(pos2(left, *y), vec2(width, 56.0 * s));
+    if active {
+        bp.osk.field_rect = Some(r);
+    }
     let hit = bp.focus.item(ui, Id::unique(("bp-pedit-field", field as usize)), r, clip, Place::Page);
     if r.intersects(clip) {
         let p = ui.painter();
@@ -2044,25 +2070,30 @@ fn edit_text_row(
             p.rect_stroke(r, paint::radius(10.0 * s), Stroke::new(2.0 * s, f.t.accent), egui::StrokeKind::Inside);
         }
         paint::line(p, pos2(r.left() + 16.0 * s, r.top() + 8.0 * s), Align2::LEFT_TOP, label, w::font_semibold(13.5 * s), f.t.text_dim, width - 32.0 * s);
-        let caret = if active && ((f.now * 2.0) as i64 % 2 == 0) { "|" } else { "" };
-        let shown = if value.is_empty() { format!("{hint}{caret}") } else { format!("{value}{caret}") };
-        let col = if value.is_empty() { f.t.text_faint } else { f.t.text };
-        paint::line(p, pos2(r.left() + 16.0 * s, r.bottom() - 8.0 * s), Align2::LEFT_BOTTOM, &shown, w::font_medium(17.5 * s), col, width - 32.0 * s);
+        let inner = Rect::from_min_max(pos2(r.left() + 16.0 * s, r.top() + 26.0 * s), pos2(r.right() - 16.0 * s, r.bottom() - 4.0 * s));
+        osk::paint_single_line_field(
+            p,
+            inner,
+            value,
+            hint,
+            w::font_medium(17.5 * s),
+            &f.t,
+            f.now,
+            active,
+            if active { bp.osk.caret } else { value.chars().count() },
+            active && bp.osk.selected_all,
+        );
     }
     if hit.focused {
         bp.focus.ring_around_clipped(r, 10.0 * s, clip);
     }
-    if hit.activated {
+    if hit.activated || (hit.focused && f.x && !active) {
         bp.profile.edit.active_field = if active { None } else { Some(field) };
+        if !active {
+            bp.osk.reset_focus();
+        }
     }
     *y += 64.0 * s;
-    if bp.profile.edit.active_field == Some(field) {
-        let done = draw_osk_into(bp, ui, f, left, width, y, value, t!("Done"));
-        if done {
-            bp.profile.edit.active_field = None;
-        }
-        *y += 14.0 * s;
-    }
 }
 
 fn edit_choice_row(

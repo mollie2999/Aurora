@@ -186,6 +186,8 @@ enum MenuAct {
     Hide,
     Shortcut,
     Browse,
+    #[cfg(not(windows))]
+    BrowsePrefix,
     Verify,
     Move,
     Backup,
@@ -1084,6 +1086,10 @@ impl Library {
                     w::menu_spacing(ui);
                     item(ui, icons::DESKTOP, t!("Add desktop shortcut"), MenuAct::Shortcut);
                     item(ui, icons::FOLDER, t!("Browse local files"), MenuAct::Browse);
+                    #[cfg(not(windows))]
+                    if ctx.local.games.iter().find(|g| g.app_id == id).and_then(|g| local::compat::prefix_dir(&g.install_dir, id)).is_some() {
+                        item(ui, icons::FOLDER, t!("Browse Proton prefix"), MenuAct::BrowsePrefix);
+                    }
                     item(ui, icons::SHIELD, t!("Verify game files"), MenuAct::Verify);
                     item(ui, icons::DRIVES, t!("Move install folder…"), MenuAct::Move);
                     item(ui, icons::PACKAGE, t!("Back up game files…"), MenuAct::Backup);
@@ -1159,6 +1165,12 @@ impl Library {
             MenuAct::Browse => {
                 if let Some(g) = local {
                     local::open_folder(&g.install_dir);
+                }
+            }
+            #[cfg(not(windows))]
+            MenuAct::BrowsePrefix => {
+                if let Some(dir) = local.and_then(|g| local::compat::prefix_dir(&g.install_dir, id)) {
+                    local::open_folder(&dir);
                 }
             }
             MenuAct::Verify => {
@@ -2791,6 +2803,12 @@ impl Library {
             }
             if item(ui, icons::FOLDER, t!("Browse local files"), t.text) {
                 local::open_folder(&g.install_dir);
+            }
+            #[cfg(not(windows))]
+            if let Some(dir) = local::compat::prefix_dir(&g.install_dir, id) {
+                if item(ui, icons::FOLDER, t!("Browse Proton prefix"), t.text) {
+                    local::open_folder(&dir);
+                }
             }
             if item(ui, icons::SHIELD, t!("Verify game files"), t.text) {
                 self.start_verify(ctx, g);

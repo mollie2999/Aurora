@@ -34,6 +34,8 @@ pub struct LocalState {
     pub libraries: Vec<PathBuf>,
     pub games: Vec<InstalledGame>,
     pub accounts: Vec<LocalAccount>,
+    /// Per-app `LaunchOptions` read from Steam's `localconfig.vdf` (trimmed, non-empty).
+    pub steam_launch_options: HashMap<AppId, String>,
 }
 
 /// Find the Steam install folder for this machine.
@@ -119,10 +121,14 @@ pub fn load(steam_root: Option<PathBuf>) -> Result<LocalState> {
             g.last_played = u.last_played.or(g.last_played);
         }
     }
+    let steam_launch_options: HashMap<AppId, String> = usage
+        .iter()
+        .filter_map(|(&id, u)| Some((id, u.launch_options.clone()?)))
+        .collect();
     games.sort_by_key(|g| g.name.to_lowercase());
     games.dedup_by_key(|g| g.app_id);
 
-    Ok(LocalState { steam_root: root, libraries, games, accounts })
+    Ok(LocalState { steam_root: root, libraries, games, accounts, steam_launch_options })
 }
 
 fn dirs() -> Option<directories::ProjectDirs> {
@@ -401,13 +407,14 @@ pub fn accounts(root: &Path) -> Result<Vec<LocalAccount>> {
     Ok(out)
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct Usage {
     pub playtime_minutes: Option<u64>,
     pub last_played: Option<u64>,
+    pub launch_options: Option<String>,
 }
 
-/// Per-app playtime from `userdata/<account>/config/localconfig.vdf`.
+/// Per-app playtime and launch options from `userdata/<account>/config/localconfig.vdf`.
 pub fn playtime(root: &Path, account_id: u32) -> HashMap<AppId, Usage> {
     let path = root
         .join("userdata")
@@ -427,6 +434,7 @@ pub fn playtime(root: &Path, account_id: u32) -> HashMap<AppId, Usage> {
                 Usage {
                     playtime_minutes: o.u64("Playtime"),
                     last_played: o.u64("LastPlayed").filter(|&t| t > 0),
+                    launch_options: o.str("LaunchOptions").map(str::trim).filter(|s| !s.is_empty()).map(String::from),
                 },
             ))
         })
@@ -470,5 +478,32 @@ mod tests {
         assert_eq!(games[0].app_id, 2000);
         assert_eq!(games[0].install_dir, apps.join("common").join("Good Game"));
         let _ = fs::remove_dir_all(&lib);
+    }
+
+    #[test]
+    fn reads_launch_options_from_localconfig() {
+        let root = std::env::temp_dir().join(format!("sir-local-launchopts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cfg = root.join("userdata").join("42").join("config");
+        fs::create_dir_all(&cfg).unwrap();
+        let vdf_text = concat!(
+            "\"UserLocalConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t\t\"apps\"\n\t\t\t\t{\n",
+            "\t\t\t\t\t\"2552430\"\n\t\t\t\t\t{\n",
+            "\t\t\t\t\t\t\"Playtime\"\t\"120\"\n",
+            "\t\t\t\t\t\t\"LaunchOptions\"\t\"WINEDLLOVERRIDES=\\\"dinput8=n,b;dbghelp=n,b\\\" %COMMAND%\"\n",
+            "\t\t\t\t\t}\n",
+            "\t\t\t\t\t\"400\"\n\t\t\t\t\t{\n",
+            "\t\t\t\t\t\t\"LaunchOptions\"\t\"   \"\n",
+            "\t\t\t\t\t}\n",
+            "\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n",
+        );
+        fs::write(cfg.join("localconfig.vdf"), vdf_text).unwrap();
+
+        let map = playtime(&root, 42);
+        let kh = map.get(&2552430).expect("KH entry");
+        assert_eq!(kh.playtime_minutes, Some(120));
+        assert_eq!(kh.launch_options.as_deref(), Some(r#"WINEDLLOVERRIDES="dinput8=n,b;dbghelp=n,b" %COMMAND%"#));
+        assert_eq!(map.get(&400).and_then(|u| u.launch_options.as_deref()), None);
+        let _ = fs::remove_dir_all(&root);
     }
 }

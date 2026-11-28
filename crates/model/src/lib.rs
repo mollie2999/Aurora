@@ -531,7 +531,7 @@ fn is_safe_connect_password(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && !s.starts_with(['-', '+'])
-        && !s.contains("%command%")
+        && !s.to_ascii_lowercase().contains("%command%")
         && !s.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '\\'))
 }
 
@@ -3155,6 +3155,7 @@ mod trade_url_tests {
         for bad_connect in [
             "LD_PRELOAD=/tmp/x.so /bin/sh %command%",
             "%command%",
+            "+connect 1.2.3.4:27015 +password %COMMAND%",
             "--gpu-launcher=/bin/sh",
             "+exec autoexec.cfg",
         ] {

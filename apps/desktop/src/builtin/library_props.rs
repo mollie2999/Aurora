@@ -161,7 +161,7 @@ impl Library {
                     match tab {
                         PropTab::General => {
                             self.tab_cloud(ui, t, ctx, app_id, &name, installed.as_ref(), owned.as_ref());
-                            self.tab_general(ui, t, app_id, owned.as_ref());
+                            self.tab_general(ui, t, ctx, app_id, owned.as_ref());
                         }
                         PropTab::Updates => self.tab_updates(ui, t, ctx, app_id, installed.as_ref(), owned.as_ref()),
                         PropTab::Files => self.tab_files(ui, t, ctx, app_id, installed.as_ref()),
@@ -452,11 +452,26 @@ impl Library {
         }
     }
 
-    fn tab_general(&mut self, ui: &mut Ui, t: &Theme, app: AppId, owned: Option<&OwnedApp>) {
+    fn tab_general(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, app: AppId, owned: Option<&OwnedApp>) {
+        let steam_opts = ctx.local.steam_launch_options.get(&app).cloned();
+        let mut imported = false;
         let s = self.settings_mut(app);
         section(ui, t, t!("Launch options"), t!("Extra arguments added when the game starts. As in Steam, %command% stands for the game: MANGOHUD=1 gamemoderun %command% -novid"), |ui| {
             ui.add(egui::TextEdit::singleline(&mut s.args).hint_text("MANGOHUD=1 %command% -novid").desired_width(f32::INFINITY).margin(vec2(10.0, 8.0))).with_edit_menu();
+            if let Some(opts) = steam_opts.as_deref().filter(|o| o.trim() != s.args.trim()) {
+                ui.add_space(6.0);
+                if w::button(ui, t, Some(icons::DOWNLOAD), t!("Import from Steam"), w::Kind::Secondary, w::Size::Sm)
+                    .on_hover_text(opts)
+                    .clicked()
+                {
+                    s.args = opts.to_string();
+                    imported = true;
+                }
+            }
         });
+        if imported {
+            ctx.toast(t!("Imported launch options from Steam"));
+        }
         section(ui, t, t!("In-game overlay"), t!("Open friends and chat with Shift+Tab while playing."), |ui| {
             if ui.add(crate::builtin::settings::toggle(&mut s.overlay_on)).changed() {
                 client::set_app_overlay(app, s.overlay_on);
@@ -620,6 +635,12 @@ impl Library {
                 ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
                 if w::button(ui, t, Some(icons::FOLDER), t!("Browse…"), w::Kind::Secondary, w::Size::Sm).clicked() {
                     local::open_folder(&g.install_dir);
+                }
+                #[cfg(not(windows))]
+                if let Some(pfx) = local::compat::prefix_dir(&g.install_dir, app) {
+                    if w::button(ui, t, Some(icons::FOLDER), t!("Browse Proton prefix"), w::Kind::Secondary, w::Size::Sm).clicked() {
+                        local::open_folder(&pfx);
+                    }
                 }
                 if w::button(ui, t, Some(icons::SHIELD), t!("Verify integrity of game files"), w::Kind::Secondary, w::Size::Sm).clicked() {
                     self.start_verify(ctx, g);

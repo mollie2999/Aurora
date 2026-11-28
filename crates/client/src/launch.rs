@@ -565,7 +565,7 @@ pub fn spawn_with_steamclient(app: &OwnedApp, install_dir: &Path, args: &LaunchA
 /// runs directly (made executable first if it isn't). Windows: shortcuts,
 /// batch files and programs that need admin rights start through the shell,
 /// which gives no process to wait for (`None`).
-pub fn spawn_non_steam(exe: &str, args: &str) -> Result<Option<Child>, String> {
+pub fn spawn_non_steam(exe: &str, args: &str, steam_app_id: Option<u32>) -> Result<Option<Child>, String> {
     let exe = PathBuf::from(exe.trim().trim_matches('"'));
     if !exe.exists() {
         return Err(format!("{} doesn't exist", exe.display()));
@@ -574,12 +574,13 @@ pub fn spawn_non_steam(exe: &str, args: &str) -> Result<Option<Child>, String> {
     let opts = UserOptions::parse(args);
     #[cfg(not(windows))]
     {
-        let mut cmd = linux::non_steam(&exe, &opts.args)?;
+        let mut cmd = linux::non_steam(&exe, &opts.args, steam_app_id)?;
         cmd.current_dir(&dir);
         return opts.wrap(cmd).spawn().map(Some).map_err(|e| format!("couldn't start {}: {e}", exe.display()));
     }
     #[cfg(windows)]
     {
+        let _ = steam_app_id;
         let ext = exe.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         if ext == "exe" {
             let mut cmd = Command::new(&exe);
@@ -595,6 +596,23 @@ pub fn spawn_non_steam(exe: &str, args: &str) -> Result<Option<Child>, String> {
             tracing::warn!("launch options: variables and wrappers don't apply to {} (opened through the Windows shell)", exe.display());
         }
         win::shell_open(&exe, &opts.args_line(), &dir).map(|()| None)
+    }
+}
+
+/// Linux: the Proton prefix folder for a non-Steam game, if it already exists on disk.
+pub fn non_steam_compat_data(exe: &str, steam_app_id: Option<u32>) -> Option<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        let exe = PathBuf::from(exe.trim().trim_matches('"'));
+        let root = local::find_steam_root()?;
+        let data_dir = directories::ProjectDirs::from("dev", "SteamInRust", "SteamInRust")?.data_dir().to_path_buf();
+        let (_, path) = linux::resolve_non_steam_compat(&exe, &root, &data_dir, steam_app_id);
+        path.is_dir().then_some(path)
+    }
+    #[cfg(windows)]
+    {
+        let _ = (exe, steam_app_id);
+        None
     }
 }
 
@@ -689,7 +707,7 @@ pub(crate) struct UserOptions {
 impl UserOptions {
     pub(crate) fn parse(s: &str) -> UserOptions {
         let words = shell_words(s);
-        let Some(at) = words.iter().position(|w| w == "%command%") else {
+        let Some(at) = words.iter().position(|w| w.eq_ignore_ascii_case("%command%")) else {
             return UserOptions { args: words, ..Default::default() };
         };
         let mut before = words[..at].iter().peekable();
@@ -700,7 +718,7 @@ impl UserOptions {
         }
         let wrapper = before.cloned().collect();
         // A second %command% means nothing here; drop it rather than pass it on.
-        let args = words[at + 1..].iter().filter(|w| *w != "%command%").cloned().collect();
+        let args = words[at + 1..].iter().filter(|w| !w.eq_ignore_ascii_case("%command%")).cloned().collect();
         UserOptions { env, wrapper, args }
     }
 
@@ -2688,18 +2706,34 @@ mod linux {
         std::fs::File::open(exe).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_ok() && &head == b"MZ"
     }
 
+    /// Pick the compatdata ID and folder for a non-Steam Windows game:
+    /// if imported from Steam (`steam_app_id`), prefer Steam's prefix
+    /// (`<steam_root>/steamapps/compatdata/<steam_app_id>`) unless Aurora
+    /// already created its own legacy FNV-1a prefix and Steam's does not exist.
+    pub fn resolve_non_steam_compat(exe: &Path, steam_root: &Path, aurora_data_dir: &Path, steam_app_id: Option<u32>) -> (u32, PathBuf) {
+        let fnv_id = exe.to_string_lossy().bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193)) | 0x8000_0000;
+        let aurora_dir = aurora_data_dir.join("compatdata").join(fnv_id.to_string());
+        if let Some(sid) = steam_app_id.filter(|&id| id != 0) {
+            let steam_dir = steam_root.join("steamapps").join("compatdata").join(sid.to_string());
+            if steam_dir.is_dir() || !aurora_dir.is_dir() {
+                return (sid, steam_dir);
+            }
+        }
+        (fnv_id, aurora_dir)
+    }
+
     /// The command for a non-Steam game (see `super::spawn_non_steam`).
-    pub fn non_steam(exe: &Path, args: &[String]) -> Result<Command, String> {
+    pub fn non_steam(exe: &Path, args: &[String], steam_app_id: Option<u32>) -> Result<Command, String> {
         use std::os::unix::process::CommandExt;
         let mut cmd = if is_windows_program(exe) {
             let root = local::find_steam_root().ok_or("Windows games need a Steam install for Proton")?;
-            // Steam's way of numbering shortcuts: a stable id from the path, top bit set.
-            let id = exe.to_string_lossy().bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193)) | 0x8000_0000;
+            let aurora_data = directories::ProjectDirs::from("dev", "SteamInRust", "SteamInRust").ok_or("no data folder")?.data_dir().to_path_buf();
+            let resolved_id = steam_app_id.filter(|&id| id != 0).or_else(|| local::shortcuts::app_id_for_exe(&root, None, exe));
+            let (id, data) = resolve_non_steam_compat(exe, &root, &aurora_data, resolved_id);
             let tool = super::proton_override()
                 .and_then(|name| compat::compat_tools(&root).into_iter().find(|t| t.name.eq_ignore_ascii_case(&name)))
                 .or_else(|| compat::tool_for(&root, id))
                 .ok_or("No Proton is installed. Install one in Steam (Library → Tools → Proton).")?;
-            let data = directories::ProjectDirs::from("dev", "SteamInRust", "SteamInRust").ok_or("no data folder")?.data_dir().join("compatdata").join(id.to_string());
             std::fs::create_dir_all(&data).map_err(|e| format!("couldn't create the Proton prefix: {e}"))?;
             tracing::info!("launching non-Steam game {} with {}", exe.display(), tool.display);
             let mut c = proton_base(&tool, &root);
@@ -3547,6 +3581,43 @@ mod tests {
         assert_eq!((o.env.len(), o.wrapper.len(), o.args.len()), (1, 0, 0));
         assert_eq!(shell_words(r#"a "" b"#), words(&["a", "", "b"]));
         assert_eq!(UserOptions::parse(r#"%command% "x y" -z"#).args_line(), r#""x y" -z"#);
+        // Uppercase %COMMAND% (common in Proton/modding guides) works identically.
+        let upper = UserOptions::parse(r#"WINEDLLOVERRIDES="dinput8=n,b;dbghelp=n,b" %COMMAND% -novid"#);
+        assert_eq!(upper.env, vec![("WINEDLLOVERRIDES".into(), "dinput8=n,b;dbghelp=n,b".into())]);
+        assert!(upper.wrapper.is_empty());
+        assert_eq!(upper.args, words(&["-novid"]));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_steam_compat_prefers_steam_prefix() {
+        let base = std::env::temp_dir().join(format!("sir-nonsteam-compat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let steam = base.join("steam");
+        let aurora = base.join("aurora");
+        let exe = Path::new("/games/KH2FM.exe");
+        let sid = 3_000_000_123u32;
+
+        // Freshly imported from Steam (neither prefix exists yet): uses Steam's prefix.
+        let (id, path) = linux::resolve_non_steam_compat(exe, &steam, &aurora, Some(sid));
+        assert_eq!(id, sid);
+        assert_eq!(path, steam.join("steamapps/compatdata").join(sid.to_string()));
+
+        // Existing Aurora prefix with no Steam prefix: preserves Aurora's prefix.
+        let (fnv_id, fnv_path) = linux::resolve_non_steam_compat(exe, &steam, &aurora, None);
+        std::fs::create_dir_all(&fnv_path).unwrap();
+        let (id2, path2) = linux::resolve_non_steam_compat(exe, &steam, &aurora, Some(sid));
+        assert_eq!(id2, fnv_id);
+        assert_eq!(path2, fnv_path);
+
+        // Once Steam's prefix exists on disk, Steam's prefix wins.
+        let steam_pfx = steam.join("steamapps/compatdata").join(sid.to_string());
+        std::fs::create_dir_all(&steam_pfx).unwrap();
+        let (id3, path3) = linux::resolve_non_steam_compat(exe, &steam, &aurora, Some(sid));
+        assert_eq!(id3, sid);
+        assert_eq!(path3, steam_pfx);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -3581,7 +3652,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let opts = format!("AURORA_T=on '{}' %command% -a \"b c\"", wrapper.display());
-        let mut child = spawn_non_steam(&game.to_string_lossy(), &opts).unwrap().unwrap();
+        let mut child = spawn_non_steam(&game.to_string_lossy(), &opts, None).unwrap().unwrap();
         assert!(child.wait().unwrap().success());
         assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "on yes -a b c");
         let _ = std::fs::remove_dir_all(dir);
